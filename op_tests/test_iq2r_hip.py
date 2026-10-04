@@ -71,3 +71,7 @@ def test_device_materializer_matches_independent_host_decoder(n):
     expected = iq2r_materialize(data.cpu(), auxiliary.cpu(), metadata)[0]
     actual = iq2r_materialize_device(data, auxiliary, metadata).cpu()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

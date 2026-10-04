@@ -71,3 +71,7 @@ def test_reference_encoder_preserves_zero_padded_k():
         data.unsqueeze(0), auxiliary.unsqueeze(0), IQ2RMetadata(16, 2944)
     )
     torch.testing.assert_close(padded[..., 2880:], torch.zeros_like(padded[..., 2880:]))
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

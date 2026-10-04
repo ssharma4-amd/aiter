@@ -17,7 +17,6 @@ from aiter.ops.iq2r_format import (
     iq2r_validate_expert_weights,
 )
 
-
 # GLM-5.3 expert projections: hidden 6144, moe_intermediate 2048.
 _GLM53_GATE_UP = (4096, 6144)
 _GLM53_DOWN = (6144, 2048)
@@ -125,3 +124,7 @@ def test_dataclass_replacement_cannot_relabel_o0():
     metadata = IQ2RMetadata(*_GLM53_DOWN)
     with pytest.raises(ValueError, match="activation_basis"):
         dataclasses.replace(metadata, activation_basis="hadamard")
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

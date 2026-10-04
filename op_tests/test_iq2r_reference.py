@@ -131,7 +131,7 @@ def test_materializer_decodes_codebook_sign_index_and_e8m0_scale():
 
 
 def test_reserved_zero_codeword_makes_padded_k_exact_zero():
-    metadata, data, auxiliary = _empty_fixture(n=96, k=2880)
+    _, data, auxiliary = _empty_fixture(n=96, k=2880)
     # Entry one is non-zero while every record remains reserved entry zero.
     codebook = torch.zeros((512, IQ2R_VECTOR_SIZE), dtype=torch.float32)
     codebook[1] = 3
@@ -148,3 +148,7 @@ def test_materializer_rejects_nonzero_reserved_codeword():
     auxiliary[0, 0] = 1
     with pytest.raises(ValueError, match="all-zero"):
         iq2r_materialize(data, auxiliary, metadata)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

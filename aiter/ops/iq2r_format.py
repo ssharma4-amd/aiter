@@ -291,7 +291,8 @@ def iq2r_slice_output_auxiliary(
     output[:, IQ2R_CODEBOOK_BYTES : IQ2R_CODEBOOK_BYTES + target.n_blocks].copy_(
         auxiliary[
             :,
-            IQ2R_CODEBOOK_BYTES + source_block_start : IQ2R_CODEBOOK_BYTES
+            IQ2R_CODEBOOK_BYTES
+            + source_block_start : IQ2R_CODEBOOK_BYTES
             + source_block_start
             + target.n_blocks,
         ]

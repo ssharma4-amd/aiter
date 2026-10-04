@@ -289,3 +289,7 @@ def test_gemm_a8w8_bpreshuffle_rejects_short_weight_k():
 
     with pytest.raises(RuntimeError, match="WQ K >= XQ K"):
         gemm_mod.gemm_a8w8_bpreshuffle(xq, wq, x_scale, w_scale, dtype=torch.bfloat16)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

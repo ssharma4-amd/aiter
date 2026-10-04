@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# ruff: noqa: B023  closures run within the loop iteration that defines them
 """Tune GLM-5.3 IQ2R MoE launch choices per token count.
 
 Reads shapes from ``aiter/configs/iq2r_glm53_untuned.csv``, times every

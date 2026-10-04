@@ -81,3 +81,7 @@ def test_flydsl_runtime_error_is_not_hidden(monkeypatch):
             0,
             config={"kernelName": "runtime-failure"},
         )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

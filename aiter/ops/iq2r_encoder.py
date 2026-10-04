@@ -28,7 +28,6 @@ from .iq2r_reference import (
     iq2r_tile_views,
 )
 
-
 # The standard IQ2_XXS positive-magnitude grid serialized as 256 eight-byte
 # vectors.  Two E4M3 phases seed the 512-entry learned IQ2R codebook.
 _IQ2_XXS_GRID_BYTES = base64.b64decode(
