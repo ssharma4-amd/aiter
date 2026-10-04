@@ -613,6 +613,7 @@ void iq2r_route_gather_quant_out(const aiter_tensor_t& input,
     const bool tiled_scales = scales.dim() == 4;
     const int scale_m_blocks = static_cast<int>((output.size(0) + 15) / 16);
     const int64_t groups = output.size(0) * groups_per_row;
+    HipDeviceGuard device_guard(device);
     hipLaunchKernelGGL(iq2r_route_gather_quant_kernel,
                        dim3((groups + kQuantThreads - 1) / kQuantThreads),
                        dim3(kQuantThreads),
@@ -696,6 +697,7 @@ void iq2r_route_direct_gather_quant_out(const aiter_tensor_t& input,
     const bool tiled_scales = scales.dim() == 4;
     const int scale_m_blocks = static_cast<int>((routes + 15) / 16);
     const bool wide = groups_per_row > kDirectQuantThreads;
+    HipDeviceGuard device_guard(device);
     hipLaunchKernelGGL((wide ? iq2r_route_direct_gather_quant_kernel<2 * kDirectQuantThreads>
                              : iq2r_route_direct_gather_quant_kernel<kDirectQuantThreads>),
                        dim3(static_cast<uint32_t>(input.size(0))),

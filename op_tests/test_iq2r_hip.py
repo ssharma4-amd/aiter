@@ -38,7 +38,7 @@ def test_device_encoder_matches_reference(k):
     torch.testing.assert_close(actual_auxiliary, expected_auxiliary, rtol=0, atol=0)
 
 
-def test_device_encoder_honors_noncurrent_gpu():
+def test_device_kernels_honor_noncurrent_gpu():
     if torch.cuda.device_count() < 2:
         pytest.skip("requires at least two visible GPUs")
 
@@ -55,6 +55,14 @@ def test_device_encoder_honors_noncurrent_gpu():
     assert torch.cuda.current_device() == 0
     torch.testing.assert_close(actual_data, expected_data, rtol=0, atol=0)
     torch.testing.assert_close(actual_auxiliary, expected_auxiliary, rtol=0, atol=0)
+
+    metadata = IQ2RMetadata(64, 128)
+    data = actual_data.reshape(1, -1)
+    auxiliary = actual_auxiliary.reshape(1, -1)
+    expected = iq2r_materialize(data.cpu(), auxiliary.cpu(), metadata)[0]
+    actual = iq2r_materialize_device(data, auxiliary, metadata)
+    assert actual.device == target and torch.cuda.current_device() == 0
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
 
 
 # N=96 leaves a partially filled six-block group; K=2048 is the GLM-5.3 TP1

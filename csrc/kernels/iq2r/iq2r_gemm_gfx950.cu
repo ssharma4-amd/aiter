@@ -3041,6 +3041,7 @@ void iq2r_encode_out(const aiter_tensor_t& weight,
     AITER_CHECK(scale_delta_overflow.numel() == 1,
                 "IQ2R scale_delta_overflow must have one element");
 
+    HipDeviceGuard device_guard(device);
     const auto stream = getCurrentHIPStream();
     const int64_t logical_blocks = N * (valid_k / 32);
     hipLaunchKernelGGL(iq2r_encode_assign_kernel,
@@ -3105,6 +3106,7 @@ void iq2r_materialize_out(const aiter_tensor_t& data,
                 "IQ2R expert_index is out of range");
     const int64_t elements = logical_n * logical_k;
     constexpr int threads = 256;
+    HipDeviceGuard device_guard(data.device_id);
     hipLaunchKernelGGL(iq2r_materialize_kernel,
                        dim3(static_cast<uint32_t>((elements + threads - 1) / threads)),
                        dim3(threads),
