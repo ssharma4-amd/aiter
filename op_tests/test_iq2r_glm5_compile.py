@@ -248,7 +248,8 @@ def test_loads_compact_glm_calibration_artifact(tmp_path):
     assert torch.equal(loaded.for_projection(3, "gate_up", 0), torch.ones(4))
 
 
-def test_loads_shared_expert_calibration_targets(tmp_path):
+@pytest.mark.parametrize("grouped", [False, True])
+def test_loads_shared_expert_calibration_targets(tmp_path, grouped):
     layout = GLM5Layout(
         layer_count=5,
         first_moe_layer=3,
@@ -269,11 +270,12 @@ def test_loads_shared_expert_calibration_targets(tmp_path):
         targets[f"model.layers.{layer}.mlp.experts.down_proj.weight"] = {
             "importance": torch.ones(layout.expert_count, layout.intermediate_size)
         }
+        groups = (1,) if grouped else ()
         targets[f"model.layers.{layer}.mlp.shared_experts.gate_up_proj.weight"] = {
-            "importance": torch.full((layout.hidden_size,), layer + 3.0)
+            "importance": torch.full(groups + (layout.hidden_size,), layer + 3.0)
         }
         targets[f"model.layers.{layer}.mlp.shared_experts.down_proj.weight"] = {
-            "importance": torch.full((layout.intermediate_size,), layer + 4.0)
+            "importance": torch.full(groups + (layout.intermediate_size,), layer + 4.0)
         }
     path = tmp_path / "calibration.pt"
     torch.save(
@@ -366,7 +368,7 @@ def test_resume_validates_existing_projection_shard(tmp_path):
         shard,
         metadata=file_metadata,
     )
-    with pytest.raises(ValueError, match="invalid resume shard.*expected U8"):
+    with pytest.raises(ValueError, match="invalid compiled shard.*expected U8"):
         _validate_projection_shard(
             shard,
             layout,
@@ -375,3 +377,7 @@ def test_resume_validates_existing_projection_shard(tmp_path):
             "diagnostic-uniform-not-o0-quality",
             safe_open,
         )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

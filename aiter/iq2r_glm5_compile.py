@@ -3,9 +3,10 @@
 
 """Compile GLM-5.3 block-FP8 routed experts into AITER IQ2R tensors.
 
-This tool writes an expert-only checkpoint in the generic IQ2R layout. Relay
-it out with ``aiter.iq2r_glm53.iq2r_glm53_pack`` and merge it with the base
-model's non-expert tensors to build a checkpoint the GLM-5.3 kernels can load.
+This tool writes an expert-only checkpoint in the generic IQ2R layout.
+``aiter.iq2r_overlay`` combines it with the base model, and
+``aiter.iq2r_glm53_pack_checkpoint`` writes the packed checkpoint the GLM-5.3
+kernels load.
 An IQ2R calibration artifact/cache is required for a production build.
 Uniform importance is available only behind an explicit diagnostic flag and is
 recorded as not O0-quality in the generated config.
@@ -186,7 +187,6 @@ def glm5_source_layout(config: dict[str, Any]) -> GLM5Layout:
         )
     ):
         raise ValueError("IQ2R GLM compiler requires a GLM MoE DSA checkpoint")
-    text = config
     quantization = config.get("quantization_config")
     if not isinstance(quantization, dict) or quantization.get("quant_method") != "fp8":
         raise ValueError("GLM-5 IQ2R source must use block-FP8 weights")
@@ -198,14 +198,14 @@ def glm5_source_layout(config: dict[str, Any]) -> GLM5Layout:
     ):
         raise ValueError("GLM-5 FP8 config has no valid weight_block_size")
     layout = GLM5Layout(
-        layer_count=int(text.get("num_hidden_layers", -1)),
-        first_moe_layer=int(text.get("first_k_dense_replace", -1)),
-        expert_count=int(text.get("n_routed_experts", -1)),
-        hidden_size=int(text.get("hidden_size", -1)),
-        intermediate_size=int(text.get("moe_intermediate_size", -1)),
+        layer_count=int(config.get("num_hidden_layers", -1)),
+        first_moe_layer=int(config.get("first_k_dense_replace", -1)),
+        expert_count=int(config.get("n_routed_experts", -1)),
+        hidden_size=int(config.get("hidden_size", -1)),
+        intermediate_size=int(config.get("moe_intermediate_size", -1)),
         block_n=block_size[0],
         block_k=block_size[1],
-        shared_expert_count=int(text.get("n_shared_experts", 0) or 0),
+        shared_expert_count=int(config.get("n_shared_experts", 0) or 0),
     )
     if not (0 <= layout.first_moe_layer < layout.layer_count):
         raise ValueError("GLM-5 config has an invalid routed-MoE layer range")
@@ -369,6 +369,13 @@ def _load_calibration_artifact(
         importance = target.get("importance")
         if not isinstance(importance, Tensor):
             raise TypeError(f"calibration target {name!r} has no importance tensor")
+        if (
+            module == "shared_experts"
+            and importance.dim() == 2
+            and importance.shape[0] == 1
+        ):
+            # Every target is stored as [groups, K]; the shared expert has one group.
+            importance = importance[0]
         destination = shared_projections if module == "shared_experts" else projections
         destination[projection][layer] = importance
 
@@ -687,7 +694,7 @@ def _validate_projection_shard(
     *,
     fuse_shared_expert: bool = False,
 ) -> None:
-    """Validate an existing projection shard before accepting ``--resume``."""
+    """Validate a compiled projection shard for ``--resume`` and the overlay."""
 
     metadata = _projection_metadata(layout, projection)
     keys = iq2r_compiled_tensor_keys(layer, projection)
@@ -738,10 +745,10 @@ def _validate_projection_shard(
                 raise ValueError(f"tile_n is {tile_n.item()}, expected 128")
     except Exception as error:
         if isinstance(error, ValueError) and str(error).startswith(
-            f"invalid resume shard {shard_path}:"
+            f"invalid compiled shard {shard_path}:"
         ):
             raise
-        raise ValueError(f"invalid resume shard {shard_path}: {error}") from error
+        raise ValueError(f"invalid compiled shard {shard_path}: {error}") from error
 
 
 def _compile_projection(

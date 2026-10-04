@@ -13,6 +13,53 @@ copy kept on the GPU. A checkpoint stored in this layout can be sliced to
 any supported TP rank with contiguous slices (`iq2r_glm53_slice_gate`, and
 the generic `iq2r_slice_*` helpers for down and aux).
 
+## Building the checkpoint
+
+Three tools turn the block-FP8 GLM-5.3 checkpoint and an importance
+calibration file into the packed checkpoint ATOM serves. The calibration
+file is an `iq2r-calibration` artifact (diagonal E[x^2] per
+routed expert and per shared expert, `iq2r-diagonal-second-moment`). Its
+capture runs outside aiter.
+
+1. `aiter.iq2r_glm5_compile` encodes the routed experts of layers 3-77, plus
+   the shared expert fused as expert 256, into per-layer IQ2R shards. It runs
+   on the GPU, and the layers can be split across GPUs:
+
+       SLICES=(3-12 13-22 23-32 33-42 43-51 52-60 61-69 70-77)
+       for i in 0 1 2 3 4 5 6 7; do
+         python3 -m aiter.iq2r_glm5_compile --model-dir $FP8 \
+             --output-dir build/part$i --calibration-cache calibration.pt \
+             --device cuda:$i --layers ${SLICES[$i]} --fuse-shared-expert \
+             --iterations 4 --sample-vectors 65536 --resume &
+       done; wait
+
+   Link all 150 `iq2r-layer-*.safetensors` shards into one `$COMPILED`
+   directory. Then rerun with `--layers 3-77 --resume` on one GPU; this
+   validates every shard against the calibration file without re-encoding.
+2. `aiter.iq2r_overlay` writes a model directory in the generic IQ2R layout.
+   It links the compiled shards and the FP8 shards, indexes the compiled
+   tensors in place of the FP8 experts and writes a config with
+   `quantization_config`:
+
+       python3 -m aiter.iq2r_overlay --model-dir $FP8 \
+           --compiled-iq2r-dir $COMPILED --output-dir $OVERLAY
+
+3. `aiter.iq2r_glm53_pack_checkpoint` writes the self-contained packed
+   checkpoint (`iq2r_layout` = `glm53-packed-v1`). The `iq2r` stage runs
+   `iq2r_glm53_pack` on each layer on the GPU. `base` re-shards the
+   non-expert tensors, and `meta` writes the index, config and tokenizer:
+
+       for p in 0 1 2 3 4 5 6 7; do
+         HIP_VISIBLE_DEVICES=$p python3 -m aiter.iq2r_glm53_pack_checkpoint \
+             $OVERLAY $PACKED iq2r --part $p --parts 8 &
+       done; wait
+       python3 -m aiter.iq2r_glm53_pack_checkpoint $OVERLAY $PACKED base
+       python3 -m aiter.iq2r_glm53_pack_checkpoint $OVERLAY $PACKED meta
+
+On 8 MI355X GPUs the compile and pack take about 10 minutes. The result is
+about 235 GB and loads at any supported TP width with no load-time
+relayout.
+
 ## Dispatch
 
 `iq2r_glm53_moe_out` looks up the launch choice for the token count in
@@ -22,7 +69,7 @@ model_dim, inter_dim, expert, topk). Token counts without a row use
 names:
 
 - the gate kernel (`decode`, `nobarrier`, `prefill`) and its grid;
-- the down kernel (`route9`, `packed`, `ordered`, `prefill`) and its grid;
+- the down kernel (`route9`, `single`, `packed`, `ordered`, `prefill`) and its grid;
 - the number of prefill down chunks.
 
 `AITER_CONFIG_IQ2R_GLM53` points the lookup at a different CSV. To tune
@@ -82,11 +129,10 @@ TP8, ISL 1024 (IQ2R peak weights 32.7 GB/GPU, 230.5k KV blocks):
 | 128 | 4532.0 | 26.98 | 4089.4 | +10.8% |
 | 256 | 6330.3 | 38.79 | 5808.4 | +9.0% |
 
-A rerun of the tuner reproduces the TP4 rows to within 0.6%. For TP8 it
-picks different launches at some token counts (up to 4.9% faster in
-isolation), but serving with those rows is within noise of the committed
-CSV (−4.1% at C16, +2.3% at C64, within 1% elsewhere), so the committed rows
-are kept.
+The tuner times each candidate by CUDA graph replay, as serving runs it;
+eager timing adds host overhead that hides the best small-M launches. The
+decode kernels accept up to 1024 tokens so the CSV can choose them for MTP
+verify batches, which are (1 + speculative tokens) x concurrency.
 
 ## Tests
 
@@ -95,12 +141,5 @@ reference (device-materialized weights, MXFP8 activations, BF16 SiLU·up) for
 M = 1..3000 at both TP widths, the chunked long prefill, that packing commutes
 with TP slicing, and the tuned CSV lookup. `op_tests/test_iq2r_hip.py` checks
 the device encoder and materializer bit-exactly against the host reference.
-
-## Producing a checkpoint
-
-Checkpoint production is offline. `aiter/iq2r_glm5_compile.py` encodes the
-GLM-5.3 FP8 routed and shared experts to generic IQ2R records (gate/up
-interleaved; pass `--fuse-shared-expert` to append the shared expert as
-expert 256, which the packed path requires); `iq2r_glm53_pack` then
-re-lays the full-width TP1 stack into the packed layout, which ATOM slices to
-TP4 or TP8 at load time.
+`op_tests/test_iq2r_glm5_compile.py`, `test_iq2r_overlay.py` and
+`test_iq2r_glm53_pack_checkpoint.py` cover the three checkpoint tools.
