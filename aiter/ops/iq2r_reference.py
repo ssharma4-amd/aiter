@@ -14,12 +14,13 @@ import torch
 from torch import Tensor
 
 from .iq2r_format import (
-    IQ2R_ATOMS_PER_TRIPLET,
     IQ2R_ATOM_TWO_METADATA_OFFSET,
     IQ2R_ATOM_TWO_RECORD_BYTES,
     IQ2R_ATOM_TWO_RECORDS_OFFSET,
+    IQ2R_ATOMS_PER_TRIPLET,
     IQ2R_CODEBOOK_BYTES,
     IQ2R_CODEBOOK_ENTRIES,
+    IQ2R_GROUP_BYTES,
     IQ2R_LANE_RECORD_BYTES,
     IQ2R_LANES_PER_TILE,
     IQ2R_N_BLOCKS_PER_GROUP,
@@ -28,7 +29,6 @@ from .iq2r_format import (
     IQ2R_TILE_N,
     IQ2R_TRIPLET_BYTES,
     IQ2R_VECTOR_SIZE,
-    IQ2R_GROUP_BYTES,
     IQ2RMetadata,
     iq2r_validate_expert_weights,
 )

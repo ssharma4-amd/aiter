@@ -10,8 +10,9 @@ buffers before allocating GPU memory or launching a kernel.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, fields
-from typing import Any, Mapping
+from typing import Any
 
 import torch
 from torch import Tensor
@@ -227,7 +228,7 @@ class IQ2RMetadata:
         return result
 
     @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> "IQ2RMetadata":
+    def from_dict(cls, value: Mapping[str, Any]) -> IQ2RMetadata:
         serialized = dict(value)
         required = (
             "logical_n",

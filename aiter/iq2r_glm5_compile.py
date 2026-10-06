@@ -7,7 +7,8 @@ This tool writes an expert-only checkpoint in the generic IQ2R layout.
 ``aiter.iq2r_overlay`` combines it with the base model, and
 ``aiter.iq2r_glm53_pack_checkpoint`` writes the packed checkpoint the GLM-5.3
 kernels load.
-An IQ2R calibration artifact/cache is required for a production build.
+A calibration artifact from ``aiter.iq2r_glm5_calibrate`` is required for a
+production build.
 Uniform importance is available only behind an explicit diagnostic flag and is
 recorded as not O0-quality in the generated config.
 """
@@ -22,7 +23,7 @@ import re
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Self
+from typing import Any
 
 import torch
 from torch import Tensor
@@ -454,7 +455,8 @@ def load_glm5_importance(
     if path is None:
         if not diagnostic_uniform_importance:
             raise ValueError(
-                "production IQ2R compilation requires a calibration cache; "
+                "production IQ2R compilation requires a calibration cache from "
+                "aiter.iq2r_glm5_calibrate; "
                 "use --diagnostic-uniform-importance only for kernel bring-up"
             )
         gate_up = torch.ones(
@@ -522,7 +524,7 @@ class _TensorReader:
         self.stack = ExitStack()
         self.handles: dict[str, Any] = {}
 
-    def __enter__(self) -> Self:
+    def __enter__(self):
         return self
 
     def __exit__(self, *args) -> None:
