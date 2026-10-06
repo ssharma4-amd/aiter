@@ -18,10 +18,10 @@ the generic `iq2r_slice_*` helpers for down and aux).
 
 ## Building the checkpoint
 
-Four tools turn the block-FP8 GLM-5.3 checkpoint into the packed checkpoint
+Two tools turn the block-FP8 GLM-5.3 checkpoint into the packed checkpoint
 ATOM serves.
 
-0. `aiter.iq2r_glm5_calibrate` runs the FP8 model in Hugging Face
+1. `aiter.iq2r_glm5_calibrate` runs the FP8 model in Hugging Face
    Transformers (5.16 or newer, plus `kernels` for the FP8 matmul) over a
    text corpus, prefill only. For every routed and shared expert projection
    it records the importance of each input channel k,
@@ -48,45 +48,31 @@ ATOM serves.
    inputs, which the artifact records; any still unobserved is an error. On
    a host without Hugging Face Hub access, `--fp8-kernel-dir` loads a local
    build of `kernels-community/finegrained-fp8`.
-1. `aiter.iq2r_glm5_compile` encodes the routed experts of layers 3-77, plus
-   the shared expert fused as expert 256, into per-layer IQ2R shards. It runs
-   on the GPU, weighting every error term by the calibrated importance, and
-   the layers can be split across GPUs:
+2. `aiter.iq2r_glm5_compile` writes the packed checkpoint
+   (`iq2r_layout` = `glm53-packed-v1`). For each MoE layer (3-77) it encodes
+   the 256 routed experts and the shared expert, fused as expert 256, on the
+   GPU, weighting every error term by the calibrated importance. It packs the
+   layer with `iq2r_glm53_pack` and writes
+   `iq2r-layer-NNNN-{gate-up,down}.safetensors`. The layers can be split
+   across GPUs:
 
        SLICES=(3-12 13-22 23-32 33-42 43-51 52-60 61-69 70-77)
        for i in 0 1 2 3 4 5 6 7; do
          python3 -m aiter.iq2r_glm5_compile --model-dir $FP8 \
-             --output-dir build/part$i --calibration-cache calibration.pt \
-             --device cuda:$i --layers ${SLICES[$i]} --fuse-shared-expert \
-             --iterations 4 --sample-vectors 65536 --resume &
+             --output-dir $OUT --calibration-cache calibration.pt \
+             --device cuda:$i --layers ${SLICES[$i]} --resume &
        done; wait
+       python3 -m aiter.iq2r_glm5_compile --model-dir $FP8 \
+           --output-dir $OUT --calibration-cache calibration.pt --resume
 
-   Link all 150 `iq2r-layer-*.safetensors` shards into one `$COMPILED`
-   directory. Then rerun with `--layers 3-77 --resume` on one GPU; this
-   validates every shard against the calibration file without re-encoding.
-2. `aiter.iq2r_overlay` writes a model directory in the generic IQ2R layout.
-   It links the compiled shards and the FP8 shards, indexes the compiled
-   tensors in place of the FP8 experts and writes a config with
-   `quantization_config`:
+   The last run covers every layer. It validates the existing layer files
+   against the calibration file instead of re-encoding them, copies the
+   remaining FP8 tensors into new shards and writes the index, config and
+   tokenizer. The config lists one `iq2r_modules` pattern per compiled layer,
+   so the experts of the MTP layer (78) stay FP8.
 
-       python3 -m aiter.iq2r_overlay --model-dir $FP8 \
-           --compiled-iq2r-dir $COMPILED --output-dir $OVERLAY
-
-3. `aiter.iq2r_glm53_pack_checkpoint` writes the self-contained packed
-   checkpoint (`iq2r_layout` = `glm53-packed-v1`). The `iq2r` stage runs
-   `iq2r_glm53_pack` on each layer on the GPU. `base` re-shards the
-   non-expert tensors, and `meta` writes the index, config and tokenizer:
-
-       for p in 0 1 2 3 4 5 6 7; do
-         HIP_VISIBLE_DEVICES=$p python3 -m aiter.iq2r_glm53_pack_checkpoint \
-             $OVERLAY $PACKED iq2r --part $p --parts 8 &
-       done; wait
-       python3 -m aiter.iq2r_glm53_pack_checkpoint $OVERLAY $PACKED base
-       python3 -m aiter.iq2r_glm53_pack_checkpoint $OVERLAY $PACKED meta
-
-On 8 MI355X GPUs, steps 1-3 take about 10 minutes. The result is
-about 235 GB and loads at any supported TP width with no load-time
-relayout.
+The result is about 235 GB and loads at any supported TP width with no
+load-time relayout.
 
 ## Dispatch
 
@@ -174,7 +160,8 @@ reference (device-materialized weights, MXFP8 activations, BF16 SiLU·up) for
 M = 1..3000 at both TP widths, the chunked long prefill, that packing commutes
 with TP slicing, and the tuned CSV lookup. `op_tests/test_iq2r_hip.py` checks
 the device encoder and materializer bit-exactly against the host reference.
-`op_tests/test_iq2r_glm5_calibrate.py`, `test_iq2r_glm5_compile.py`,
-`test_iq2r_overlay.py` and `test_iq2r_glm53_pack_checkpoint.py` cover the
-four checkpoint tools; the calibration test runs the capture on a tiny
-random GLM MoE DSA model on the CPU and skips without Transformers.
+`op_tests/test_iq2r_glm5_calibrate.py` and `test_iq2r_glm5_compile.py`
+cover the two checkpoint tools. The calibration test runs the capture on a
+tiny random GLM MoE DSA model on the CPU and skips without Transformers. The
+compile test checks the written shards, index and config, and runs a split
+build with random records in place of the encoder.

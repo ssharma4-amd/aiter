@@ -1,25 +1,28 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Compile GLM-5.3 block-FP8 routed experts into AITER IQ2R tensors.
+"""Compile a block-FP8 GLM-5.3 checkpoint into the packed IQ2R checkpoint.
 
-This tool writes an expert-only checkpoint in the generic IQ2R layout.
-``aiter.iq2r_overlay`` combines it with the base model, and
-``aiter.iq2r_glm53_pack_checkpoint`` writes the packed checkpoint the GLM-5.3
-kernels load.
+For each MoE layer the routed experts, plus the shared expert fused as the
+last expert, are encoded to IQ2R on the GPU, packed with
+``aiter.iq2r_glm53.iq2r_glm53_pack`` and written as
+``iq2r-layer-NNNN-{gate-up,down}.safetensors``. A run over every MoE layer
+then copies the remaining FP8 tensors into new shards and writes the index,
+config.json and tokenizer files, so the output directory is a complete
+checkpoint. The MTP layer keeps its FP8 experts.
 A calibration artifact from ``aiter.iq2r_glm5_calibrate`` is required for a
 production build.
 Uniform importance is available only behind an explicit diagnostic flag and is
-recorded as not O0-quality in the generated config.
+recorded as not O0-quality in every layer file.
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import re
+import shutil
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +31,7 @@ from typing import Any
 import torch
 from torch import Tensor
 
+from .iq2r_glm53 import iq2r_glm53_gate_bytes, iq2r_glm53_pack
 from .ops.iq2r import iq2r_encode_device
 from .ops.iq2r_encoder import iq2r_learn_codebook
 from .ops.iq2r_format import (
@@ -43,10 +47,20 @@ _TARGET_PATTERN = re.compile(
     r"^model\.layers\.(\d+)\.mlp\.(experts|shared_experts)\."
     r"(gate_up_proj|up_gate_proj|down_proj)\.weight$"
 )
+LAYOUT = "glm53-packed-v1"
+_SHARD_BYTES = 5 << 30
+_PROJECTIONS = {"gate_up": "gate-up", "down": "down"}
+_MODEL_FILES = (
+    "generation_config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "chat_template.jinja",
+    "LICENSE",
+)
 
 
 def iq2r_compiled_tensor_keys(layer_index: int, projection: str) -> dict[str, str]:
-    """Return the compiled-checkpoint keys for one stacked projection."""
+    """Return the checkpoint keys for one stacked projection."""
 
     if isinstance(layer_index, bool) or not isinstance(layer_index, int):
         raise TypeError("layer_index must be an int")
@@ -62,9 +76,12 @@ def iq2r_compiled_tensor_keys(layer_index: int, projection: str) -> dict[str, st
     return {
         "data": f"{prefix}.iq2r_data",
         "auxiliary": f"{prefix}.iq2r_auxiliary",
-        "bias": f"{prefix}.bias",
         "tile_n": f"{prefix}.iq2r_tN",
     }
+
+
+def _layer_file(layer: int, projection: str) -> str:
+    return f"iq2r-layer-{layer:04d}-{_PROJECTIONS[projection]}.safetensors"
 
 
 def _glm5_expert_keys(prefix: str) -> dict[str, str]:
@@ -629,12 +646,11 @@ def _projection_metadata(layout: GLM5Layout, projection: str) -> IQ2RMetadata:
     raise ValueError(f"unknown projection {projection!r}")
 
 
-def _compiled_expert_count(layout: GLM5Layout, fuse_shared_expert: bool) -> int:
-    if not fuse_shared_expert:
-        return layout.expert_count
+def _compiled_expert_count(layout: GLM5Layout) -> int:
     if layout.shared_expert_count != 1:
         raise ValueError(
-            "fused IQ2R shared-expert compilation requires exactly one shared expert"
+            "the packed GLM-5.3 layout fuses exactly one shared expert, but the "
+            f"source declares {layout.shared_expert_count}"
         )
     return layout.expert_count + 1
 
@@ -646,10 +662,8 @@ def _source_projection(
     expert: int,
     projection: str,
     device: torch.device | str,
-    *,
-    fuse_shared_expert: bool = False,
 ) -> Tensor:
-    if expert == layout.expert_count and fuse_shared_expert:
+    if expert == layout.expert_count:
         names = iq2r_glm5_shared_source_keys(layer, root=layout.source_root)
     else:
         names = iq2r_glm5_source_keys(layer, expert, root=layout.source_root)
@@ -685,16 +699,19 @@ def _validate_projection_shard(
     projection: str,
     quality: str,
     safe_open,
-    *,
-    fuse_shared_expert: bool = False,
 ) -> None:
-    """Validate a compiled projection shard for ``--resume`` and the overlay."""
+    """Validate a packed layer file for ``--resume``."""
 
     metadata = _projection_metadata(layout, projection)
+    data_bytes = (
+        iq2r_glm53_gate_bytes(metadata.logical_n)
+        if projection == "gate_up"
+        else metadata.data_bytes
+    )
     keys = iq2r_compiled_tensor_keys(layer, projection)
-    compiled_experts = _compiled_expert_count(layout, fuse_shared_expert)
+    compiled_experts = _compiled_expert_count(layout)
     expected_tensors = {
-        keys["data"]: ([compiled_experts, metadata.data_bytes], "U8"),
+        keys["data"]: ([compiled_experts, data_bytes], "U8"),
         keys["auxiliary"]: (
             [compiled_experts, metadata.auxiliary_bytes],
             "U8",
@@ -708,6 +725,7 @@ def _validate_projection_shard(
         "iq2r_layer": str(layer),
         "iq2r_projection": projection,
         "iq2r_quality": quality,
+        "iq2r_layout": LAYOUT,
     }
     try:
         with safe_open(shard_path, framework="pt", device="cpu") as handle:
@@ -744,57 +762,25 @@ def _validate_projection_shard(
         raise ValueError(f"invalid compiled shard {shard_path}: {error}") from error
 
 
-def _compile_projection(
+def _encode_projection(
     reader: _TensorReader,
     layout: GLM5Layout,
     importance: GLM5Importance,
     layer: int,
     projection: str,
-    output_dir: Path,
     *,
     device: torch.device | str,
     iterations: int,
     sample_vectors: int,
-    force: bool,
-    resume: bool,
-    safe_open,
-    save_file,
-    fuse_shared_expert: bool = False,
-) -> str:
-    suffix = "gate-up" if projection == "gate_up" else "down"
-    shard_name = f"iq2r-layer-{layer:04d}-{suffix}.safetensors"
-    shard_path = output_dir / shard_name
-    if shard_path.exists():
-        if resume:
-            _validate_projection_shard(
-                shard_path,
-                layout,
-                layer,
-                projection,
-                importance.quality,
-                safe_open,
-                fuse_shared_expert=fuse_shared_expert,
-            )
-            return shard_name
-        if not force:
-            raise FileExistsError(f"refusing to overwrite {shard_path}; pass --force")
-
+) -> tuple[Tensor, Tensor]:
     metadata = _projection_metadata(layout, projection)
-    compiled_experts = _compiled_expert_count(layout, fuse_shared_expert)
+    compiled_experts = _compiled_expert_count(layout)
     data = torch.empty((compiled_experts, metadata.data_bytes), dtype=torch.uint8)
     auxiliary = torch.empty(
         (compiled_experts, metadata.auxiliary_bytes), dtype=torch.uint8
     )
     for expert in range(compiled_experts):
-        weight = _source_projection(
-            reader,
-            layout,
-            layer,
-            expert,
-            projection,
-            device,
-            fuse_shared_expert=fuse_shared_expert,
-        )
+        weight = _source_projection(reader, layout, layer, expert, projection, device)
         expected = (metadata.logical_n, metadata.logical_k)
         if tuple(weight.shape) != expected:
             raise ValueError(
@@ -828,30 +814,61 @@ def _compile_projection(
                 ),
                 flush=True,
             )
+    return data, auxiliary
 
-    keys = iq2r_compiled_tensor_keys(layer, projection)
-    tensors = {
-        keys["data"]: data,
-        keys["auxiliary"]: auxiliary,
-        keys["tile_n"]: torch.tensor([128], dtype=torch.int32),
-    }
-    temporary = shard_path.with_suffix(shard_path.suffix + ".tmp")
-    if temporary.exists():
-        temporary.unlink()
-    save_file(
-        tensors,
-        temporary,
-        metadata={
-            "format": "pt",
-            "iq2r_format": IQ2R_FORMAT_NAME,
-            "iq2r_activation_basis": IQ2R_ACTIVATION_BASIS,
-            "iq2r_layer": str(layer),
-            "iq2r_projection": projection,
-            "iq2r_quality": importance.quality,
-        },
+
+def _compile_layer(
+    reader: _TensorReader,
+    layout: GLM5Layout,
+    importance: GLM5Importance,
+    layer: int,
+    output_dir: Path,
+    *,
+    device: torch.device,
+    iterations: int,
+    sample_vectors: int,
+    save_file,
+) -> None:
+    encoded = [
+        _encode_projection(
+            reader,
+            layout,
+            importance,
+            layer,
+            projection,
+            device=device,
+            iterations=iterations,
+            sample_vectors=sample_vectors,
+        )
+        for projection in _PROJECTIONS
+    ]
+    # Returns (gate_quad, gate_auxiliary, down_data, down_auxiliary).
+    packed = iq2r_glm53_pack(
+        *(tensor.to(device) for pair in encoded for tensor in pair),
+        intermediate_size=layout.intermediate_size,
     )
-    os.replace(temporary, shard_path)
-    return shard_name
+    for projection, data, auxiliary in zip(_PROJECTIONS, packed[::2], packed[1::2]):
+        keys = iq2r_compiled_tensor_keys(layer, projection)
+        path = output_dir / _layer_file(layer, projection)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        save_file(
+            {
+                keys["data"]: data.cpu().contiguous(),
+                keys["auxiliary"]: auxiliary.cpu().contiguous(),
+                keys["tile_n"]: torch.tensor([128], dtype=torch.int32),
+            },
+            temporary,
+            metadata={
+                "format": "pt",
+                "iq2r_format": IQ2R_FORMAT_NAME,
+                "iq2r_activation_basis": IQ2R_ACTIVATION_BASIS,
+                "iq2r_layer": str(layer),
+                "iq2r_projection": projection,
+                "iq2r_quality": importance.quality,
+                "iq2r_layout": LAYOUT,
+            },
+        )
+        os.replace(temporary, path)
 
 
 def _validate_device(device: torch.device) -> None:
@@ -867,53 +884,110 @@ def _validate_device(device: torch.device) -> None:
         )
 
 
-def _compiled_config(
-    source_config: dict[str, Any],
+def _tensor_bytes(path: Path) -> dict[str, int]:
+    """Return the byte size of each tensor in a safetensors file."""
+
+    with path.open("rb") as handle:
+        header = json.loads(handle.read(int.from_bytes(handle.read(8), "little")))
+    return {
+        name: info["data_offsets"][1] - info["data_offsets"][0]
+        for name, info in header.items()
+        if name != "__metadata__"
+    }
+
+
+def _write_checkpoint_files(
+    model_dir: Path,
+    output_dir: Path,
+    config: dict[str, Any],
+    weight_map: dict[str, str],
     layout: GLM5Layout,
-    importance: GLM5Importance,
-    selected_layers: list[int],
-    file_manifest: list[str],
-    source_model: str,
-    source_config_sha256: str,
-    fuse_shared_expert: bool = False,
-) -> dict[str, Any]:
-    result: dict[str, Any] = {
-        "architectures": list(source_config.get("architectures") or []),
-        "model_type": layout.model_family,
-        "compiled_tensor_parallel_size": 1,
-        "compiled_expert_parallel_size": 1,
-        "storage_format": "safetensors",
-        "profile": "o0" if importance.quality == "calibrated-o0" else "diagnostic",
-        "file_manifest": file_manifest,
-        "iq2r": {
-            "format": IQ2R_FORMAT_NAME,
-            "activation_basis": IQ2R_ACTIVATION_BASIS,
-            "expert_projection_modules": {
-                "gate_up": "up_gate_proj",
-                "down": "down_proj",
-            },
-            "expert_bias": False,
-            "gate_up_row_order": "gate-up-interleaved",
-            "model_family": layout.model_family,
-            "source_root": layout.source_root,
-            "quality": importance.quality,
-            "compiled_expert_count": _compiled_expert_count(layout, fuse_shared_expert),
-            "fused_shared_expert": fuse_shared_expert,
-            "compiled_layers": selected_layers,
-            "source_model": source_model,
-            "source_config_sha256": source_config_sha256,
-            "calibration": importance.metadata,
-        },
+    safe_open,
+    save_file,
+) -> Path:
+    """Write the FP8 shards, index, config.json and tokenizer files.
+
+    Every source tensor except the compiled experts is copied into new shards
+    of about 5 GiB. Returns the config path.
+    """
+
+    layers = range(layout.first_moe_layer, layout.layer_count)
+    compiled = {
+        name
+        for layer in layers
+        for keys in (
+            iq2r_glm5_shared_source_keys(layer, root=layout.source_root),
+            *(
+                iq2r_glm5_source_keys(layer, expert, root=layout.source_root)
+                for expert in range(layout.expert_count)
+            ),
+        )
+        for name in keys.values()
     }
-    dimensions = {
-        "num_hidden_layers": layout.layer_count,
-        "first_k_dense_replace": layout.first_moe_layer,
-        "n_routed_experts": layout.expert_count,
-        "hidden_size": layout.hidden_size,
-        "moe_intermediate_size": layout.intermediate_size,
+    missing = compiled - weight_map.keys()
+    if missing:
+        raise KeyError(f"source index is missing {min(missing)!r}")
+
+    # Fill the shards in source-shard order so each reads few source shards.
+    groups: list[list[str]] = [[]]
+    group_bytes = 0
+    sizes: dict[str, dict[str, int]] = {}
+    for shard, name in sorted(
+        (shard, name) for name, shard in weight_map.items() if name not in compiled
+    ):
+        if shard not in sizes:
+            sizes[shard] = _tensor_bytes(model_dir / shard)
+        if groups[-1] and group_bytes + sizes[shard][name] > _SHARD_BYTES:
+            groups.append([])
+            group_bytes = 0
+        groups[-1].append(name)
+        group_bytes += sizes[shard][name]
+
+    output_map: dict[str, str] = {}
+    with _TensorReader(model_dir, weight_map, safe_open) as reader:
+        for index, names in enumerate(groups):
+            shard = f"model-{index + 1:05d}-of-{len(groups):05d}.safetensors"
+            path = output_dir / shard
+            temporary = path.with_suffix(path.suffix + ".tmp")
+            save_file(
+                {name: reader.get(name) for name in names},
+                temporary,
+                metadata={"format": "pt"},
+            )
+            os.replace(temporary, path)
+            output_map.update(dict.fromkeys(names, shard))
+    for layer in layers:
+        for projection in _PROJECTIONS:
+            keys = iq2r_compiled_tensor_keys(layer, projection).values()
+            output_map.update(dict.fromkeys(keys, _layer_file(layer, projection)))
+    total_size = sum(
+        sum(_tensor_bytes(output_dir / shard).values())
+        for shard in set(output_map.values())
+    )
+    _atomic_write_json(
+        output_dir / "model.safetensors.index.json",
+        {"metadata": {"total_size": total_size}, "weight_map": output_map},
+    )
+
+    output_config = dict(config)
+    output_config["quantization_config"] = {
+        "quant_method": "iq2r",
+        "base_quantization_config": config["quantization_config"],
+        # ATOM fnmatches patterns that contain "*". One pattern per compiled
+        # layer keeps the MTP layer's experts on the FP8 path.
+        "iq2r_modules": [
+            f"model.layers.{layer}.mlp.{module}*"
+            for module in ("experts", "shared_experts")
+            for layer in layers
+        ],
+        "iq2r_layout": LAYOUT,
     }
-    result.update(dimensions)
-    return result
+    config_path = output_dir / "config.json"
+    _atomic_write_json(config_path, output_config)
+    for name in _MODEL_FILES:
+        if (model_dir / name).is_file():
+            shutil.copyfile(model_dir / name, output_dir / name)
+    return config_path
 
 
 def compile_glm5_iq2r(
@@ -928,17 +1002,19 @@ def compile_glm5_iq2r(
     sample_vectors: int = 65536,
     force: bool = False,
     resume: bool = False,
-    fuse_shared_expert: bool = False,
     diagnostic_shared_importance: bool = False,
-) -> Path:
-    """Compile GLM routed experts and return the intermediate config path."""
+) -> Path | None:
+    """Compile the selected MoE layers into ``output_dir``.
+
+    A run over every MoE layer also writes the rest of the checkpoint and
+    returns its config path. A run over a subset returns None.
+    """
 
     safe_open, save_file = _require_safetensors()
     model_dir = Path(model_dir).resolve()
     output_dir = Path(output_dir).resolve()
-    config_path = model_dir / "config.json"
     index_path = model_dir / "model.safetensors.index.json"
-    config = _read_json(config_path)
+    config = _read_json(model_dir / "config.json")
     layout = glm5_source_layout(config)
     source_index = _read_json(index_path)
     weight_map = source_index.get("weight_map")
@@ -955,15 +1031,12 @@ def compile_glm5_iq2r(
         layout,
         diagnostic_uniform_importance=diagnostic_uniform_importance,
     )
-    _compiled_expert_count(layout, fuse_shared_expert)
-    if fuse_shared_expert and (
-        importance.shared_gate_up is None or importance.shared_down is None
-    ):
+    _compiled_expert_count(layout)
+    if importance.shared_gate_up is None or importance.shared_down is None:
         if not diagnostic_shared_importance:
             raise ValueError(
-                "fused shared-expert compilation requires shared-expert "
-                "calibration; use --diagnostic-shared-importance only for "
-                "performance bring-up"
+                "the fused shared expert requires shared-expert calibration; "
+                "use --diagnostic-shared-importance only for performance bring-up"
             )
         importance = GLM5Importance(
             importance.gate_up,
@@ -979,16 +1052,11 @@ def compile_glm5_iq2r(
                 layout.moe_layers, layout.intermediate_size, dtype=torch.float32
             ),
         )
+    moe_layers = list(range(layout.first_moe_layer, layout.layer_count))
     selected_layers = (
-        list(range(layout.first_moe_layer, layout.layer_count))
-        if layer_indices is None
-        else sorted(set(layer_indices))
+        moe_layers if layer_indices is None else sorted(set(layer_indices))
     )
-    invalid = [
-        layer
-        for layer in selected_layers
-        if not (layout.first_moe_layer <= layer < layout.layer_count)
-    ]
+    invalid = [layer for layer in selected_layers if layer not in moe_layers]
     if invalid or not selected_layers:
         raise ValueError(
             f"selected layers must be inside [{layout.first_moe_layer},"
@@ -998,64 +1066,41 @@ def compile_glm5_iq2r(
     resolved_device = torch.device(device)
     _validate_device(resolved_device)
     output_dir.mkdir(parents=True, exist_ok=True)
-    file_manifest: list[str] = []
     for layer in selected_layers:
+        paths = {
+            projection: output_dir / _layer_file(layer, projection)
+            for projection in _PROJECTIONS
+        }
+        existing = [path for path in paths.values() if path.exists()]
+        if existing and not force:
+            if not resume:
+                raise FileExistsError(
+                    f"refusing to overwrite {existing[0]}; pass --resume or --force"
+                )
+            if len(existing) == len(paths):
+                for projection, path in paths.items():
+                    _validate_projection_shard(
+                        path, layout, layer, projection, importance.quality, safe_open
+                    )
+                continue
         with _TensorReader(model_dir, weight_map, safe_open) as reader:
-            file_manifest.append(
-                _compile_projection(
-                    reader,
-                    layout,
-                    importance,
-                    layer,
-                    "gate_up",
-                    output_dir,
-                    device=resolved_device,
-                    iterations=iterations,
-                    sample_vectors=sample_vectors,
-                    force=force,
-                    resume=resume,
-                    safe_open=safe_open,
-                    save_file=save_file,
-                    fuse_shared_expert=fuse_shared_expert,
-                )
-            )
-            file_manifest.append(
-                _compile_projection(
-                    reader,
-                    layout,
-                    importance,
-                    layer,
-                    "down",
-                    output_dir,
-                    device=resolved_device,
-                    iterations=iterations,
-                    sample_vectors=sample_vectors,
-                    force=force,
-                    resume=resume,
-                    safe_open=safe_open,
-                    save_file=save_file,
-                    fuse_shared_expert=fuse_shared_expert,
-                )
+            _compile_layer(
+                reader,
+                layout,
+                importance,
+                layer,
+                output_dir,
+                device=resolved_device,
+                iterations=iterations,
+                sample_vectors=sample_vectors,
+                save_file=save_file,
             )
 
-    source_config_sha256 = hashlib.sha256(config_path.read_bytes()).hexdigest()
-    compiled_config = _compiled_config(
-        config,
-        layout,
-        importance,
-        selected_layers,
-        file_manifest,
-        str(model_dir),
-        source_config_sha256,
-        fuse_shared_expert,
+    if selected_layers != moe_layers:
+        return None
+    return _write_checkpoint_files(
+        model_dir, output_dir, config, weight_map, layout, safe_open, save_file
     )
-    output_config = output_dir / "config.json"
-    if output_config.exists() and not (force or resume):
-        raise FileExistsError(
-            f"refusing to overwrite {output_config}; pass --force or --resume"
-        )
-    _atomic_write_json(output_config, compiled_config)
-    return output_config
 
 
 def _parse_layers(value: str) -> list[int]:
@@ -1083,7 +1128,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sample-vectors", type=int, default=65536)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--fuse-shared-expert", action="store_true")
     parser.add_argument("--diagnostic-shared-importance", action="store_true")
     args = parser.parse_args(argv)
     config_path = compile_glm5_iq2r(
@@ -1097,10 +1141,9 @@ def main(argv: list[str] | None = None) -> int:
         sample_vectors=args.sample_vectors,
         force=args.force,
         resume=args.resume,
-        fuse_shared_expert=args.fuse_shared_expert,
         diagnostic_shared_importance=args.diagnostic_shared_importance,
     )
-    print(json.dumps({"config": str(config_path)}))
+    print(json.dumps({"config": config_path and str(config_path)}))
     return 0
 
 
