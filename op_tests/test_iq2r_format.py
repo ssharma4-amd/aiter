@@ -10,7 +10,6 @@ from aiter.ops.iq2r_format import (
     IQ2R_ACTIVATION_BASIS,
     IQ2R_CODEBOOK_BYTES,
     IQ2R_FORMAT_NAME,
-    IQ2R_FORMAT_VERSION,
     IQ2RMetadata,
     iq2r_packed_sizes,
     iq2r_storage_bits_per_weight,
@@ -64,13 +63,12 @@ def test_metadata_round_trip_and_identity_fail_closed():
 
     for field in (
         "format_name",
-        "format_version",
         "activation_basis",
         "architecture",
         "reserved_zero_codeword",
     ):
         corrupt = dict(serialized)
-        corrupt[field] = "wrong" if field != "format_version" else 3
+        corrupt[field] = "wrong"
         with pytest.raises(ValueError, match=field):
             IQ2RMetadata.from_dict(corrupt)
 
@@ -80,7 +78,6 @@ def test_metadata_round_trip_and_identity_fail_closed():
         IQ2RMetadata.from_dict(missing)
 
     assert metadata.format_name == IQ2R_FORMAT_NAME
-    assert metadata.format_version == IQ2R_FORMAT_VERSION
     assert metadata.activation_basis == IQ2R_ACTIVATION_BASIS
 
 

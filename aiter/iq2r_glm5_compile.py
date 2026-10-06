@@ -33,7 +33,6 @@ from .ops.iq2r_encoder import iq2r_learn_codebook
 from .ops.iq2r_format import (
     IQ2R_ACTIVATION_BASIS,
     IQ2R_FORMAT_NAME,
-    IQ2R_FORMAT_VERSION,
     IQ2RMetadata,
 )
 
@@ -292,18 +291,11 @@ def _validate_shared_importance_shapes(
 def _load_direct_importance(
     payload: dict[str, Any], layout: GLM5Layout
 ) -> GLM5Importance:
-    if (
-        payload.get("format") != IQ2R_FORMAT_NAME
-        or payload.get("version") != IQ2R_FORMAT_VERSION
-    ):
+    if payload.get("format") != IQ2R_FORMAT_NAME:
         raise ValueError("unsupported IQ2R importance cache identity")
     metadata = dict(payload.get("metadata") or {})
-    expected = (IQ2R_FORMAT_NAME, IQ2R_FORMAT_VERSION, IQ2R_ACTIVATION_BASIS)
-    actual = (
-        metadata.get("format"),
-        metadata.get("version"),
-        metadata.get("activation_basis"),
-    )
+    expected = (IQ2R_FORMAT_NAME, IQ2R_ACTIVATION_BASIS)
+    actual = (metadata.get("format"), metadata.get("activation_basis"))
     if actual != expected:
         raise ValueError(
             f"importance metadata identity {actual!r} does not match {expected!r}"
@@ -712,7 +704,6 @@ def _validate_projection_shard(
     expected_metadata = {
         "format": "pt",
         "iq2r_format": IQ2R_FORMAT_NAME,
-        "iq2r_format_version": str(IQ2R_FORMAT_VERSION),
         "iq2r_activation_basis": IQ2R_ACTIVATION_BASIS,
         "iq2r_layer": str(layer),
         "iq2r_projection": projection,
@@ -853,7 +844,6 @@ def _compile_projection(
         metadata={
             "format": "pt",
             "iq2r_format": IQ2R_FORMAT_NAME,
-            "iq2r_format_version": str(IQ2R_FORMAT_VERSION),
             "iq2r_activation_basis": IQ2R_ACTIVATION_BASIS,
             "iq2r_layer": str(layer),
             "iq2r_projection": projection,
@@ -897,7 +887,6 @@ def _compiled_config(
         "file_manifest": file_manifest,
         "iq2r": {
             "format": IQ2R_FORMAT_NAME,
-            "version": IQ2R_FORMAT_VERSION,
             "activation_basis": IQ2R_ACTIVATION_BASIS,
             "expert_projection_modules": {
                 "gate_up": "up_gate_proj",

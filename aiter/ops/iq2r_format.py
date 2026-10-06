@@ -19,7 +19,6 @@ from torch import Tensor
 
 IQ2R_SCHEME = "iq2r"
 IQ2R_FORMAT_NAME = "iq2r-512-fullsign-e8m0-native-v1"
-IQ2R_FORMAT_VERSION = 4
 IQ2R_PACKED_LAYOUT = "iq2r-cdna4-triplet6-v1"
 IQ2R_ACTIVATION_BASIS = "native"
 IQ2R_ARCHITECTURE = "gfx950"
@@ -121,7 +120,6 @@ class IQ2RMetadata:
     logical_k: int
     scheme: str = IQ2R_SCHEME
     format_name: str = IQ2R_FORMAT_NAME
-    format_version: int = IQ2R_FORMAT_VERSION
     packed_layout: str = IQ2R_PACKED_LAYOUT
     activation_basis: str = IQ2R_ACTIVATION_BASIS
     architecture: str = IQ2R_ARCHITECTURE
@@ -185,7 +183,6 @@ class IQ2RMetadata:
         expected = {
             "scheme": IQ2R_SCHEME,
             "format_name": IQ2R_FORMAT_NAME,
-            "format_version": IQ2R_FORMAT_VERSION,
             "packed_layout": IQ2R_PACKED_LAYOUT,
             "activation_basis": IQ2R_ACTIVATION_BASIS,
             "architecture": IQ2R_ARCHITECTURE,
@@ -235,7 +232,6 @@ class IQ2RMetadata:
             "logical_k",
             "scheme",
             "format_name",
-            "format_version",
             "packed_layout",
             "activation_basis",
             "architecture",

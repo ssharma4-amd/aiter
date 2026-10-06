@@ -7,7 +7,7 @@
 shared expert) as ``iq2r-layer-NNNN-{gate-up,down}.safetensors``. This tool
 symlinks those shards and the base FP8 shards into one directory, writes an
 index in which the compiled tensors replace the FP8 expert tensors, and
-declares the ``aiter-iq2r-overlay`` v2 quantization contract in config.json.
+sets ``quant_method: "iq2r"`` in config.json.
 ``aiter.iq2r_glm53_pack_checkpoint`` turns the result into the packed
 checkpoint ATOM serves.
 """
@@ -35,11 +35,8 @@ from .iq2r_glm5_compile import (
 from .ops.iq2r_format import (
     IQ2R_ACTIVATION_BASIS,
     IQ2R_FORMAT_NAME,
-    IQ2R_FORMAT_VERSION,
 )
 
-IQ2R_GENERIC_OVERLAY_SCHEMA = "aiter-iq2r-overlay"
-IQ2R_GENERIC_OVERLAY_SCHEMA_VERSION = 2
 _SHARD_SUFFIXES = {"gate_up": "gate-up", "down": "down"}
 
 
@@ -85,8 +82,8 @@ def _compiled_contract(compiled_dir: Path, layout: GLM5Layout) -> tuple[bool, st
     iq2r = config.get("iq2r")
     if not isinstance(iq2r, dict):
         raise TypeError("compiled config does not contain an IQ2R format declaration")
-    identity = (iq2r.get("format"), iq2r.get("version"), iq2r.get("activation_basis"))
-    expected = (IQ2R_FORMAT_NAME, IQ2R_FORMAT_VERSION, IQ2R_ACTIVATION_BASIS)
+    identity = (iq2r.get("format"), iq2r.get("activation_basis"))
+    expected = (IQ2R_FORMAT_NAME, IQ2R_ACTIVATION_BASIS)
     if identity != expected:
         raise ValueError(
             f"unsupported IQ2R checkpoint identity {identity!r}; expected {expected!r}"
@@ -217,8 +214,6 @@ def create_glm5_iq2r_overlay(
     overlay_config = dict(config)
     overlay_config["quantization_config"] = {
         "quant_method": "iq2r",
-        "schema": IQ2R_GENERIC_OVERLAY_SCHEMA,
-        "schema_version": IQ2R_GENERIC_OVERLAY_SCHEMA_VERSION,
         "base_quantization_config": base_quantization_config,
         "iq2r_modules": [
             "model.layers.*.mlp.experts",
@@ -230,8 +225,6 @@ def create_glm5_iq2r_overlay(
     overlay_index = {
         "metadata": {
             **(source_index.get("metadata") or {}),
-            "iq2r_schema": IQ2R_GENERIC_OVERLAY_SCHEMA,
-            "iq2r_schema_version": IQ2R_GENERIC_OVERLAY_SCHEMA_VERSION,
             "iq2r_layer_count": len(moe_layers),
             "iq2r_first_layer": layout.first_moe_layer,
             "iq2r_bytes": total_iq2r_bytes,
@@ -248,8 +241,6 @@ def create_glm5_iq2r_overlay(
         )
     )
     manifest = {
-        "schema": IQ2R_GENERIC_OVERLAY_SCHEMA,
-        "schema_version": IQ2R_GENERIC_OVERLAY_SCHEMA_VERSION,
         "model_family": layout.model_family,
         "source_root": layout.source_root,
         "base_model": str(model_dir),
@@ -291,8 +282,4 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = [
-    "IQ2R_GENERIC_OVERLAY_SCHEMA",
-    "IQ2R_GENERIC_OVERLAY_SCHEMA_VERSION",
-    "create_glm5_iq2r_overlay",
-]
+__all__ = ["create_glm5_iq2r_overlay"]

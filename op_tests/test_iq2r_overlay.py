@@ -19,7 +19,6 @@ from aiter.iq2r_overlay import create_glm5_iq2r_overlay, main
 from aiter.ops.iq2r_format import (
     IQ2R_ACTIVATION_BASIS,
     IQ2R_FORMAT_NAME,
-    IQ2R_FORMAT_VERSION,
     IQ2RMetadata,
 )
 
@@ -95,7 +94,6 @@ def _write_compiled(path, *, fused: bool, layers=None, experts=None) -> None:
                 metadata={
                     "format": "pt",
                     "iq2r_format": IQ2R_FORMAT_NAME,
-                    "iq2r_format_version": str(IQ2R_FORMAT_VERSION),
                     "iq2r_activation_basis": IQ2R_ACTIVATION_BASIS,
                     "iq2r_layer": str(layer),
                     "iq2r_projection": projection,
@@ -108,7 +106,6 @@ def _write_compiled(path, *, fused: bool, layers=None, experts=None) -> None:
         "compiled_expert_parallel_size": 1,
         "iq2r": {
             "format": IQ2R_FORMAT_NAME,
-            "version": IQ2R_FORMAT_VERSION,
             "activation_basis": IQ2R_ACTIVATION_BASIS,
             "model_family": "glm_moe_dsa",
             "quality": _QUALITY,
@@ -130,10 +127,6 @@ def test_overlay_replaces_routed_experts_with_compiled_shards(tmp_path, fused):
     config = json.loads((output / "config.json").read_text())
     quantization = config["quantization_config"]
     assert quantization["quant_method"] == "iq2r"
-    assert (quantization["schema"], quantization["schema_version"]) == (
-        "aiter-iq2r-overlay",
-        2,
-    )
     assert quantization["base_quantization_config"]["quant_method"] == "fp8"
     assert quantization["iq2r_modules"] == ["model.layers.*.mlp.experts"] + (
         ["model.layers.*.mlp.shared_experts"] if fused else []

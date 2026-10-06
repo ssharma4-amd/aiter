@@ -25,7 +25,6 @@ from aiter.iq2r_glm5_compile import (
 from aiter.ops.iq2r_format import (
     IQ2R_ACTIVATION_BASIS,
     IQ2R_FORMAT_NAME,
-    IQ2R_FORMAT_VERSION,
     IQ2RMetadata,
 )
 
@@ -330,7 +329,6 @@ def test_resume_validates_existing_projection_shard(tmp_path):
     file_metadata = {
         "format": "pt",
         "iq2r_format": IQ2R_FORMAT_NAME,
-        "iq2r_format_version": str(IQ2R_FORMAT_VERSION),
         "iq2r_activation_basis": IQ2R_ACTIVATION_BASIS,
         "iq2r_layer": "3",
         "iq2r_projection": "gate_up",
