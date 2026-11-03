@@ -891,6 +891,9 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_gate_prefill_kernel(
             asm volatile("" ::: "memory");
         };
         IQ2RCompressedQuad pending=iq2r_scheduled_load_quad(data,data_bytes,n_tile*48*kQuadBytes,lane);
+        // IQ2R-v2 d words load one K256 ahead, with the records.
+        uint32_t pending_d=0;
+        if constexpr(Classes>0) pending_d=iq2r_v2_bases<Classes,2>(aux,n_tile,24,0,lane_row);
         issue_a(0,0);
         opus::vector_t<float,4> total[MAtoms][4]={};
 #pragma unroll 1
@@ -916,12 +919,14 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_gate_prefill_kernel(
                     *reinterpret_cast<uint4*>(a[m].bytes+16)=*reinterpret_cast<const uint4*>(shared.reuse.input+slot*Rows*128+((r*128+col+64)^(((r>>1)&7)<<4)));
                     sa[m]=shared.scales[slot*Rows*4+r*4+lane_group];
                 }
+                if constexpr(Classes>0) bases=pending_d;
                 if(kt<47)
                 {
                     issue_a(kt+1,1-slot);
                     pending=iq2r_scheduled_load_quad(data,data_bytes,(n_tile*48+kt+1)*kQuadBytes,lane);
+                    if constexpr(Classes>0)
+                        if((kt&1)==1) pending_d=iq2r_v2_bases<Classes,2>(aux,n_tile,24,(kt+1)/2,lane_row);
                 }
-                if constexpr(Classes>0) bases=iq2r_v2_bases<Classes,2>(aux,n_tile,24,kt/2,lane_row);
                 glm53_quad_decode_mfma<MAtoms,Classes>(compressed,lane_book,bases,a,sa,partial,active_m);
             }
 #pragma unroll
