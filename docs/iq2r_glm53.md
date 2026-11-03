@@ -80,6 +80,73 @@ ATOM serves. They need `safetensors` (`pip install safetensors`, or the
 The result is about 235 GB and loads at any supported TP width with no
 load-time relayout.
 
+## IQ2R-v2
+
+IQ2R-v2 (`aiter/ops/iq2r_v2.py`) keeps IQ2R's records, learned codebooks
+and kernels and changes only how a 32-weight group is scaled:
+
+| | IQ2R | IQ2R-v2 |
+|---|---|---|
+| per row and 256 inputs | - | E8M0 `d` |
+| per 16-row N block | E8M0 base exponent | - |
+| per 32 weights (4 bits) | exponent delta | level `l`: `m[l % 4] * 2^(l / 4)`, `m = 2^(j/4)` |
+| codewords | E4M3 codebook | `E4M3(codebook * m[c])`, four pre-scaled copies |
+| per projection | - | FP32 output gain (gate and up separately) |
+| bits per weight | ~2.25 | ~2.28 |
+
+The power-of-two parts (`d` and `2^(l / 4)`) form the scaled-MFMA E8M0
+operand, the mantissa `m[c]` selects a codebook copy in LDS, and the gain is
+applied once per output, so the kernels run the same MFMA stream. The
+copies' E4M3 rounding is part of the format: the encoder, the reference
+decoder (`iq2r_v2_materialize`) and the kernels agree bit for bit. Gate and
+up keep separate codebooks (the up copies follow the gate's in LDS).
+
+In a lane group `g`, the metadata high nibble holds the exponent of block
+`g`, whose MFMA scale that lane supplies, and the class of block `s(g)`,
+`s = (0, 2, 1, 3)`. The classes a lane needs for its own codewords are then
+in its own nibble or its neighbour group's, one `v_permlane16_swap` away.
+
+The kernels recognize the format from the packed auxiliary size, so
+`iq2r_glm53_moe_out` and ATOM's call are unchanged. A packed IQ2R-v2
+auxiliary holds the codebook copies, the `d` table laid out per lane
+(`[N/64][K/256][16][4]` for gate/up, `[N/48][K/256][16][4]` for down) and
+the two gains. `iq2r_glm53_pack_v2` builds it; `iq2r_glm53_v2_slice_gate_aux`
+and `iq2r_glm53_v2_slice_down_aux` take TP shards.
+
+The compiler builds it with `--format iq2r-v2`:
+
+    python3 -m aiter.quantization.iq2r.glm5.compile --model-dir $FP8 \
+        --output-dir $OUT --calibration-cache calibration.pt \
+        --format iq2r-v2 --device cuda:$i --layers ... --resume
+
+Each step of the recipe:
+
+1. Importance: the calibration artifact's router-weighted second moment
+   (above). The GLM-5.3 study used a 322K-token mix of agent trajectories,
+   math reasoning, code, chat and WikiText rather than WikiText alone.
+2. Codebook (`iq2r_v2_learn_codebook`): per matrix, seeded with the IQ2_XXS
+   grid at 1x and sqrt(2)x, importance-weighted k-means on 65,536 sampled
+   8-vectors alternating with the encoder (`--iterations` rounds). Codewords
+   stay below the seed maximum and a round is kept only if the matrix's
+   weighted cost drops.
+3. Encoder (`iq2r_v2_encode`), after the IQ2_XXS quantizer of ggml/llama.cpp
+   as adapted by antirez: each weight's error is weighted by
+   `importance * sqrt(sigma^2 + w^2)` (sigma^2 the mean square of its
+   256-weight block); a group's starting scale comes from 13 candidate
+   least-squares fits; then `d` (three exponents) and every group's level
+   (all 16) are searched exhaustively with codeword re-assignment.
+4. Gain: each matrix's output gain makes `<W, Wq> / <W, W>` equal
+   `--target-gain` (0.98; a slight shrink lowered KL in the study).
+
+On GLM-5.3 (12 routed matrices, three layers) this matches the weight error
+of the evaluated IQ2R-v2 checkpoint (importance-weighted relative MSE 0.0737
+for both). That checkpoint, served at 2.32 bits per weight, scored 23/29 on a
+SWE-bench Lite subset where MXFP4 scored 22/29 under the same settings.
+
+`op_tests/test_iq2r_glm53_v2.py` checks the IQ2R-v2 MoE against a dense
+reference at both TP widths, checks that TP slicing commutes with packing,
+and (`python3 op_tests/test_iq2r_glm53_v2.py`) times IQ2R against IQ2R-v2.
+
 ## Dispatch
 
 `iq2r_glm53_moe_out` looks up the launch choice for the token count in

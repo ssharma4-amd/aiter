@@ -14,6 +14,22 @@ A calibration artifact from ``aiter.quantization.iq2r.glm5.calibrate`` is
 required for a production build.
 Uniform importance is available only behind an explicit diagnostic flag and is
 recorded as not O0-quality in every layer file.
+
+``--format iq2r-v2`` builds IQ2R-v2 instead (``aiter/ops/iq2r_v2.py``): the
+same records and kernels with two-level scales, an E8M0 ``d`` per row and 256
+inputs plus a 4-bit level per 32 weights that selects one of the codebook's
+pre-scaled copies. Each step of the recipe:
+
+* importance: the calibration artifact's router-weighted second moment,
+  sum r^2 x^2 / sum r^2 per input channel (shared by gate and up);
+* codebook (``iq2r_v2_learn_codebook``): per matrix, importance-weighted
+  k-means on 65,536 sampled 8-vectors, alternating with the encoder for
+  ``--iterations`` rounds; gate and up each get their own codebook;
+* encoder (``iq2r_v2_encode``): IQ2_XXS-style cost
+  importance * sqrt(sigma^2 + w^2), a 13-candidate least-squares group scale
+  search, then an exhaustive search of d and every group's level;
+* gain: each matrix's output is scaled so its reconstruction gain
+  <W, Wq> / <W, W> is ``--target-gain`` (0.98).
 """
 
 from __future__ import annotations
@@ -40,6 +56,8 @@ from aiter.iq2r_glm53 import (
     TOPK,
     iq2r_glm53_gate_bytes,
     iq2r_glm53_pack,
+    iq2r_glm53_pack_v2,
+    iq2r_glm53_v2_aux_bytes,
 )
 from aiter.ops.iq2r import iq2r_encode_device
 from aiter.ops.iq2r_encoder import iq2r_learn_codebook
@@ -47,6 +65,17 @@ from aiter.ops.iq2r_format import (
     IQ2R_ACTIVATION_BASIS,
     IQ2R_FORMAT_NAME,
     IQ2RMetadata,
+)
+from aiter.ops.iq2r_v2 import (
+    IQ2R_V2_LEVEL_SETS,
+    IQ2R_V2_LEVELS_C4,
+    IQ2RV2Levels,
+    iq2r_v2_encode,
+    iq2r_v2_format_name,
+    iq2r_v2_gains,
+    iq2r_v2_learn_codebook,
+    iq2r_v2_write_auxiliary,
+    iq2r_v2_write_data,
 )
 
 _CALIBRATION_FORMAT = "iq2r-calibration"
@@ -57,6 +86,18 @@ _TARGET_PATTERN = re.compile(
     r"(gate_up|down)_proj\.weight$"
 )
 LAYOUT = "glm53-packed-v1"
+LAYOUT_V2 = "glm53-packed-v2"
+FORMATS = ("iq2r", "iq2r-v2")
+
+
+@dataclass(frozen=True)
+class IQ2RV2Recipe:
+    """IQ2R-v2 encoding choices (see the module docstring)."""
+
+    levels: IQ2RV2Levels = IQ2R_V2_LEVELS_C4
+    target_gain: float = 0.98
+
+
 # The serving kernels are built for this shape. ATOM slices the 2048-wide
 # experts into the TP4 (512) and TP8 (256) shards they cover.
 _GLM53_SHAPE = {
@@ -463,32 +504,42 @@ def _projection_metadata(layout: GLM5Layout, projection: str) -> IQ2RMetadata:
 
 
 def _encoding_metadata(
-    importance: GLM5Importance, iterations: int, sample_vectors: int
+    importance: GLM5Importance,
+    iterations: int,
+    sample_vectors: int,
+    v2: IQ2RV2Recipe | None = None,
 ) -> dict[str, str]:
     """What decides the encoded bytes besides the source weights.
 
     Every layer file records it, so ``--resume`` keeps only layers built the same way.
     """
 
-    return {
+    metadata = {
         "iq2r_quality": importance.quality,
         "iq2r_calibration_sha256": importance.sha256,
         "iq2r_codebook_iterations": str(iterations),
         "iq2r_codebook_sample_vectors": str(sample_vectors),
     }
+    if v2 is not None:
+        metadata["iq2r_v2_levels"] = v2.levels.name
+        metadata["iq2r_v2_target_gain"] = repr(v2.target_gain)
+    return metadata
 
 
 def _layer_file_metadata(
     layer: int, projection: str, encoding: dict[str, str]
 ) -> dict[str, str]:
+    v2 = encoding.get("iq2r_v2_levels")
     return {
         "format": "pt",
-        "iq2r_format": IQ2R_FORMAT_NAME,
+        "iq2r_format": (
+            iq2r_v2_format_name(IQ2R_V2_LEVEL_SETS[v2]) if v2 else IQ2R_FORMAT_NAME
+        ),
         "iq2r_activation_basis": IQ2R_ACTIVATION_BASIS,
         "iq2r_layer": str(layer),
         "iq2r_projection": projection,
         **encoding,
-        "iq2r_layout": LAYOUT,
+        "iq2r_layout": LAYOUT_V2 if v2 else LAYOUT,
     }
 
 
@@ -544,12 +595,23 @@ def _validate_projection_shard(
         if projection == "gate_up"
         else metadata.data_bytes
     )
+    v2 = encoding.get("iq2r_v2_levels")
+    auxiliary_bytes = (
+        iq2r_glm53_v2_aux_bytes(
+            metadata.logical_n,
+            metadata.logical_k,
+            2 if projection == "gate_up" else 1,
+            IQ2R_V2_LEVEL_SETS[v2].classes,
+        )
+        if v2
+        else metadata.auxiliary_bytes
+    )
     keys = iq2r_compiled_tensor_keys(layer, projection)
     compiled_experts = layout.compiled_experts
     expected_tensors = {
         keys["data"]: ([compiled_experts, data_bytes], "U8"),
         keys["auxiliary"]: (
-            [compiled_experts, metadata.auxiliary_bytes],
+            [compiled_experts, auxiliary_bytes],
             "U8",
         ),
         keys["tile_n"]: ([1], "I32"),
@@ -641,6 +703,105 @@ def _encode_projection(
     return data, auxiliary
 
 
+def _source_gate_up_v2(
+    reader: _TensorReader,
+    layout: GLM5Layout,
+    layer: int,
+    expert: int,
+    device: torch.device | str,
+) -> tuple[Tensor, Tensor]:
+    """Separate gate and up weights (IQ2R-v2 encodes each with its own codebook)."""
+    interleaved = _source_projection(reader, layout, layer, expert, "gate_up", device)
+    return interleaved[0::2].contiguous(), interleaved[1::2].contiguous()
+
+
+def _encode_projection_v2(
+    reader: _TensorReader,
+    layout: GLM5Layout,
+    importance: GLM5Importance,
+    layer: int,
+    projection: str,
+    *,
+    device: torch.device | str,
+    iterations: int,
+    sample_vectors: int,
+    recipe: IQ2RV2Recipe,
+) -> tuple[Tensor, Tensor]:
+    """Canonical IQ2R-v2 buffers ``(data, auxiliary)`` of every compiled expert."""
+    metadata = _projection_metadata(layout, projection)
+    levels = recipe.levels
+    data_rows, aux_rows = [], []
+    for expert in range(layout.compiled_experts):
+        expert_importance = (
+            importance.for_projection(layer, projection, expert)
+            .to(device=device, dtype=torch.float32, non_blocking=True)
+            .contiguous()
+        )
+        seed = 0x10A0 + layer * 1024 + expert * 2 + (projection == "down")
+
+        def encode(weight: Tensor, salt: int, importance=expert_importance, seed=seed):
+            book = iq2r_v2_learn_codebook(
+                weight,
+                importance,
+                levels,
+                rounds=iterations,
+                sample_vectors=sample_vectors,
+                seed=seed * 2 + salt,
+            )
+            return book, iq2r_v2_encode(weight, importance, book, levels)
+
+        if projection == "gate_up":
+            gate, up = _source_gate_up_v2(reader, layout, layer, expert, device)
+            (gate_book, g), (up_book, u) = encode(gate, 0), encode(up, 1)
+
+            def interleave(a: Tensor, b: Tensor) -> Tensor:
+                return torch.stack((a, b), dim=1).reshape(-1, *a.shape[1:])
+
+            gains = iq2r_v2_gains(
+                interleave(gate, up),
+                interleave(g.reconstruction, u.reconstruction),
+                recipe.target_gain,
+                interleaved=True,
+            )
+            data = iq2r_v2_write_data(
+                interleave(g.indices, u.indices),
+                interleave(g.negative, u.negative),
+                interleave(g.levels, u.levels),
+                levels,
+            )
+            aux = iq2r_v2_write_auxiliary(
+                torch.stack((gate_book, up_book)), interleave(g.d, u.d), gains
+            )
+            del gate, up, g, u
+        else:
+            weight = _source_projection(
+                reader, layout, layer, expert, projection, device
+            )
+            book, enc = encode(weight, 0)
+            gains = iq2r_v2_gains(weight, enc.reconstruction, recipe.target_gain)
+            data = iq2r_v2_write_data(enc.indices, enc.negative, enc.levels, levels)
+            aux = iq2r_v2_write_auxiliary(book[None], enc.d, gains)
+            del weight, enc
+        if tuple(data.shape) != (metadata.data_bytes,):
+            raise ValueError(f"layer {layer} expert {expert} {projection}: data bytes")
+        data_rows.append(data.cpu())
+        aux_rows.append(aux.cpu())
+        if (expert + 1) % 16 == 0 or expert + 1 == layout.compiled_experts:
+            print(
+                json.dumps(
+                    {
+                        "layer": layer,
+                        "projection": projection,
+                        "format": "iq2r-v2",
+                        "experts_complete": expert + 1,
+                        "experts_total": layout.compiled_experts,
+                    }
+                ),
+                flush=True,
+            )
+    return torch.stack(data_rows), torch.stack(aux_rows)
+
+
 def _compile_layer(
     reader: _TensorReader,
     layout: GLM5Layout,
@@ -651,9 +812,12 @@ def _compile_layer(
     device: torch.device,
     iterations: int,
     sample_vectors: int,
+    v2: IQ2RV2Recipe | None = None,
 ) -> None:
+    encode = _encode_projection if v2 is None else _encode_projection_v2
+    extra = {} if v2 is None else {"recipe": v2}
     encoded = [
-        _encode_projection(
+        encode(
             reader,
             layout,
             importance,
@@ -662,14 +826,18 @@ def _compile_layer(
             device=device,
             iterations=iterations,
             sample_vectors=sample_vectors,
+            **extra,
         )
         for projection in _PROJECTIONS
     ]
     # Returns (gate_quad, gate_auxiliary, down_data, down_auxiliary).
-    packed = iq2r_glm53_pack(
-        *(tensor.to(device) for pair in encoded for tensor in pair),
-        intermediate_size=layout.intermediate_size,
-    )
+    tensors = (tensor.to(device) for pair in encoded for tensor in pair)
+    if v2 is None:
+        packed = iq2r_glm53_pack(*tensors, intermediate_size=layout.intermediate_size)
+    else:
+        packed = iq2r_glm53_pack_v2(
+            *tensors, intermediate_size=layout.intermediate_size, levels=v2.levels
+        )
     for projection, data, auxiliary in zip(_PROJECTIONS, packed[::2], packed[1::2]):
         keys = iq2r_compiled_tensor_keys(layer, projection)
         path = output_dir / _layer_file(layer, projection)
@@ -684,7 +852,7 @@ def _compile_layer(
             metadata=_layer_file_metadata(
                 layer,
                 projection,
-                _encoding_metadata(importance, iterations, sample_vectors),
+                _encoding_metadata(importance, iterations, sample_vectors, v2),
             ),
         )
         os.replace(temporary, path)
@@ -721,6 +889,7 @@ def _write_checkpoint_files(
     config: dict[str, Any],
     weight_map: dict[str, str],
     layout: GLM5Layout,
+    v2: IQ2RV2Recipe | None = None,
 ) -> Path:
     """Write the FP8 shards, index, config.json and tokenizer files.
 
@@ -797,8 +966,12 @@ def _write_checkpoint_files(
             for module in ("experts", "shared_experts")
             for layer in layers
         ],
-        "iq2r_layout": LAYOUT,
+        "iq2r_layout": LAYOUT if v2 is None else LAYOUT_V2,
     }
+    if v2 is not None:
+        output_config["quantization_config"]["iq2r_format"] = iq2r_v2_format_name(
+            v2.levels
+        )
     config_path = output_dir / "config.json"
     _atomic_write_json(config_path, output_config)
     for name in _MODEL_FILES:
@@ -819,6 +992,7 @@ def compile_glm5_iq2r(
     sample_vectors: int = 65536,
     force: bool = False,
     resume: bool = False,
+    v2: IQ2RV2Recipe | None = None,
 ) -> Path | None:
     """Compile the selected MoE layers into ``output_dir``.
 
@@ -856,7 +1030,7 @@ def compile_glm5_iq2r(
         layout,
         diagnostic_uniform_importance=diagnostic_uniform_importance,
     )
-    encoding = _encoding_metadata(importance, iterations, sample_vectors)
+    encoding = _encoding_metadata(importance, iterations, sample_vectors, v2)
     moe_layers = list(range(layout.first_moe_layer, layout.layer_count))
     selected_layers = (
         moe_layers if layer_indices is None else sorted(set(layer_indices))
@@ -898,11 +1072,14 @@ def compile_glm5_iq2r(
                 device=resolved_device,
                 iterations=iterations,
                 sample_vectors=sample_vectors,
+                v2=v2,
             )
 
     if selected_layers != moe_layers:
         return None
-    return _write_checkpoint_files(model_dir, output_dir, config, weight_map, layout)
+    return _write_checkpoint_files(
+        model_dir, output_dir, config, weight_map, layout, v2
+    )
 
 
 def _parse_layers(value: str) -> list[int]:
@@ -930,7 +1107,30 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sample-vectors", type=int, default=65536)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--format",
+        choices=FORMATS,
+        default="iq2r",
+        help="iq2r (power-of-two scales) or iq2r-v2 (two-level scales, see above)",
+    )
+    parser.add_argument(
+        "--levels",
+        choices=sorted(IQ2R_V2_LEVEL_SETS),
+        default=IQ2R_V2_LEVELS_C4.name,
+        help="IQ2R-v2 level set; the kernels are built for c4e4q",
+    )
+    parser.add_argument(
+        "--target-gain",
+        type=float,
+        default=0.98,
+        help="IQ2R-v2 reconstruction gain <W,Wq>/<W,W> after the output gain",
+    )
     args = parser.parse_args(argv)
+    v2 = (
+        IQ2RV2Recipe(IQ2R_V2_LEVEL_SETS[args.levels], args.target_gain)
+        if args.format == "iq2r-v2"
+        else None
+    )
     config_path = compile_glm5_iq2r(
         args.model_dir,
         args.output_dir,
@@ -942,6 +1142,7 @@ def main(argv: list[str] | None = None) -> int:
         sample_vectors=args.sample_vectors,
         force=args.force,
         resume=args.resume,
+        v2=v2,
     )
     print(json.dumps({"config": config_path and str(config_path)}))
     return 0
@@ -954,6 +1155,7 @@ if __name__ == "__main__":
 __all__ = [
     "GLM5Importance",
     "GLM5Layout",
+    "IQ2RV2Recipe",
     "compile_glm5_iq2r",
     "dequantize_block_fp8",
     "glm5_source_layout",
