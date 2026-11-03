@@ -159,8 +159,9 @@ The corpus is not published with aiter. Within AMD it is the text JSONL
 `iq2r_v2_calib_corpus.jsonl` (one `{"kind", "text"}` object per window,
 sha256
 `1d2595d86c63046090db291e6b3e0650bde09352cbe8e237221c17006e5e3bcc`, 1.2 MB),
-stored next to the evaluated
-checkpoint (`GLM-5.3-IQ2Rv2-Brw`); ask the IQ2R maintainers for it. It feeds
+kept in the private repository `ssharma4-amd/glm53-iq2r-calib` and next to the
+evaluated checkpoint (`GLM-5.3-IQ2Rv2-Brw`); ask the IQ2R maintainers for
+access. It feeds
 the calibration tool directly:
 
     python3 -m aiter.quantization.iq2r.glm5.calibrate --model-dir $FP8 \
