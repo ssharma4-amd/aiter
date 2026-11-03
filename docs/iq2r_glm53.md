@@ -122,8 +122,7 @@ The compiler builds it with `--format iq2r-v2`:
 Each step of the recipe:
 
 1. Importance: the calibration artifact's router-weighted second moment
-   (above). The GLM-5.3 study used a 322K-token mix of agent trajectories,
-   math reasoning, code, chat and WikiText rather than WikiText alone.
+   (above), from the calibration corpus below rather than WikiText alone.
 2. Codebook (`iq2r_v2_learn_codebook`): per matrix, seeded with the IQ2_XXS
    grid at 1x and sqrt(2)x, importance-weighted k-means on 65,536 sampled
    8-vectors alternating with the encoder (`--iterations` rounds). Codewords
@@ -137,6 +136,39 @@ Each step of the recipe:
    (all 16) are searched exhaustively with codeword re-assignment.
 4. Gain: each matrix's output gain makes `<W, Wq> / <W, W>` equal
    `--target-gain` (0.98; a slight shrink lowered KL in the study).
+
+### Calibration corpus
+
+The evaluated IQ2R-v2 checkpoint was calibrated on 40 windows of 8,192
+tokens (321,818 tokens), chosen to match how the model is used for agentic
+coding and reasoning. Agent and math text dominate because calibrating on one
+source raised the expert error on the others by 12-29% in a pilot.
+
+| Share | Windows | Source |
+|---:|---:|---|
+| 61% | 24 | GLM-5.3 mini-swe-agent trajectories on SWE-bench Verified instances that are not in SWE-bench Lite, rendered with the serving chat template and bash tool |
+| 20% | 8 | GLM-5.3 (FP8) reasoning traces on MATH-500 level 4-5 problems, chat template |
+| 6% | 2 + 1 | multi-turn chat built from other MATH problems (final answers, no thinking), plus one window of general chat prompts |
+| 5% | 2 | WikiText-2 train |
+| 8% | 3 | Python standard-library source |
+
+No SWE-bench Lite or AIME text is included, and the windows exclude the
+sequences used to measure KL (64-gram overlap with them is 0.2%).
+
+The corpus is not published with aiter. Within AMD it is the text JSONL
+`iq2r_v2_calib_corpus.jsonl` (one `{"kind", "text"}` object per window,
+sha256
+`1d2595d86c63046090db291e6b3e0650bde09352cbe8e237221c17006e5e3bcc`, 1.2 MB),
+stored next to the evaluated
+checkpoint (`GLM-5.3-IQ2Rv2-Brw`); ask the IQ2R maintainers for it. It feeds
+the calibration tool directly:
+
+    python3 -m aiter.quantization.iq2r.glm5.calibrate --model-dir $FP8 \
+        --text-file iq2r_v2_calib_corpus.jsonl --output calibration.pt \
+        --sequence-length 8192 --max-tokens 327680 --device-map balanced
+
+Any corpus with the same mix of agent trajectories, long reasoning, code,
+chat and prose can stand in for it.
 
 On GLM-5.3 (12 routed matrices, three layers) this matches the weight error
 of the evaluated IQ2R-v2 checkpoint (importance-weighted relative MSE 0.0737
