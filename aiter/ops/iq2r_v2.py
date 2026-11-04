@@ -50,7 +50,8 @@ Copyright (c) The ggml authors) as adapted for GLM-5 by antirez
 
 ``iq2r_v2_learn_codebook`` learns the per-matrix codebook with
 importance-weighted k-means alternating with this encoder, seeded from the
-IQ2_XXS grid (one phase at 1x, one at sqrt(2)).
+IQ2_XXS grid (one phase at 1x, one at sqrt(2)), and returns it with the
+matrix's encoding.
 """
 
 from __future__ import annotations
@@ -240,9 +241,10 @@ def _group_scales(
         weights.reshape(-1, IQ2R_VECTOR_SIZE),
         codebook,
     )
+    b2 = 2 * b
 
     def fit(scale: Tensor) -> tuple[Tensor, Tensor]:
-        index = torch.argmin(scale.repeat_interleave(4)[:, None] * a - 2 * b, dim=-1)
+        index = torch.argmin(scale.repeat_interleave(4)[:, None] * a - b2, dim=-1)
         q2 = a.gather(1, index[:, None]).reshape(-1, 4).sum(-1)
         qx = b.gather(1, index[:, None]).reshape(-1, 4).sum(-1)
         return q2, qx
@@ -307,7 +309,11 @@ def _encode_blocks(
         vectors = magnitudes.reshape(-1, IQ2R_VECTOR_SIZE)
         vector_weights = weights.reshape(-1, IQ2R_VECTOR_SIZE)
         scores = [
-            _codeword_scores(vectors, vector_weights, copies[c]) for c in range(classes)
+            (a, 2 * b)
+            for a, b in (
+                _codeword_scores(vectors, vector_weights, copies[c])
+                for c in range(classes)
+            )
         ]
         # d: the E8M0 exponent putting the largest group at the top level, and its neighbours.
         top = (group_scale.amax(-1) / nominal_max).clamp_min(2.0**-126)
@@ -324,9 +330,9 @@ def _encode_blocks(
             group_index = torch.zeros(rows * 32, dtype=torch.int64, device=device)
             group_recon = torch.zeros(rows, 8, IQ2R_SCALE_BLOCK, device=device)
             for level in range(16):
-                a, b = scores[level % classes]
+                a, b2 = scores[level % classes]
                 scale = torch.exp2(exponent + level // classes).repeat_interleave(32)
-                index = torch.argmin(scale[:, None] * a - 2 * b, dim=-1)
+                index = torch.argmin(scale[:, None] * a - b2, dim=-1)
                 recon = (copies[level % classes][index] * scale[:, None]).reshape(
                     rows, 8, IQ2R_SCALE_BLOCK
                 )
@@ -437,7 +443,7 @@ def iq2r_v2_learn_codebook(
     sample_vectors: int = 65536,
     seed: int = 0,
     chunk_blocks: int = 4096,
-) -> Tensor:
+) -> tuple[Tensor, IQ2RV2Encoding]:
     """Learn one ``[512, 8]`` native E4M3 codebook for ``weight [N, K]``.
 
     Importance-weighted k-means on ``sample_vectors / 32`` random 256-weight
@@ -447,6 +453,9 @@ def iq2r_v2_learn_codebook(
     encoder's own cost). Codewords stay within the seed's maximum, which keeps
     the scale search's reference point, and a round is kept only if the
     weighted cost of the whole matrix drops.
+
+    Returns the codebook and ``weight``'s encoding with it, which the last kept
+    round has already computed.
     """
 
     k = weight.shape[1]
@@ -465,12 +474,10 @@ def iq2r_v2_learn_codebook(
     weights = _cost_weights(sample, sample_importance).reshape(-1, IQ2R_VECTOR_SIZE)
     multipliers = torch.tensor(levels.multipliers, device=device)
 
-    def matrix_cost(b: Tensor) -> float:
-        return iq2r_v2_encode(
-            weight, importance, b, levels, chunk_blocks=chunk_blocks
-        ).cost
+    def matrix_encode(b: Tensor) -> IQ2RV2Encoding:
+        return iq2r_v2_encode(weight, importance, b, levels, chunk_blocks=chunk_blocks)
 
-    best_cost = matrix_cost(book)
+    best = matrix_encode(book)
     for _ in range(rounds):
         enc = _encode_blocks(sample, sample_importance, book, levels, chunk_blocks)
         level = enc.levels.long()
@@ -497,11 +504,11 @@ def iq2r_v2_learn_codebook(
                 occupied, numerator / torch.where(occupied, denominator, 1.0), candidate
             )
         candidate = _e4m3(candidate.clamp(0.0, pin))
-        cost = matrix_cost(candidate)
-        if cost >= best_cost:
+        encoding = matrix_encode(candidate)
+        if encoding.cost >= best.cost:
             break
-        book, best_cost = candidate, cost
-    return book.contiguous()
+        book, best = candidate, encoding
+    return book.contiguous(), best
 
 
 # --------------------------------------------------------------------------

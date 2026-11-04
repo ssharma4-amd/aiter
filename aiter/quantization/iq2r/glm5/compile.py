@@ -74,7 +74,6 @@ from aiter.ops.iq2r_v2 import (
     IQ2R_V2_LEVEL_SETS,
     IQ2R_V2_LEVELS_C4,
     IQ2RV2Levels,
-    iq2r_v2_encode,
     iq2r_v2_format_name,
     iq2r_v2_gains,
     iq2r_v2_learn_codebook,
@@ -112,6 +111,10 @@ _GLM53_SHAPE = {
 }
 _SHARD_BYTES = 5 << 30
 _PROJECTIONS = {"gate_up": "gate-up", "down": "down"}
+# 256-weight blocks per IQ2R-v2 encoder pass (~50 GB peak on a gate/up
+# matrix). The blocks are independent, so any size gives the same bytes; large
+# passes halve the compile time of the default.
+_V2_CHUNK_BLOCKS = 65536
 _MODEL_FILES = (
     "generation_config.json",
     "tokenizer.json",
@@ -736,15 +739,15 @@ def _encode_projection_v2(
         seed = 0x10A0 + layer * 1024 + expert * 2 + (projection == "down")
 
         def encode(weight: Tensor, salt: int, importance=expert_importance, seed=seed):
-            book = iq2r_v2_learn_codebook(
+            return iq2r_v2_learn_codebook(
                 weight,
                 importance,
                 levels,
                 rounds=iterations,
                 sample_vectors=sample_vectors,
                 seed=seed * 2 + salt,
+                chunk_blocks=_V2_CHUNK_BLOCKS,
             )
-            return book, iq2r_v2_encode(weight, importance, book, levels)
 
         # gate/up is the interleaved matrix (gate0, up0, ...) with one codebook;
         # its gains are fitted to the gate and the up rows separately.
