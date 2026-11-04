@@ -121,6 +121,10 @@ The compiler builds it with `--format iq2r-v2`:
         --output-dir $OUT --calibration-cache calibration.pt \
         --format iq2r-v2 --device cuda:$i --layers ... --resume
 
+It encodes the 256 routed experts of each MoE layer. The shared expert, which
+every token passes through, is not fused: it keeps its block-FP8 weights in
+the checkpoint shards, and `iq2r_modules` lists only the routed experts.
+
 Each step of the recipe:
 
 1. Importance: the calibration artifact's router-weighted second moment

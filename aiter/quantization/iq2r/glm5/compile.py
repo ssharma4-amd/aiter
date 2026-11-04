@@ -4,7 +4,7 @@
 """Compile a block-FP8 GLM-5.3 checkpoint into the packed IQ2R checkpoint.
 
 For each MoE layer the routed experts, plus the shared expert fused as the
-last expert, are encoded to IQ2R on the GPU, packed with
+last expert (IQ2R only), are encoded on the GPU, packed with
 ``aiter.iq2r_glm53.iq2r_glm53_pack`` and written as
 ``iq2r-layer-NNNN-{gate-up,down}.safetensors``. A run over every MoE layer
 then copies the remaining FP8 tensors into new shards and writes the index,
@@ -18,7 +18,9 @@ recorded as not O0-quality in every layer file.
 ``--format iq2r-v2`` builds IQ2R-v2 instead (``aiter/ops/iq2r_v2.py``): the
 same records and kernels with two-level scales, an E8M0 ``d`` per row and 256
 inputs plus a 4-bit level per 32 weights that selects one of the codebook's
-pre-scaled copies. Each step of the recipe:
+pre-scaled copies. It encodes the routed experts only: the shared expert,
+which every token passes through, keeps its block-FP8 weights. Each step of
+the recipe:
 
 * importance: the calibration artifact's router-weighted second moment,
   sum r^2 x^2 / sum r^2 per input channel (shared by gate and up);
@@ -194,6 +196,10 @@ class GLM5Layout:
     def compiled_experts(self) -> int:
         # The shared expert is fused as the last expert.
         return self.expert_count + 1
+
+    def experts_for(self, v2: bool) -> int:
+        """Experts per layer file: IQ2R-v2 leaves the shared expert in FP8."""
+        return self.expert_count if v2 else self.compiled_experts
 
 
 @dataclass(frozen=True, slots=True)
@@ -609,7 +615,7 @@ def _validate_projection_shard(
         else metadata.auxiliary_bytes
     )
     keys = iq2r_compiled_tensor_keys(layer, projection)
-    compiled_experts = layout.compiled_experts
+    compiled_experts = layout.experts_for(bool(v2))
     expected_tensors = {
         keys["data"]: ([compiled_experts, data_bytes], "U8"),
         keys["auxiliary"]: (
@@ -717,11 +723,11 @@ def _encode_projection_v2(
     sample_vectors: int,
     recipe: IQ2RV2Recipe,
 ) -> tuple[Tensor, Tensor]:
-    """Canonical IQ2R-v2 buffers ``(data, auxiliary)`` of every compiled expert."""
+    """Canonical IQ2R-v2 buffers ``(data, auxiliary)`` of every routed expert."""
     metadata = _projection_metadata(layout, projection)
     levels = recipe.levels
     data_rows, aux_rows = [], []
-    for expert in range(layout.compiled_experts):
+    for expert in range(layout.expert_count):
         expert_importance = (
             importance.for_projection(layer, projection, expert)
             .to(device=device, dtype=torch.float32, non_blocking=True)
@@ -757,7 +763,7 @@ def _encode_projection_v2(
             raise ValueError(f"layer {layer} expert {expert} {projection}: data bytes")
         data_rows.append(data.cpu())
         aux_rows.append(aux.cpu())
-        if (expert + 1) % 16 == 0 or expert + 1 == layout.compiled_experts:
+        if (expert + 1) % 16 == 0 or expert + 1 == layout.expert_count:
             print(
                 json.dumps(
                     {
@@ -765,7 +771,7 @@ def _encode_projection_v2(
                         "projection": projection,
                         "format": "iq2r-v2",
                         "experts_complete": expert + 1,
-                        "experts_total": layout.compiled_experts,
+                        "experts_total": layout.expert_count,
                     }
                 ),
                 flush=True,
@@ -869,11 +875,13 @@ def _write_checkpoint_files(
     """
 
     layers = range(layout.first_moe_layer, layout.layer_count)
+    # IQ2R-v2 copies the shared expert's FP8 weights like any other tensor.
+    modules = ("experts", "shared_experts") if v2 is None else ("experts",)
     compiled = {
         name
         for layer in layers
         for keys in (
-            iq2r_glm5_shared_source_keys(layer),
+            *((iq2r_glm5_shared_source_keys(layer),) if v2 is None else ()),
             *(
                 iq2r_glm5_source_keys(layer, expert)
                 for expert in range(layout.expert_count)
@@ -934,7 +942,7 @@ def _write_checkpoint_files(
         # layer keeps the MTP layer's experts on the FP8 path.
         "iq2r_modules": [
             f"model.layers.{layer}.mlp.{module}*"
-            for module in ("experts", "shared_experts")
+            for module in modules
             for layer in layers
         ],
         "iq2r_layout": LAYOUT if v2 is None else LAYOUT_V2,

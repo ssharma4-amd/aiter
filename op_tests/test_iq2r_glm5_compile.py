@@ -21,7 +21,9 @@ from aiter.ops.iq2r_format import (
 )
 from aiter.quantization.iq2r.glm5.compile import (
     LAYOUT,
+    LAYOUT_V2,
     GLM5Layout,
+    IQ2RV2Recipe,
     _projection_metadata,
     _validate_projection_shard,
     _write_checkpoint_files,
@@ -344,6 +346,51 @@ def test_checkpoint_files_replace_compiled_experts(tmp_path, monkeypatch, two_ex
         assert not is_iq2r(module)
     assert (output / "tokenizer.json").read_text() == "{}"
     assert not (output / "README.md").exists()
+
+
+def test_v2_checkpoint_keeps_shared_expert_fp8(tmp_path, two_experts):
+    source, output = tmp_path / "source", tmp_path / "out"
+    tensors = _write_source_model(source)
+    output.mkdir()
+    for layer in (3, 4):
+        for projection, suffix in (("gate_up", "gate-up"), ("down", "down")):
+            keys = iq2r_compiled_tensor_keys(layer, projection)
+            save_file(
+                {name: torch.zeros(2, dtype=torch.uint8) for name in keys.values()},
+                output / f"iq2r-layer-{layer:04d}-{suffix}.safetensors",
+            )
+    config = json.loads((source / "config.json").read_text())
+    _write_checkpoint_files(
+        source,
+        output,
+        config,
+        json.loads((source / "model.safetensors.index.json").read_text())["weight_map"],
+        glm5_source_layout(config),
+        IQ2RV2Recipe(),
+    )
+
+    weight_map = json.loads((output / "model.safetensors.index.json").read_text())[
+        "weight_map"
+    ]
+    for layer in (3, 4):
+        for name in iq2r_glm5_shared_source_keys(layer).values():
+            with safe_open(output / weight_map[name], "pt") as handle:
+                assert torch.equal(handle.get_tensor(name), tensors[name])
+        for expert in range(_EXPERTS):
+            assert not set(iq2r_glm5_source_keys(layer, expert).values()) & set(
+                weight_map
+            )
+    quantization = json.loads((output / "config.json").read_text())[
+        "quantization_config"
+    ]
+    assert quantization["iq2r_layout"] == LAYOUT_V2
+    patterns = quantization["iq2r_modules"]
+    for layer in (3, 4):
+        module = f"model.layers.{layer}.mlp"
+        assert any(fnmatch.fnmatch(f"{module}.experts", p) for p in patterns)
+        assert not any(fnmatch.fnmatch(f"{module}.shared_experts", p) for p in patterns)
+    assert _layout().experts_for(True) == _EXPERTS
+    assert _layout().experts_for(False) == _EXPERTS + 1
 
 
 def test_resume_validates_existing_layer_file(tmp_path):
