@@ -76,21 +76,13 @@ def _interleave(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 _TEST_GAIN = 0.8
 
 
-def _encode_gate_up(gate, up, books, importance):
-    """Canonical IQ2R-v2 gate/up (rows interleaved, one codebook each)."""
-    eg = iq2r_v2_encode(gate, importance, books[0], LEVELS)
-    eu = iq2r_v2_encode(up, importance, books[1], LEVELS)
+def _encode_gate_up(gate, up, book, importance):
+    """Canonical IQ2R-v2 gate/up: rows interleaved, one shared codebook."""
     weight = _interleave(gate, up)
-    recon = _interleave(eg.reconstruction, eu.reconstruction)
-    gains = iq2r_v2_gains(weight, recon, _TEST_GAIN, interleaved=True)
-    data = iq2r_v2_write_data(
-        _interleave(eg.indices, eu.indices),
-        _interleave(eg.negative, eu.negative),
-        _interleave(eg.levels, eu.levels),
-        LEVELS,
-    )
-    aux = iq2r_v2_write_auxiliary(torch.stack(books), _interleave(eg.d, eu.d), gains)
-    return data, aux
+    enc = iq2r_v2_encode(weight, importance, book, LEVELS)
+    gains = iq2r_v2_gains(weight, enc.reconstruction, _TEST_GAIN, interleaved=True)
+    data = iq2r_v2_write_data(enc.indices, enc.negative, enc.levels, LEVELS)
+    return data, iq2r_v2_write_auxiliary(book[None], enc.d, gains)
 
 
 def _encode_down(weight, book, importance):
@@ -115,7 +107,7 @@ def _glm53_v2_layer(intermediate: int):
         _encode_gate_up(
             weight(intermediate, _HIDDEN, 0x5330 + i),
             weight(intermediate, _HIDDEN, 0x5350 + i),
-            books,
+            books[1],
             ones_h,
         )
         for i in range(3)
@@ -133,7 +125,7 @@ def _glm53_v2_layer(intermediate: int):
         intermediate=intermediate,
         pick=pick,
         gate_weights=[
-            iq2r_v2_materialize(d, a, 2 * intermediate, _HIDDEN, LEVELS, books=2)
+            iq2r_v2_materialize(d, a, 2 * intermediate, _HIDDEN, LEVELS)
             for d, a in gate
         ],
         down_weights=[
@@ -216,7 +208,7 @@ def test_glm53_v2_tp_slices_match_shard_pack(tp):
     down = torch.randn((_HIDDEN, full_i), generator=generator, device="cuda") * 0.02
     imp_h = torch.rand(_HIDDEN, generator=generator, device="cuda") + 0.5
     imp_i = torch.rand(full_i, generator=generator, device="cuda") + 0.5
-    gd, ga = _encode_gate_up(gate, up, books, imp_h)
+    gd, ga = _encode_gate_up(gate, up, books[1], imp_h)
     dd, da = _encode_down(down, books[0], imp_i)
     full = iq2r_glm53_pack_v2(
         gd[None], ga[None], dd[None], da[None], intermediate_size=full_i, levels=LEVELS
@@ -226,7 +218,7 @@ def test_glm53_v2_tp_slices_match_shard_pack(tp):
     cols = slice(shard * rank, shard * (rank + 1))
     # Canonical shard: re-encode-free slice of the canonical buffers is not
     # byte-addressable, so encode the shard from the same weights instead.
-    sgd, sga = _encode_gate_up(gate[cols], up[cols], books, imp_h)
+    sgd, sga = _encode_gate_up(gate[cols], up[cols], books[1], imp_h)
     sdd, sda = _encode_down(down[:, cols], books[0], imp_i[cols])
     want = iq2r_glm53_pack_v2(
         sgd[None],

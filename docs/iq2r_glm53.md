@@ -98,8 +98,10 @@ The power-of-two parts (`d` and `2^(l / 4)`) form the scaled-MFMA E8M0
 operand, the mantissa `m[c]` selects a codebook copy in LDS, and the gain is
 applied once per output, so the kernels run the same MFMA stream. The
 copies' E4M3 rounding is part of the format: the encoder, the reference
-decoder (`iq2r_v2_materialize`) and the kernels agree bit for bit. Gate and
-up keep separate codebooks (the up copies follow the gate's in LDS).
+decoder (`iq2r_v2_materialize`) and the kernels agree bit for bit. As in
+IQ2R, gate and up share one codebook (learned on the interleaved matrix); on
+six GLM-5.3 experts, separate gate and up codebooks lowered the weighted
+weight error by only 0.09%, for twice the codebook memory.
 
 In a lane group `g`, the metadata high nibble holds the exponent of block
 `g`, whose MFMA scale that lane supplies, and the class of block `s(g)`,
@@ -123,7 +125,8 @@ Each step of the recipe:
 
 1. Importance: the calibration artifact's router-weighted second moment
    (above), from the calibration corpus below rather than WikiText alone.
-2. Codebook (`iq2r_v2_learn_codebook`): per matrix, seeded with the IQ2_XXS
+2. Codebook (`iq2r_v2_learn_codebook`): per matrix (one for the interleaved
+   gate/up matrix, one for down), seeded with the IQ2_XXS
    grid at 1x and sqrt(2)x, importance-weighted k-means on 65,536 sampled
    8-vectors alternating with the encoder (`--iterations` rounds). Codewords
    stay below the seed maximum and a round is kept only if the matrix's

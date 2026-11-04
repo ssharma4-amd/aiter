@@ -209,7 +209,7 @@ def iq2r_glm53_pack(
 # IQ2R-v2 (aiter/ops/iq2r_v2.py). The data records pack exactly as above (the
 # metadata high nibble carries the level instead of the exponent delta). The
 # packed auxiliary is
-#   [books * C * 4096]  codebook copies E4M3(codebook * m[c]), book-major
+#   [C * 4096]          codebook copies E4M3(codebook * m[c])
 #   [d table]           E8M0 d, one uint32 per (row block, K256, lane row):
 #                       gate/up [N/64][K/256][16][4 quad atoms],
 #                       down    [N/48][K/256][16][3 triplet atoms + 1 pad]
@@ -229,10 +229,10 @@ def _pack_v2_d(d: Tensor, atoms: int) -> Tensor:
     return out
 
 
-def iq2r_glm53_v2_aux_bytes(n: int, k: int, books: int, classes: int) -> int:
-    """Bytes per expert of a packed IQ2R-v2 auxiliary tensor."""
-    atoms = 4 if books == 2 else 3
-    return books * classes * 4096 + (n // (16 * atoms)) * (k // 256) * 64 + 8
+def iq2r_glm53_v2_aux_bytes(n: int, k: int, classes: int, *, gate: bool) -> int:
+    """Bytes per expert of a packed IQ2R-v2 auxiliary tensor (gate/up or down)."""
+    atoms = 4 if gate else 3
+    return classes * 4096 + (n // (16 * atoms)) * (k // 256) * 64 + 8
 
 
 @torch.no_grad()
@@ -247,21 +247,18 @@ def iq2r_glm53_pack_v2(
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Relayout one GLM-5.3 IQ2R-v2 MoE layer (full checkpoint or a TP shard).
 
-    Inputs are canonical IQ2R-v2 buffers (``aiter.ops.iq2r_v2``): gate/up with
-    two codebooks (gate rows, up rows), down with one. Returns
+    Inputs are canonical IQ2R-v2 buffers (``aiter.ops.iq2r_v2``), one codebook
+    per matrix (gate and up share one, as in IQ2R). Returns
     ``(gate_quad, gate_auxiliary, down_data, down_auxiliary)``.
     """
     from .ops.iq2r_v2 import iq2r_v2_codebook_copies
 
-    def aux(auxiliary: Tensor, n: int, k: int, books: int, atoms: int) -> Tensor:
+    def aux(auxiliary: Tensor, n: int, k: int, atoms: int) -> Tensor:
         experts = auxiliary.shape[0]
-        book_end = books * 4096
-        codebooks = auxiliary[:, :book_end].view(torch.float8_e4m3fn).float()
+        codebooks = auxiliary[:, :4096].view(torch.float8_e4m3fn).float()
         copies = iq2r_v2_codebook_copies(codebooks.reshape(-1, 512, 8), levels)
-        copies = copies.reshape(levels.classes, experts, books, 512, 8).permute(
-            1, 2, 0, 3, 4
-        )
-        d = auxiliary[:, book_end : book_end + n * (k // 256)].reshape(experts, n, -1)
+        copies = copies.permute(1, 0, 2, 3)  # [E, C, 512, 8]
+        d = auxiliary[:, 4096 : 4096 + n * (k // 256)].reshape(experts, n, -1)
         return torch.cat(
             (
                 copies.to(torch.float8_e4m3fn).view(torch.uint8).reshape(experts, -1),
@@ -278,8 +275,8 @@ def iq2r_glm53_pack_v2(
     del gate
     down = down_data.clone(memory_format=torch.contiguous_format)
     _pack_indices(down, intermediate_size)
-    gate_aux = aux(gate_up_auxiliary, 2 * intermediate_size, HIDDEN, 2, 4)
-    down_aux = aux(down_auxiliary, HIDDEN, intermediate_size, 1, 3)
+    gate_aux = aux(gate_up_auxiliary, 2 * intermediate_size, HIDDEN, 4)
+    down_aux = aux(down_auxiliary, HIDDEN, intermediate_size, 3)
     return quad, gate_aux, down, down_aux
 
 
@@ -289,7 +286,7 @@ def iq2r_glm53_v2_slice_gate_aux(
     """Output-row slice of a packed v2 gate/up auxiliary (64-row aligned)."""
     if start % 64 or length % 64:
         raise ValueError("packed gate/up slices must be aligned to 64 columns")
-    books = 2 * classes * 4096
+    books = classes * 4096
     table = aux[:, books:-8].reshape(aux.shape[0], full_n // 64, -1)
     picked = table[:, start // 64 : (start + length) // 64].reshape(aux.shape[0], -1)
     return torch.cat((aux[:, :books], picked, aux[:, -8:]), dim=1).contiguous()

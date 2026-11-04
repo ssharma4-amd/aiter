@@ -24,7 +24,9 @@ pre-scaled copies. Each step of the recipe:
   sum r^2 x^2 / sum r^2 per input channel (shared by gate and up);
 * codebook (``iq2r_v2_learn_codebook``): per matrix, importance-weighted
   k-means on 65,536 sampled 8-vectors, alternating with the encoder for
-  ``--iterations`` rounds; gate and up each get their own codebook;
+  ``--iterations`` rounds; gate and up share one codebook, learned on the
+  interleaved gate/up matrix as in IQ2R (separate codebooks measured +0.09%
+  better weight error at twice the codebook memory);
 * encoder (``iq2r_v2_encode``): IQ2_XXS-style cost
   importance * sqrt(sigma^2 + w^2), a 13-candidate least-squares group scale
   search, then an exhaustive search of d and every group's level;
@@ -600,8 +602,8 @@ def _validate_projection_shard(
         iq2r_glm53_v2_aux_bytes(
             metadata.logical_n,
             metadata.logical_k,
-            2 if projection == "gate_up" else 1,
             IQ2R_V2_LEVEL_SETS[v2].classes,
+            gate=projection == "gate_up",
         )
         if v2
         else metadata.auxiliary_bytes
@@ -703,18 +705,6 @@ def _encode_projection(
     return data, auxiliary
 
 
-def _source_gate_up_v2(
-    reader: _TensorReader,
-    layout: GLM5Layout,
-    layer: int,
-    expert: int,
-    device: torch.device | str,
-) -> tuple[Tensor, Tensor]:
-    """Separate gate and up weights (IQ2R-v2 encodes each with its own codebook)."""
-    interleaved = _source_projection(reader, layout, layer, expert, "gate_up", device)
-    return interleaved[0::2].contiguous(), interleaved[1::2].contiguous()
-
-
 def _encode_projection_v2(
     reader: _TensorReader,
     layout: GLM5Layout,
@@ -750,38 +740,19 @@ def _encode_projection_v2(
             )
             return book, iq2r_v2_encode(weight, importance, book, levels)
 
-        if projection == "gate_up":
-            gate, up = _source_gate_up_v2(reader, layout, layer, expert, device)
-            (gate_book, g), (up_book, u) = encode(gate, 0), encode(up, 1)
-
-            def interleave(a: Tensor, b: Tensor) -> Tensor:
-                return torch.stack((a, b), dim=1).reshape(-1, *a.shape[1:])
-
-            gains = iq2r_v2_gains(
-                interleave(gate, up),
-                interleave(g.reconstruction, u.reconstruction),
-                recipe.target_gain,
-                interleaved=True,
-            )
-            data = iq2r_v2_write_data(
-                interleave(g.indices, u.indices),
-                interleave(g.negative, u.negative),
-                interleave(g.levels, u.levels),
-                levels,
-            )
-            aux = iq2r_v2_write_auxiliary(
-                torch.stack((gate_book, up_book)), interleave(g.d, u.d), gains
-            )
-            del gate, up, g, u
-        else:
-            weight = _source_projection(
-                reader, layout, layer, expert, projection, device
-            )
-            book, enc = encode(weight, 0)
-            gains = iq2r_v2_gains(weight, enc.reconstruction, recipe.target_gain)
-            data = iq2r_v2_write_data(enc.indices, enc.negative, enc.levels, levels)
-            aux = iq2r_v2_write_auxiliary(book[None], enc.d, gains)
-            del weight, enc
+        # gate/up is the interleaved matrix (gate0, up0, ...) with one codebook;
+        # its gains are fitted to the gate and the up rows separately.
+        weight = _source_projection(reader, layout, layer, expert, projection, device)
+        book, enc = encode(weight, 0)
+        gains = iq2r_v2_gains(
+            weight,
+            enc.reconstruction,
+            recipe.target_gain,
+            interleaved=projection == "gate_up",
+        )
+        data = iq2r_v2_write_data(enc.indices, enc.negative, enc.levels, levels)
+        aux = iq2r_v2_write_auxiliary(book[None], enc.d, gains)
+        del weight, enc
         if tuple(data.shape) != (metadata.data_bytes,):
             raise ValueError(f"layer {layer} expert {expert} {projection}: data bytes")
         data_rows.append(data.cpu())
