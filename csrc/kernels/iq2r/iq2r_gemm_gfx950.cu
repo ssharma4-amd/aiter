@@ -645,18 +645,19 @@ __device__ __forceinline__ void iq2r_stage_codebook_async(uint64_t* lds,const ui
     asm volatile("" ::: "memory");
 }
 
-// IQ2R-v2 codebook copies from copy 0, the codebook itself. For a normal E4M3
-// byte b in 0x08..0x78, E4M3(b * 2^(c/4)) (the packer's FP32 product rounded
-// to nearest even) is b + delta_c[b & 7]: copy 2 adds 2, copies 1 and 3 add a
-// v_perm table entry, and no byte carries into the next. The encoder keeps
-// every codebook byte in that range (aiter/ops/iq2r_v2.py).
+// IQ2R-v2 codebook copies 1-3 from copy 0, the codebook itself. For a normal
+// E4M3 byte b in 0x08..0x78, copy c's byte E4M3(b * 2^(c/4)) (the packer's
+// FP32 product rounded to nearest even) is b + delta_c[b & 7], and no byte
+// carries into the next: copy 1 adds 2, copies 2 and 3 add a v_perm table
+// entry (k2, k3: deltas for mantissas 0-3, 4-7 are the high word's). The
+// encoder keeps every codebook byte in that range (aiter/ops/iq2r_v2.py).
 __device__ __forceinline__ void iq2r_v2_copy_words(uint32_t w,uint32_t k2,uint32_t k3,
                                                    uint32_t& r1,uint32_t& r2,uint32_t& r3)
 {
     const uint32_t m=w&0x07070707u;
-    r1=w+0x02020202u;                                        // class 2: x 2^(2/4)
-    r2=w+__builtin_amdgcn_perm(0x04040404u,k2,m);            // class 1: x 2^(1/4)
-    r3=w+__builtin_amdgcn_perm(0x06060606u,k3,m);            // class 3: x 2^(3/4)
+    r1=w+0x02020202u;                                        // x 2^(1/4)
+    r2=w+__builtin_amdgcn_perm(0x04040404u,k2,m);            // x 2^(2/4)
+    r3=w+__builtin_amdgcn_perm(0x06060606u,k3,m);            // x 2^(3/4)
 }
 
 // The 4 copies of a 4 KB book in LDS from copy 0; base[i] holds bytes
@@ -2847,10 +2848,11 @@ __device__ __forceinline__ void glm53_cross_k_decode_mfma(
         else asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
         const uint32_t signs=atom==0?compressed.first.y:atom==1?compressed.first.w:atom==2?compressed.second.y:compressed.second.w;
         union { opus::i32x8_t words;uint64_t codewords[4]; } decoded;
-        decoded.codewords[0]=glm53_sign_word<0>(mag[0],signs);
-        decoded.codewords[1]=glm53_sign_word<1>(mag[1],signs);
-        decoded.codewords[2]=glm53_sign_word<2>(mag[2],signs);
-        decoded.codewords[3]=glm53_sign_word<3>(mag[3],signs);
+        const uint64_t sign_pair=glm53_sign_pair(signs);
+        decoded.codewords[0]=glm53_sign_word<0>(mag[0],sign_pair);
+        decoded.codewords[1]=glm53_sign_word<1>(mag[1],sign_pair);
+        decoded.codewords[2]=glm53_sign_word<2>(mag[2],sign_pair);
+        decoded.codewords[3]=glm53_sign_word<3>(mag[3],sign_pair);
         const uint32_t sb=((bases>>(atom*8))&255u)+((compressed.metadata>>(atom*8+4))&15u);
 #pragma unroll
         for(int m=0;m<MAtoms;++m) {
