@@ -165,6 +165,28 @@ def test_glm53_v2_moe_matches_reference(glm53_v2_layer, tokens):
     _check_moe(actual, expected)
 
 
+def _routed_only(layer, tokens: int, seed: int):
+    """IQ2R-v2 without the shared expert: [256, ...] stacks, top-8 routing."""
+    hidden, topk_weights, topk_ids = _routing(tokens, seed)
+    topk_ids = topk_ids[:, : _TOPK - 1].contiguous()
+    topk_weights = topk_weights[:, : _TOPK - 1].contiguous()
+    packed = [t[: _EXPERTS - 1].contiguous() for t in layer.packed]
+    return hidden, topk_weights, topk_ids, packed
+
+
+@pytest.mark.parametrize("tokens", [1, 2, 4, 8, 64, 256, 1024, 4096])
+def test_glm53_v2_routed_only_matches_reference(glm53_v2_layer, tokens):
+    layer = glm53_v2_layer
+    hidden, topk_weights, topk_ids, packed = _routed_only(
+        layer, tokens, 0x5370 + tokens
+    )
+    expected = _reference_moe(layer, hidden, topk_weights, topk_ids)
+    actual = torch.empty_like(hidden)
+    workspace = IQ2RGlm53Workspace.allocate(tokens, layer.intermediate, device="cuda")
+    iq2r_glm53_moe_out(hidden, *packed, topk_weights, topk_ids, actual, workspace)
+    _check_moe(actual, expected)
+
+
 _EXPLICIT_CONFIGS = [
     IQ2RGlm53Config("nobarrier", 4, "route9", 4, 1),
     IQ2RGlm53Config("decode", 1, "single", 2, 1),
@@ -191,6 +213,27 @@ def test_glm53_v2_moe_explicit_configs(glm53_v2_layer, tokens, config):
     workspace = IQ2RGlm53Workspace.allocate(tokens, layer.intermediate, device="cuda")
     iq2r_glm53_moe_out(
         hidden, *layer.packed, topk_weights, topk_ids, actual, workspace, config
+    )
+    _check_moe(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "config", _EXPLICIT_CONFIGS, ids=lambda c: "-".join(map(str, astuple(c)))
+)
+@pytest.mark.parametrize("tokens", [4, 48, 1024])
+def test_glm53_v2_routed_only_explicit_configs(glm53_v2_layer, tokens, config):
+    layer = glm53_v2_layer
+    problem = _config_problem(config, tokens, layer.intermediate)
+    if problem:
+        pytest.skip(problem)
+    hidden, topk_weights, topk_ids, packed = _routed_only(
+        layer, tokens, 0x53B0 + tokens
+    )
+    expected = _reference_moe(layer, hidden, topk_weights, topk_ids)
+    actual = torch.empty_like(hidden)
+    workspace = IQ2RGlm53Workspace.allocate(tokens, layer.intermediate, device="cuda")
+    iq2r_glm53_moe_out(
+        hidden, *packed, topk_weights, topk_ids, actual, workspace, config
     )
     _check_moe(actual, expected)
 

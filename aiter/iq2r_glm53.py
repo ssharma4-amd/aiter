@@ -386,16 +386,22 @@ _TUNED: dict[str, dict] = {}
 
 
 def _tuned_table(tuned_file: str) -> dict:
-    """(gfx, cu_num, intermediate) -> [(token, config)] sorted by token."""
+    """(gfx, cu_num, intermediate, experts) -> [(token, config)] sorted by token.
+
+    Rows with 257 experts and top-9 are for stacks with the fused shared expert
+    (IQ2R); rows with 256 experts and top-8 for stacks without it (IQ2R-v2).
+    """
     if tuned_file not in _TUNED:
         table = pd.read_csv(tuned_file).drop_duplicates()
         # Other model families may share the file; keep only this shape.
         table = table[
             (table.model_dim == HIDDEN)
-            & (table.expert == EXPERTS)
-            & (table.topk == TOPK)
+            & (
+                ((table.expert == EXPERTS) & (table.topk == TOPK))
+                | ((table.expert == EXPERTS - 1) & (table.topk == TOPK - 1))
+            )
         ]
-        keys = ["gfx", "cu_num", "token", "inter_dim"]
+        keys = ["gfx", "cu_num", "token", "inter_dim", "expert"]
         duplicate = table[table.duplicated(keys, keep=False)]
         if len(duplicate):
             raise ValueError(
@@ -416,21 +422,26 @@ def _tuned_table(tuned_file: str) -> dict:
                 raise ValueError(
                     f"{tuned_file}: M={row.token} I={row.inter_dim} {config}: {problem}"
                 )
-            key = (row.gfx, int(row.cu_num), int(row.inter_dim))
+            key = (row.gfx, int(row.cu_num), int(row.inter_dim), int(row.expert))
             shapes.setdefault(key, []).append((int(row.token), config))
         _TUNED[tuned_file] = shapes
     return _TUNED[tuned_file]
 
 
 @functools.lru_cache(maxsize=1024)
-def iq2r_glm53_config(tokens: int, intermediate_size: int) -> IQ2RGlm53Config:
+def iq2r_glm53_config(
+    tokens: int, intermediate_size: int, experts: int = EXPERTS
+) -> IQ2RGlm53Config:
     """Config of the smallest tuned M >= ``tokens`` that can run ``tokens``.
 
-    Tuned rows are powers of two; rounding up skips rows that cannot run the
-    real M (M3 skips the route9 M4 row).
+    ``experts`` is the packed stack's expert count: 257 (top-9, fused shared
+    expert) or 256 (top-8). Tuned rows are powers of two; rounding up skips
+    rows that cannot run the real M (M3 skips the route9 M4 row).
     """
     tuned_file = AITER_CONFIGS.AITER_CONFIG_IQ2R_GLM53_FILE
-    rows = _tuned_table(tuned_file).get((get_gfx(), get_cu_num(), intermediate_size))
+    rows = _tuned_table(tuned_file).get(
+        (get_gfx(), get_cu_num(), intermediate_size, experts)
+    )
     for tuned_tokens, config in rows or ():
         if tuned_tokens >= tokens and not _config_problem(
             config, tokens, intermediate_size
@@ -530,10 +541,12 @@ def iq2r_glm53_moe_out(
 
     ``hidden_states`` is BF16 [tokens, 6144]; ``topk_ids``/``topk_weights``
     are int32/float32 [tokens, 9] (eight routed experts plus the fused shared
-    expert 256); the weights come from :func:`iq2r_glm53_pack`. Routes with an
-    id outside 0..256 contribute nothing. ``config`` overrides the tuned launch
-    choice (used by the tuner); it must fit ``tokens``, and ``tokens`` must fit
-    the workspace.
+    expert 256), or [tokens, 8] for weights without the shared expert
+    ([256, ...] stacks, IQ2R-v2 keeps the shared expert FP8); the weights come
+    from :func:`iq2r_glm53_pack` or :func:`iq2r_glm53_pack_v2`. Routes with a
+    negative id contribute nothing; ids must be below the stack's expert
+    count. ``config`` overrides the tuned launch choice (used by the tuner); it
+    must fit ``tokens``, and ``tokens`` must fit the workspace.
     """
     # The gate and down kernel bodies are built for gfx950 only and are empty
     # on other targets, which would leave ``output`` unwritten.
@@ -564,12 +577,20 @@ def iq2r_glm53_moe_out(
         return
     if tokens == 0:
         return
-    if topk_ids.shape != (tokens, TOPK) or topk_weights.shape != (tokens, TOPK):
-        raise ValueError("GLM-5.3 IQ2R expects top-9 routing [tokens, 9]")
+    # Without the fused shared expert ([256, ...] stacks) the kernels read
+    # top-8 routing and leave the ninth route slot of each token empty.
+    topk = TOPK if gate_up_data.shape[0] == EXPERTS else TOPK - 1
+    if topk_ids.shape != (tokens, topk) or topk_weights.shape != (tokens, topk):
+        raise ValueError(
+            "GLM-5.3 IQ2R expects routing [tokens, 9] with 257 experts, or "
+            "[tokens, 8] with 256 experts"
+        )
     if topk_weights.dtype != torch.float32 or not topk_weights.is_contiguous():
         raise ValueError("topk_weights must be contiguous float32")
     if config is None:
-        config = iq2r_glm53_config(tokens, workspace.intermediate_size)
+        config = iq2r_glm53_config(
+            tokens, workspace.intermediate_size, gate_up_data.shape[0]
+        )
     else:
         problem = _config_problem(config, tokens, workspace.intermediate_size)
         if problem is not None:
