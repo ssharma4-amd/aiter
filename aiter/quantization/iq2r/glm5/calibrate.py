@@ -365,9 +365,32 @@ def corpus_digest(texts: list[str]) -> str:
 
 
 def token_batches(
-    tokenizer, texts: list[str], sequence_length: int, max_tokens: int
+    tokenizer,
+    texts: list[str],
+    sequence_length: int,
+    max_tokens: int,
+    *,
+    per_row: bool = False,
 ) -> Iterator[Tensor]:
-    """Tokenize the texts in order, EOS after each, cycling until ``max_tokens``."""
+    """Tokenize the texts in order, EOS after each, cycling until ``max_tokens``.
+
+    ``per_row`` feeds each text as its own sequence instead, as rendered (no
+    special tokens added), truncated to ``sequence_length``, one pass over the
+    texts or until ``max_tokens``: for corpora of whole chat-template
+    conversations, so every token attends to its own conversation only.
+    """
+
+    if per_row:
+        total = 0
+        for text in texts:
+            if total >= max_tokens:
+                return
+            encoded = tokenizer.encode(text, add_special_tokens=False)
+            encoded = encoded[: min(sequence_length, max_tokens - total)]
+            if encoded:
+                total += len(encoded)
+                yield torch.tensor(encoded, dtype=torch.long).unsqueeze(0)
+        return
 
     tokens: list[int] = []
     index = 0
@@ -394,6 +417,7 @@ def capture_glm5_calibration(
     max_tokens: int = 32768,
     force_unobserved_tokens: int = 512,
     device: torch.device | str | None = None,
+    per_row: bool = False,
 ) -> dict[str, Any]:
     """Run ``texts`` through ``model`` and return the calibration artifact payload.
 
@@ -415,7 +439,7 @@ def capture_glm5_calibration(
     try:
         with torch.inference_mode():
             for input_ids in token_batches(
-                tokenizer, texts, sequence_length, max_tokens
+                tokenizer, texts, sequence_length, max_tokens, per_row=per_row
             ):
                 observer.run(input_ids.to(device))
                 natural_tokens += input_ids.numel()
@@ -455,6 +479,7 @@ def capture_glm5_calibration(
     metadata = {
         "corpus_sha256": corpus_digest(texts),
         "sequence_length": sequence_length,
+        "per_row": per_row,
         "token_count": natural_tokens,
         "forced_layer_input_tokens": forced_tokens,
         "forced_layer_experts": observer.force_mask.nonzero().tolist(),
@@ -514,6 +539,7 @@ def calibrate_glm5(
     device: str = "cuda:0",
     device_map: str | None = None,
     fp8_kernel_dir: str | os.PathLike[str] | None = None,
+    per_row: bool = False,
 ) -> dict[str, Any]:
     """Load the checkpoint, capture the corpus statistics and write the artifact."""
 
@@ -564,6 +590,7 @@ def calibrate_glm5(
         max_tokens=max_tokens,
         force_unobserved_tokens=force_unobserved_tokens,
         device=target,
+        per_row=per_row,
     )
     payload["metadata"].update(
         {
@@ -601,6 +628,14 @@ def main(argv: list[str] | None = None) -> int:
         default=512,
         help="tokens of layer input recorded for experts the corpus never reaches",
     )
+    parser.add_argument(
+        "--per-row",
+        action="store_true",
+        help=(
+            "feed each corpus row as its own sequence (as rendered, truncated to "
+            "--sequence-length) instead of packing EOS-separated text"
+        ),
+    )
     parser.add_argument("--device", default="cuda:0", help="device of the input tokens")
     parser.add_argument(
         "--device-map",
@@ -627,6 +662,7 @@ def main(argv: list[str] | None = None) -> int:
         device=args.device,
         device_map=args.device_map,
         fp8_kernel_dir=args.fp8_kernel_dir,
+        per_row=args.per_row,
     )
     summary = {key: value for key, value in payload.items() if key != "targets"}
     summary["targets"] = len(payload["targets"])

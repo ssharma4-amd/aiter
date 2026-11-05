@@ -22,8 +22,10 @@ from aiter.ops.iq2r_format import (
 from aiter.quantization.iq2r.glm5.compile import (
     LAYOUT,
     LAYOUT_V2,
+    GLM5Importance,
     GLM5Layout,
     IQ2RV2Recipe,
+    _encode_projection_v2,
     _projection_metadata,
     _validate_projection_shard,
     _write_checkpoint_files,
@@ -184,6 +186,39 @@ def test_loads_calibration_artifact(tmp_path):
     torch.save(artifact, path)
     with pytest.raises(ValueError, match="shared_experts down targets cover"):
         load_glm5_importance(path, layout)
+
+
+def test_calibration_hit_counts_exclude_forced_fills(tmp_path):
+    layout = _layout()
+    widths = {"gate_up": layout.hidden_size, "down": layout.intermediate_size}
+    modules = (("experts", layout.expert_count), ("shared_experts", 1))
+    targets = {
+        f"model.layers.{layer}.mlp.{module}.{projection}_proj.weight": {
+            "importance": torch.ones((groups, width)),
+            "hit_count": torch.tensor([300, 40][:groups]) + layer,
+            "forced_hit_count": torch.tensor([0, 30][:groups]),
+        }
+        for layer in (3, 4)
+        for module, groups in modules
+        for projection, width in widths.items()
+    }
+    artifact = {
+        "format": "iq2r-calibration",
+        "version": 1,
+        "scheme": "iq2r-diagonal-second-moment",
+        "basis": "native",
+        "targets": targets,
+    }
+    path = tmp_path / "calibration.pt"
+    torch.save(artifact, path)
+    loaded = load_glm5_importance(path, layout)
+    assert [loaded.routed_tokens(4, expert) for expert in (0, 1)] == [304, 14]
+    assert (
+        load_glm5_importance(
+            None, layout, diagnostic_uniform_importance=True
+        ).routed_tokens(3, 0)
+        is None
+    )
 
 
 def test_uniform_importance_requires_explicit_diagnostic_mode():
@@ -391,6 +426,64 @@ def test_v2_checkpoint_keeps_shared_expert_fp8(tmp_path, two_experts):
         assert not any(fnmatch.fnmatch(f"{module}.shared_experts", p) for p in patterns)
     assert _layout().experts_for(True) == _EXPERTS
     assert _layout().experts_for(False) == _EXPERTS + 1
+
+
+@pytest.mark.skipif(not _has_gfx950(), reason="requires gfx950")
+def test_v2_encodes_routed_experts_with_low_token_fallback(monkeypatch):
+    layout = GLM5Layout(
+        layer_count=4,
+        first_moe_layer=3,
+        expert_count=2,
+        hidden_size=256,
+        intermediate_size=256,
+        block_n=128,
+        block_k=128,
+    )
+    generator = torch.Generator(device="cuda").manual_seed(0x5320)
+    weights = [
+        torch.randn((256, 256), generator=generator, device="cuda") * (0.01 + 0.01 * e)
+        for e in range(2)
+    ]
+    channel = torch.linspace(0.5, 2.0, 256)
+    importance = GLM5Importance(
+        torch.stack([channel, channel])[None],
+        torch.stack([channel, channel])[None],
+        torch.ones(1, 256),
+        torch.ones(1, 256),
+        3,
+        "calibrated-o0",
+        "test",
+        torch.tensor([[1000, 255]]),
+    )
+    seen = []
+    learn = compile_module.iq2r_v2_learn_codebook
+
+    def record(weight, expert_importance, *args, **kwargs):
+        seen.append(expert_importance.cpu())
+        return learn(weight, expert_importance, *args, **kwargs)
+
+    monkeypatch.setattr(compile_module, "iq2r_v2_learn_codebook", record)
+    monkeypatch.setattr(
+        compile_module,
+        "_source_projection",
+        lambda reader, layout, layer, expert, projection, device: weights[expert],
+    )
+    data, auxiliary = _encode_projection_v2(
+        None,
+        layout,
+        importance,
+        3,
+        "down",
+        device="cuda",
+        iterations=1,
+        sample_vectors=4096,
+        recipe=IQ2RV2Recipe(),
+    )
+    # Routed experts only: the shared expert stays FP8.
+    assert data.shape[0] == auxiliary.shape[0] == 2
+    assert torch.allclose(seen[0], channel / channel.mean())
+    energy = weights[1].square().sum(dim=0).cpu()
+    assert torch.allclose(seen[1], (energy / energy.mean()).clamp_min(1e-6))
 
 
 def test_resume_validates_existing_layer_file(tmp_path):

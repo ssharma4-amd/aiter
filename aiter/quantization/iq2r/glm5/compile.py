@@ -19,11 +19,13 @@ recorded as not O0-quality in every layer file.
 same records and kernels with two-level scales, an E8M0 ``d`` per row and 256
 inputs plus a 4-bit level per 32 weights that selects one of the codebook's
 pre-scaled copies. It encodes the routed experts only: the shared expert,
-which every token passes through, keeps its block-FP8 weights. Each step of
-the recipe:
+which every token passes through, keeps its block-FP8 weights (at 2 bits it
+cost ~5 AIME-60 points on GLM-5.3). Each step of the recipe:
 
 * importance: the calibration artifact's router-weighted second moment,
-  sum r^2 x^2 / sum r^2 per input channel (shared by gate and up);
+  sum r^2 x^2 / sum r^2 per input channel (shared by gate and up), divided by
+  its mean; an expert that fewer than 256 corpus tokens reach uses its weight's
+  column energy sum_n W[n, k]^2 instead;
 * codebook (``iq2r_v2_learn_codebook``): per matrix, importance-weighted
   k-means on 65,536 sampled 8-vectors, alternating with the encoder for
   ``--iterations`` rounds; gate and up share one codebook, learned on the
@@ -99,6 +101,8 @@ class IQ2RV2Recipe:
 
     levels: IQ2RV2Levels = IQ2R_V2_LEVELS_C4
     target_gain: float = 0.98
+    # Routed experts reached by fewer corpus tokens use weight energy instead.
+    min_routed_tokens: int = 256
 
 
 # The serving kernels are built for this shape. ATOM slices the 2048-wide
@@ -219,6 +223,14 @@ class GLM5Importance:
     first_moe_layer: int
     quality: str
     sha256: str
+    # Corpus tokens that reached each routed expert [layers, experts] (forced
+    # fills excluded); None for the diagnostic uniform importance.
+    routed_hits: Tensor | None = None
+
+    def routed_tokens(self, layer: int, expert: int) -> int | None:
+        if self.routed_hits is None:
+            return None
+        return int(self.routed_hits[layer - self.first_moe_layer, expert])
 
     def for_projection(self, layer: int, projection: str, expert: int) -> Tensor:
         index = layer - self.first_moe_layer
@@ -323,6 +335,7 @@ def _load_calibration_artifact(
 
     # found[module, projection][layer] is the target's [groups, K] importance.
     found: dict[tuple[str, str], dict[int, Tensor]] = {}
+    hits: dict[int, Tensor] = {}
     for name, target in targets.items():
         match = _TARGET_PATTERN.fullmatch(name)
         if match is None or not isinstance(target, dict):
@@ -332,6 +345,13 @@ def _load_calibration_artifact(
             raise TypeError(f"calibration target {name!r} has no importance tensor")
         layer, module, projection = match.groups()
         found.setdefault((module, projection), {})[int(layer)] = importance
+        if module == "experts" and projection == "gate_up":
+            natural = target.get("hit_count")
+            if isinstance(natural, Tensor):
+                forced = target.get("forced_hit_count")
+                hits[int(layer)] = natural - (
+                    forced if isinstance(forced, Tensor) else 0
+                )
 
     layers = range(layout.first_moe_layer, layout.layer_count)
     widths = {"gate_up": layout.hidden_size, "down": layout.intermediate_size}
@@ -357,6 +377,11 @@ def _load_calibration_artifact(
         layout.first_moe_layer,
         "calibrated-o0",
         _importance_sha256(list(stacked.values())),
+        (
+            torch.stack([hits[layer] for layer in layers])
+            if set(hits) == set(layers)
+            else None
+        ),
     )
 
 
@@ -534,6 +559,8 @@ def _encoding_metadata(
     if v2 is not None:
         metadata["iq2r_v2_levels"] = v2.levels.name
         metadata["iq2r_v2_target_gain"] = repr(v2.target_gain)
+        metadata["iq2r_v2_min_routed_tokens"] = str(v2.min_routed_tokens)
+        metadata["iq2r_v2_shared_expert"] = "fp8"
     return metadata
 
 
@@ -731,28 +758,31 @@ def _encode_projection_v2(
     levels = recipe.levels
     data_rows, aux_rows = [], []
     for expert in range(layout.expert_count):
-        expert_importance = (
-            importance.for_projection(layer, projection, expert)
-            .to(device=device, dtype=torch.float32, non_blocking=True)
-            .contiguous()
-        )
-        seed = 0x10A0 + layer * 1024 + expert * 2 + (projection == "down")
-
-        def encode(weight: Tensor, salt: int, importance=expert_importance, seed=seed):
-            return iq2r_v2_learn_codebook(
-                weight,
-                importance,
-                levels,
-                rounds=iterations,
-                sample_vectors=sample_vectors,
-                seed=seed * 2 + salt,
-                chunk_blocks=_V2_CHUNK_BLOCKS,
-            )
-
         # gate/up is the interleaved matrix (gate0, up0, ...) with one codebook;
         # its gains are fitted to the gate and the up rows separately.
         weight = _source_projection(reader, layout, layer, expert, projection, device)
-        book, enc = encode(weight, 0)
+        tokens = importance.routed_tokens(layer, expert)
+        if tokens is not None and tokens < recipe.min_routed_tokens:
+            channel = weight.square().sum(dim=0)
+            expert_importance = (channel / channel.mean().clamp_min(1e-12)).clamp_min(
+                1e-6
+            )
+        else:
+            expert_importance = importance.for_projection(layer, projection, expert).to(
+                device=device, dtype=torch.float32, non_blocking=True
+            )
+        expert_importance = expert_importance.float().contiguous()
+        seed = 0x10A0 + layer * 1024 + expert * 2 + (projection == "down")
+        # The learner returns the matrix's encoding with the codebook it keeps.
+        book, enc = iq2r_v2_learn_codebook(
+            weight,
+            expert_importance,
+            levels,
+            rounds=iterations,
+            sample_vectors=sample_vectors,
+            seed=seed * 2,
+            chunk_blocks=_V2_CHUNK_BLOCKS,
+        )
         gains = iq2r_v2_gains(
             weight,
             enc.reconstruction,

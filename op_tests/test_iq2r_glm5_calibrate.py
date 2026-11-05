@@ -29,6 +29,14 @@ class _CharTokenizer:
         return [2 + ord(char) % 60 for char in text]
 
 
+class _RenderedTokenizer(_CharTokenizer):
+    """Rows already carry the chat template's special tokens."""
+
+    def encode(self, text, add_special_tokens=True):
+        assert not add_special_tokens
+        return [2 + ord(char) % 60 for char in text]
+
+
 def _tiny_config():
     from transformers import GlmMoeDsaConfig
 
@@ -151,6 +159,16 @@ def test_token_batches_append_eos_and_cycle_texts():
         [stream[8:]],
     ]
     assert all(batch.dtype == torch.long for batch in batches)
+
+
+def test_token_batches_per_row_truncates_without_special_tokens():
+    tokenizer = _RenderedTokenizer()
+    texts = ["abcde", "f", "gh"]
+    batches = list(
+        token_batches(tokenizer, texts, sequence_length=3, max_tokens=5, per_row=True)
+    )
+    a, b, c, f, g = (2 + ord(char) % 60 for char in "abcfg")
+    assert [batch.tolist() for batch in batches] == [[[a, b, c]], [[f]], [[g]]]
 
 
 def test_load_texts_reads_jsonl_fields_and_plain_lines(tmp_path):
