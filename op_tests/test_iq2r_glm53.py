@@ -400,27 +400,25 @@ def test_glm53_tuned_config():
     table = pd.read_csv(AITER_CONFIGS.AITER_CONFIG_IQ2R_GLM53_FILE)
     rows = table[(table.gfx == get_gfx_runtime()) & (table.cu_num == get_cu_num())]
     for row in rows.itertuples():
-        assert iq2r_glm53_config(row.token, row.inter_dim) == IQ2RGlm53Config(
+        config = iq2r_glm53_config(row.token, row.inter_dim, row.expert)
+        assert config == IQ2RGlm53Config(
             row.gate_kernel,
             row.gate_grid,
             row.down_kernel,
             row.down_grid,
             row.down_chunks,
         )
-    for intermediate in (256, 512):
-        assert iq2r_glm53_config(77, intermediate) == iq2r_glm53_config(
-            128, intermediate
+    # 257 experts top-9 (IQ2R) and 256 experts top-8 (IQ2R-v2) have their own rows.
+    for intermediate, experts in itertools.product((256, 512), (257, 256)):
+        lookup = functools.partial(
+            iq2r_glm53_config, intermediate_size=intermediate, experts=experts
         )
+        assert lookup(77) == lookup(128)
         # route9 cannot run M3, so M3 rounds up past a route9 M4 row.
-        m4 = iq2r_glm53_config(4, intermediate)
-        assert iq2r_glm53_config(3, intermediate) == (
-            iq2r_glm53_config(8, intermediate) if m4.down_kernel == "route9" else m4
-        )
+        m4 = lookup(4)
+        assert lookup(3) == (lookup(8) if m4.down_kernel == "route9" else m4)
         for tokens in range(1, MAX_CHUNK_TOKENS + 1):
-            for config in (
-                iq2r_glm53_config(tokens, intermediate),
-                _default_config(tokens),
-            ):
+            for config in (lookup(tokens), _default_config(tokens)):
                 assert _config_problem(config, tokens, intermediate) is None
 
 
