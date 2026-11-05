@@ -3075,7 +3075,7 @@ __global__ __launch_bounds__(512,1) void glm53_gate_decode_nobarrier_kernel(
 //   instead of a d load every K step.
 // At most 128 VGPRs, so two workgroups share a CU (launch bounds: 4 waves per
 // SIMD).
-template<int NT,int Classes,bool DBC>
+template<int NT,int Classes,bool DBC,bool LateForm>
 __global__ __launch_bounds__(512,4) void glm53_gate_decode_nobarrier_v2_kernel(
     const opus::fp8_t* __restrict__ activations,
     const uint8_t* __restrict__ scales,
@@ -3119,8 +3119,10 @@ __global__ __launch_bounds__(512,4) void glm53_gate_decode_nobarrier_v2_kernel(
         const uint8_t* aux=all_auxiliary+static_cast<int64_t>(expert)*auxiliary_bytes;
         // The previous item ended in a barrier, so the book may be overwritten.
         const bool new_expert=expert!=current_expert;
+        uint2 book_base{};
         if(new_expert) {
-            iq2r_v2_gate_form(shared.codebook,iq2r_v2_gate_base_load(aux,wave*64+lane),wave*64+lane);
+            book_base=iq2r_v2_gate_base_load(aux,wave*64+lane);
+            if constexpr(!LateForm) iq2r_v2_gate_form(shared.codebook,book_base,wave*64+lane);
             current_expert=expert;
         }
         const float2 gains=iq2r_gains<Classes>(aux,auxiliary_bytes);
@@ -3150,6 +3152,7 @@ __global__ __launch_bounds__(512,4) void glm53_gate_decode_nobarrier_v2_kernel(
         uint64_t pending_book[4]={};
         IQ2RCompressedQuad pending=iq2r_scheduled_load_quad<2>(data,data_bytes,base,lane);
         if(new_expert) {
+            if constexpr(LateForm) iq2r_v2_gate_form(shared.codebook,book_base,wave*64+lane);
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
             __syncthreads();
         }
@@ -3393,6 +3396,7 @@ constexpr int kGlm53Experts = 257;
 constexpr int kGlm53TopK = 9;
 
 constexpr bool kGlm53GateDbc = false;
+constexpr bool kGlm53GateLateForm = false;
 
 bool glm53_expert_stack(int64_t experts) { return experts == kGlm53Experts || experts == kGlm53Experts - 1; }
 // IQ2R-v2 codebook copies (aiter/ops/iq2r_v2.py level set c4e4q).
@@ -3595,8 +3599,8 @@ void iq2r_glm53_gate_out(const aiter_tensor_t& activations,
             if constexpr(C == 0)
                 launch = tp4 ? glm53_gate_decode_nobarrier_kernel<16> : glm53_gate_decode_nobarrier_kernel<8>;
             else
-                launch = tp4 ? glm53_gate_decode_nobarrier_v2_kernel<16, C, kGlm53GateDbc>
-                             : glm53_gate_decode_nobarrier_v2_kernel<8, C, kGlm53GateDbc>;
+                launch = tp4 ? glm53_gate_decode_nobarrier_v2_kernel<16, C, kGlm53GateDbc, kGlm53GateLateForm>
+                             : glm53_gate_decode_nobarrier_v2_kernel<8, C, kGlm53GateDbc, kGlm53GateLateForm>;
         }
         else
             launch = tp4 ? glm53_gate_decode_kernel<true, 16, C> : glm53_gate_decode_kernel<false, 8, C>;
