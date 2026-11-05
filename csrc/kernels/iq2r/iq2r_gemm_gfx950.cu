@@ -684,6 +684,8 @@ __device__ __forceinline__ void iq2r_v2_form_copies(uint64_t* lds,const uint4 (&
     }
 }
 
+constexpr bool kGlm53PrefillGateForm = false;
+
 // IQ2R-v2 book in LDS from copy 0 by a workgroup of Threads (256 or 512)
 // threads, instead of a 16 KB copy stage: each thread loads 4096 / Threads
 // bytes of copy 0 (iq2r_v2_book_base_load) and forms their four copies
@@ -971,6 +973,7 @@ __global__ __launch_bounds__(64*Waves,Classes>0?2:1) void glm53_gate_prefill_ker
         {
             // IQ2R-v2's 16 KB lands by the first K step's vmcnt(0) + barrier.
             if constexpr(Classes==0) { for(int i=linear;i<BookWords;i+=Threads)shared.codebook[i]=reinterpret_cast<const uint64_t*>(aux)[i]; }
+            else if constexpr(kGlm53PrefillGateForm) iq2r_v2_book_form<Threads>(shared.codebook,iq2r_v2_book_base_load<Threads>(aux,linear),linear);
             else iq2r_stage_codebook_async<BookWords,Waves>(shared.codebook,aux,wave,lane);
             previous_expert=expert;
         }
@@ -1368,7 +1371,7 @@ __global__ __launch_bounds__(64*Waves,Occupancy) void glm53_down_tp4_kernel(
         if(previous_expert!=expert)
         {
             if constexpr(Classes==0) { for(int i=linear;i<512;i+=Threads)shared.codebook[i]=reinterpret_cast<const uint64_t*>(aux)[i]; }
-            else iq2r_v2_book_form<Threads>(shared.codebook,iq2r_v2_book_base_load<Threads>(aux,linear),linear);
+            else iq2r_stage_codebook_async<iq2r_codebook_words<Classes>(),Waves>(shared.codebook,aux,wave,lane);
             previous_expert=expert;
         }
         for(int row_base=begin;row_base<begin+count;row_base+=Rows)
@@ -2379,7 +2382,7 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_tp8_ordered_kernel(
         if(previous_expert!=expert)
         {
             if constexpr(Classes==0) { for(int i=linear;i<512;i+=Threads)shared.codebook[i]=reinterpret_cast<const uint64_t*>(aux)[i]; }
-            else iq2r_v2_book_form<Threads>(shared.codebook,iq2r_v2_book_base_load<Threads>(aux,linear),linear);
+            else iq2r_stage_codebook_async<iq2r_codebook_words<Classes>(),Waves>(shared.codebook,aux,wave,lane);
             previous_expert=expert;
         }
         for(int row_base=begin;row_base<begin+count;row_base+=Rows)
@@ -3073,19 +3076,17 @@ __global__ __launch_bounds__(512,1) void glm53_gate_decode_nobarrier_kernel(
 // IQ2R-v2 decode gate, glm53_gate_decode_nobarrier_kernel's structure:
 // - Items (N tiles of 16-row tasks) are split into 8 contiguous per-XCD
 //   ranges, which the XCD's workgroups take round-robin.
-// - A new expert's book is formed in LDS from its 4 KB copy 0 right after the
-//   load (iq2r_v2_gate_form), so the loaded words are not live across the
-//   item's other loads.
+// - A new expert's book is formed in LDS from its 4 KB copy 0
+//   (iq2r_v2_book_form) instead of staging 16 KB of copies; the copy-0 load
+//   goes out first and the formation after the item's other loads, so the
+//   two latencies overlap.
 // - The K loop loads activations, their scales and d words through buffer
 //   descriptors with the K offset in an SGPR, and the quad offset is scalar:
 //   no per-iteration 64-bit address arithmetic.
 // - The MFMA scale op_sel selects each atom's byte of the scale word.
-// - DBC: a wave's 48 d words (lane 16c+r: K256 column c, row r) load once per
-//   item and permlane swaps broadcast each column to the four lane groups,
-//   instead of a d load every K step.
 // At most 128 VGPRs, so two workgroups share a CU (launch bounds: 4 waves per
 // SIMD).
-template<int NT,int Classes,bool DBC,bool LateForm>
+template<int NT,int Classes>
 __global__ __launch_bounds__(512,4) void glm53_gate_decode_nobarrier_v2_kernel(
     const opus::fp8_t* __restrict__ activations,
     const uint8_t* __restrict__ scales,
@@ -3129,10 +3130,11 @@ __global__ __launch_bounds__(512,4) void glm53_gate_decode_nobarrier_v2_kernel(
         const uint8_t* aux=all_auxiliary+static_cast<int64_t>(expert)*auxiliary_bytes;
         // The previous item ended in a barrier, so the book may be overwritten.
         const bool new_expert=expert!=current_expert;
+        // A new expert's copy 0 loads first; its copies are formed once the
+        // item's other loads are issued.
         uint2 book_base{};
         if(new_expert) {
             book_base=iq2r_v2_book_base_load<512>(aux,wave*64+lane);
-            if constexpr(!LateForm) iq2r_v2_book_form<512>(shared.codebook,book_base,wave*64+lane);
             current_expert=expert;
         }
         const float2 gains=iq2r_gains<Classes>(aux,auxiliary_bytes);
@@ -3150,19 +3152,10 @@ __global__ __launch_bounds__(512,4) void glm53_gate_decode_nobarrier_v2_kernel(
         for(int m=0;m<MAtoms;++m) { act_off[m]=rows[m]*K+lane_group*16;scale_off[m]=rows[m]*192+lane_group; }
         // d table: [N tile][24 K256 columns][16 rows] words after the copies.
         const int d_off=BookWords*8+(n_tile*24*16+lane_row)*4;
-        [[maybe_unused]] uint32_t d_cols[3]={};
-        if constexpr(DBC) {
-            const uint32_t x=iq2r_scheduled_buffer_load1(d_rsrc,BookWords*8+min(lane,47)*4,(n_tile*24+swave*3)*64,0);
-            // (x0,x0,x2,x2), (x1,x1,x3,x3); then lane groups 0-1 or 2-3 to all
-            const auto pairs=__builtin_amdgcn_permlane16_swap(x,x,false,true);
-            const auto even=__builtin_amdgcn_permlane32_swap(pairs[0],pairs[0],false,true);
-            const auto odd=__builtin_amdgcn_permlane32_swap(pairs[1],pairs[1],false,true);
-            d_cols[0]=even[0];d_cols[1]=odd[0];d_cols[2]=even[1];
-        }
         uint64_t pending_book[4]={};
         IQ2RCompressedQuad pending=iq2r_scheduled_load_quad<2>(data,data_bytes,base,lane);
         if(new_expert) {
-            if constexpr(LateForm) iq2r_v2_book_form<512>(shared.codebook,book_base,wave*64+lane);
+            iq2r_v2_book_form<512>(shared.codebook,book_base,wave*64+lane);
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
             __syncthreads();
         }
@@ -3179,11 +3172,10 @@ __global__ __launch_bounds__(512,4) void glm53_gate_decode_nobarrier_v2_kernel(
                 *reinterpret_cast<opus::i32x4_t*>(a[m].bytes+16)=iq2r_scheduled_load_dwordx4(act_rsrc,act_off[m],kt*128+64,0);
                 sa[m]=iq2r_buffer_load_u8(scale_rsrc,scale_off[m],kt*4,0);
             }
-            // d word of this K256: reloaded with the activations rather than
-            // held for the whole K768 slice, unless DBC.
-            uint32_t bases;
-            if constexpr(DBC) bases=iteration<2?d_cols[0]:iteration<4?d_cols[1]:d_cols[2];
-            else bases=iq2r_scheduled_buffer_load1(d_rsrc,d_off,(kt/2)*64,0);
+            // d word of this K256, reloaded with the activations rather than
+            // held for the whole K768 slice (loading a wave's 48 d words once
+            // and broadcasting them by permlane swaps measured slower).
+            const uint32_t bases=iq2r_scheduled_buffer_load1(d_rsrc,d_off,(kt/2)*64,0);
             const IQ2RCompressedQuad compressed=pending;
             if(iteration<5) {
                 base+=kQuadBytes;
@@ -3405,9 +3397,6 @@ constexpr int kGlm53Hidden = 6144;
 constexpr int kGlm53Experts = 257;
 constexpr int kGlm53TopK = 9;
 
-constexpr bool kGlm53GateDbc = false;
-constexpr bool kGlm53GateLateForm = false;
-
 bool glm53_expert_stack(int64_t experts) { return experts == kGlm53Experts || experts == kGlm53Experts - 1; }
 // IQ2R-v2 codebook copies (aiter/ops/iq2r_v2.py level set c4e4q).
 constexpr int kIQ2RV2Classes = 4;
@@ -3609,8 +3598,8 @@ void iq2r_glm53_gate_out(const aiter_tensor_t& activations,
             if constexpr(C == 0)
                 launch = tp4 ? glm53_gate_decode_nobarrier_kernel<16> : glm53_gate_decode_nobarrier_kernel<8>;
             else
-                launch = tp4 ? glm53_gate_decode_nobarrier_v2_kernel<16, C, kGlm53GateDbc, kGlm53GateLateForm>
-                             : glm53_gate_decode_nobarrier_v2_kernel<8, C, kGlm53GateDbc, kGlm53GateLateForm>;
+                launch = tp4 ? glm53_gate_decode_nobarrier_v2_kernel<16, C>
+                             : glm53_gate_decode_nobarrier_v2_kernel<8, C>;
         }
         else
             launch = tp4 ? glm53_gate_decode_kernel<true, 16, C> : glm53_gate_decode_kernel<false, 8, C>;
