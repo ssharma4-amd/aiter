@@ -251,11 +251,13 @@ def iq2r_glm53_pack_v2(
     per matrix (gate and up share one, as in IQ2R). Returns
     ``(gate_quad, gate_auxiliary, down_data, down_auxiliary)``.
     """
-    from .ops.iq2r_v2 import iq2r_v2_codebook_copies
+    from .ops.iq2r_v2 import iq2r_v2_check_codebook, iq2r_v2_codebook_copies
 
     def aux(auxiliary: Tensor, n: int, k: int, atoms: int) -> Tensor:
         experts = auxiliary.shape[0]
         codebooks = auxiliary[:, :4096].view(torch.float8_e4m3fn).float()
+        # The decode kernels form copies 1..C-1 from copy 0 in LDS.
+        iq2r_v2_check_codebook(codebooks)
         copies = iq2r_v2_codebook_copies(codebooks.reshape(-1, 512, 8), levels)
         copies = copies.permute(1, 0, 2, 3)  # [E, C, 512, 8]
         d = auxiliary[:, 4096 : 4096 + n * (k // 256)].reshape(experts, n, -1)

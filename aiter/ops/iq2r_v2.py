@@ -52,6 +52,13 @@ Copyright (c) The ggml authors) as adapted for GLM-5 by antirez
 importance-weighted k-means alternating with this encoder, seeded from the
 IQ2_XXS grid (one phase at 1x, one at sqrt(2)), and returns it with the
 matrix's encoding.
+
+Codebook entries are normal E4M3 values from 2**-6 to the seed's maximum
+(bytes 0x08..0x78 at most; ``IQ2R_V2_CODEBOOK_MIN_BYTE``,
+``IQ2R_V2_CODEBOOK_MAX_BYTE``). The gfx950 decode kernels load only copy 0
+and form copies 1..C-1 with integer byte arithmetic, which equals
+``E4M3(codebook * m[c])`` only in that range. The learner keeps its codebooks
+there, and :func:`iq2r_v2_check_codebook` rejects others.
 """
 
 from __future__ import annotations
@@ -84,6 +91,11 @@ from .iq2r_format import (
 IQ2R_V2_D_BLOCK = 256
 IQ2R_V2_GAIN_BYTES = 8  # two FP32 gains: even rows, odd rows
 IQ2R_V2_EPS = 1e-15
+# Codebook byte range the kernels' in-LDS copy formation reproduces exactly:
+# normal E4M3 values 2**-6 (0x08) to 256 (0x78).
+IQ2R_V2_CODEBOOK_MIN_BYTE = 0x08
+IQ2R_V2_CODEBOOK_MAX_BYTE = 0x78
+IQ2R_V2_CODEBOOK_MIN = 2.0**-6
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,6 +160,21 @@ def iq2r_v2_seed_codebook(device: torch.device | str = "cpu") -> Tensor:
     grid = torch.tensor(list(_IQ2_XXS_GRID_BYTES), dtype=torch.float32, device=device)
     grid = grid.reshape(256, IQ2R_VECTOR_SIZE) * 0.125
     return _e4m3(torch.cat((grid, grid * math.sqrt(2.0)))).contiguous()
+
+
+def iq2r_v2_check_codebook(codebook: Tensor) -> None:
+    """Raise unless every entry of an E4M3 ``codebook`` (any shape) is a byte in
+    ``IQ2R_V2_CODEBOOK_MIN_BYTE..IQ2R_V2_CODEBOOK_MAX_BYTE`` (see the module
+    docstring); codebooks from before the learner enforced it may not be."""
+
+    raw = codebook.float().to(torch.float8_e4m3fn).view(torch.uint8)
+    low, high = int(raw.min()), int(raw.max())
+    if low < IQ2R_V2_CODEBOOK_MIN_BYTE or high > IQ2R_V2_CODEBOOK_MAX_BYTE:
+        raise ValueError(
+            f"IQ2R-v2 codebook bytes span 0x{low:02x}..0x{high:02x}; the kernels "
+            f"need 0x{IQ2R_V2_CODEBOOK_MIN_BYTE:02x}..0x{IQ2R_V2_CODEBOOK_MAX_BYTE:02x}"
+            " (re-encode with the current iq2r_v2_learn_codebook)"
+        )
 
 
 def iq2r_v2_codebook_copies(codebook: Tensor, levels: IQ2RV2Levels) -> Tensor:
@@ -451,8 +478,9 @@ def iq2r_v2_learn_codebook(
     runs ``inner`` Lloyd steps at its fixed per-group scales t (centroid =
     cost-weighted mean of t * |x| over t^2, so the update minimizes the
     encoder's own cost). Codewords stay within the seed's maximum, which keeps
-    the scale search's reference point, and a round is kept only if the
-    weighted cost of the whole matrix drops.
+    the scale search's reference point, and at or above
+    ``IQ2R_V2_CODEBOOK_MIN`` (see the module docstring), and a round is kept
+    only if the weighted cost of the whole matrix drops.
 
     Returns the codebook and ``weight``'s encoding with it, which the last kept
     round has already computed.
@@ -503,7 +531,7 @@ def iq2r_v2_learn_codebook(
             candidate = torch.where(
                 occupied, numerator / torch.where(occupied, denominator, 1.0), candidate
             )
-        candidate = _e4m3(candidate.clamp(0.0, pin))
+        candidate = _e4m3(candidate.clamp(IQ2R_V2_CODEBOOK_MIN, pin))
         encoding = matrix_encode(candidate)
         if encoding.cost >= best.cost:
             break
