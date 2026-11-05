@@ -3813,10 +3813,10 @@ void iq2r_glm53_down_reduce_out(const aiter_tensor_t& activations,
         glm53_with_classes(classes, [&](auto tag) {
         constexpr int C = decltype(tag)::value;
         if(K == 512 && chunks == 1)
-            GLM53_PREFILL_DOWN((glm53_down_prefill_tp4_kernel<4, C > 0 ? 4 : 2, 8, 4, 4, 1, 3, C>), 16,
+            GLM53_PREFILL_DOWN((glm53_down_prefill_tp4_kernel<4, (C > 0 ? 4 : 2), 8, 4, 4, 1, 3, C>), 16,
                                static_cast<__hip_bfloat16*>(route_output.data_ptr()), routes, static_cast<int>(data.size(0)));
         else if(K == 512)
-            GLM53_PREFILL_DOWN((glm53_down_prefill_tp4_kernel<4, C > 0 ? 4 : 2, 8, 4, 4, 2, 3, C>), 16,
+            GLM53_PREFILL_DOWN((glm53_down_prefill_tp4_kernel<4, (C > 0 ? 4 : 2), 8, 4, 4, 2, 3, C>), 16,
                                static_cast<__hip_bfloat16*>(route_output.data_ptr()), routes, static_cast<int>(data.size(0)));
         else if(chunks == 1)
             GLM53_PREFILL_DOWN((glm53_down_prefill_tp8_kernel<4, 2, 2, 8, 4, 1, true, C>), 8,
