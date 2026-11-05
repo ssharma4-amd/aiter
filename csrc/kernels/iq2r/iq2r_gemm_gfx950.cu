@@ -907,8 +907,10 @@ __device__ __forceinline__ int glm53_remap8(int index,int total)
 
 // Prefill gate: waves cover N, while a shared K128 activation tile is reused
 // across the CTA. K is summed as eight K768 partials, like the decode gate.
+// IQ2R-v2 asks for two waves per SIMD, as IQ2R gets by itself: left free, the
+// compiler spends 264 registers (one wave per SIMD, +59% at TP4 M1024).
 template<int Waves,int XCD,int TaskGroup,int Unroll,int NT,int Classes=0>
-__global__ __launch_bounds__(64*Waves,1) void glm53_gate_prefill_kernel(
+__global__ __launch_bounds__(64*Waves,Classes>0?2:1) void glm53_gate_prefill_kernel(
     const opus::fp8_t* __restrict__ activations,const uint8_t* __restrict__ scales,
     const uint8_t* __restrict__ all_data,const uint8_t* __restrict__ all_auxiliary,
     const int32_t* __restrict__ tasks,const int32_t* __restrict__ task_count,

@@ -33,9 +33,14 @@ from aiter.iq2r_glm53 import (
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.iq2r_format import IQ2RMetadata, iq2r_slice_input_data
 from aiter.ops.iq2r_v2 import (
+    IQ2R_V2_CODEBOOK_MAX_BYTE,
+    IQ2R_V2_CODEBOOK_MIN_BYTE,
     IQ2R_V2_LEVELS_C4,
+    iq2r_v2_check_codebook,
+    iq2r_v2_codebook_copies,
     iq2r_v2_encode,
     iq2r_v2_gains,
+    iq2r_v2_learn_codebook,
     iq2r_v2_materialize,
     iq2r_v2_seed_codebook,
     iq2r_v2_write_auxiliary,
@@ -236,6 +241,114 @@ def test_glm53_v2_routed_only_explicit_configs(glm53_v2_layer, tokens, config):
         hidden, *packed, topk_weights, topk_ids, actual, workspace, config
     )
     _check_moe(actual, expected)
+
+
+@pytest.mark.parametrize("tokens", [1, 2, 4, 48, 1024])
+def test_glm53_v2_top8_equals_top9_with_empty_ninth_route(glm53_v2_layer, tokens):
+    """Top-8 on a 256-expert stack and top-9 on the 257-expert stack with the
+    ninth route dropped run the same arithmetic: equal outputs."""
+    layer = glm53_v2_layer
+    hidden, topk_weights, topk_ids, packed = _routed_only(
+        layer, tokens, 0x53D0 + tokens
+    )
+    dropped = torch.cat(
+        (topk_ids, torch.full_like(topk_ids[:, :1], -1)), dim=1
+    ).contiguous()
+    weights9 = torch.cat((topk_weights, topk_weights[:, :1]), dim=1).contiguous()
+    configs = [None] + [
+        c
+        for c in _EXPLICIT_CONFIGS
+        if not _config_problem(c, tokens, layer.intermediate)
+    ]
+    for config in configs:
+        outputs = []
+        for args in (
+            (*packed, topk_weights, topk_ids),
+            (*layer.packed, weights9, dropped),
+        ):
+            out = torch.full_like(hidden, float("nan"))
+            workspace = IQ2RGlm53Workspace.allocate(
+                tokens, layer.intermediate, device="cuda"
+            )
+            iq2r_glm53_moe_out(hidden, *args, out, workspace, config)
+            outputs.append(out)
+        assert torch.equal(outputs[0], outputs[1]), config
+
+
+def test_glm53_v2_routing_must_match_the_stack(glm53_v2_layer):
+    layer = glm53_v2_layer
+    hidden, weights8, ids8, packed = _routed_only(layer, 4, 0x53E0)
+    _, weights9, ids9 = _routing(4, 0x53E0)
+    workspace = IQ2RGlm53Workspace.allocate(4, layer.intermediate, device="cuda")
+    out = torch.empty_like(hidden)
+    with pytest.raises(ValueError):  # top-8 needs the 256-expert stack
+        iq2r_glm53_moe_out(hidden, *layer.packed, weights8, ids8, out, workspace)
+    with pytest.raises(ValueError):  # and the 256-expert stack top-8
+        iq2r_glm53_moe_out(hidden, *packed, weights9, ids9, out, workspace)
+
+
+# Copy-formation deltas of the decode kernels (iq2r_v2_copy_words): copy c of
+# a codebook byte b is b + delta_c[b & 7].
+_FORMATION_DELTAS = (
+    (0,) * 8,
+    (2,) * 8,
+    (3, 4, 4, 5, 4, 4, 4, 4),
+    (5, 6, 6, 6, 6, 6, 6, 6),
+)
+
+
+def test_glm53_v2_copy_formation_matches_codebook_copies():
+    """The kernels form copies 1-3 from copy 0 with integer adds; on every byte
+    the encoder may emit they equal the packed copies E4M3(codebook * m[c])."""
+    allowed = torch.arange(
+        IQ2R_V2_CODEBOOK_MIN_BYTE, IQ2R_V2_CODEBOOK_MAX_BYTE + 1, dtype=torch.uint8
+    )
+    deltas = torch.tensor(_FORMATION_DELTAS, dtype=torch.int32)
+    formed = (allowed.int()[None] + deltas[:, allowed.long() & 7]).to(torch.uint8)
+    book = allowed.view(torch.float8_e4m3fn).float()
+    copies = iq2r_v2_codebook_copies(book, LEVELS)
+    assert torch.equal(formed, copies.to(torch.float8_e4m3fn).view(torch.uint8))
+    # The range is tight: the subnormal byte below it already forms wrongly.
+    below = torch.tensor([IQ2R_V2_CODEBOOK_MIN_BYTE - 1], dtype=torch.uint8)
+    copies = iq2r_v2_codebook_copies(below.view(torch.float8_e4m3fn).float(), LEVELS)
+    formed = (below.int()[None] + deltas[:, below.long() & 7]).to(torch.uint8)
+    assert not torch.equal(formed, copies.to(torch.float8_e4m3fn).view(torch.uint8))
+
+
+def test_glm53_v2_learned_codebook_stays_in_kernel_range():
+    """Zero and tiny weights pull k-means centroids towards 0 (below 2^-6, a
+    subnormal byte the kernels' copy formation gets wrong); the learner clamps."""
+    generator = torch.Generator(device="cuda").manual_seed(0x53F0)
+    weight = torch.randn((256, 1024), generator=generator, device="cuda") * 0.02
+    weight[:, :512] = 0.0
+    weight[:64, 512:768] *= 1e-4
+    book, _ = iq2r_v2_learn_codebook(
+        weight, torch.ones(1024, device="cuda"), LEVELS, rounds=3, sample_vectors=8192
+    )
+    raw = book.to(torch.float8_e4m3fn).view(torch.uint8)
+    assert int(raw.min()) >= IQ2R_V2_CODEBOOK_MIN_BYTE
+    assert int(raw.max()) <= IQ2R_V2_CODEBOOK_MAX_BYTE
+    iq2r_v2_check_codebook(book)
+
+
+@pytest.mark.parametrize("byte", [0x00, 0x05, 0x79, 0x80])
+def test_glm53_v2_pack_rejects_codebook_outside_kernel_range(glm53_v2_layer, byte):
+    layer = glm53_v2_layer
+    for which in ("gate", "down"):
+        aux = {
+            "gate": layer.gate_auxiliary.clone(),
+            "down": layer.down_auxiliary.clone(),
+        }
+        aux[which][0, 17] = byte  # one codebook byte of expert 0
+        with pytest.raises(ValueError, match="codebook bytes"):
+            iq2r_glm53_pack_v2(
+                layer.gate_data,
+                aux["gate"],
+                layer.down_data,
+                aux["down"],
+                intermediate_size=layer.intermediate,
+                levels=LEVELS,
+            )
 
 
 @pytest.mark.parametrize("tp", [4, 8])
