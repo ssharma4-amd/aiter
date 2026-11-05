@@ -684,29 +684,39 @@ __device__ __forceinline__ void iq2r_v2_form_copies(uint64_t* lds,const uint4 (&
     }
 }
 
-// Gate/up book in LDS from copy 0 by a 512-thread workgroup: each thread loads
-// 8 bytes of copy 0 first and forms their 4 copies after the caller's other
-// loads are issued.
-__device__ __forceinline__ uint2 iq2r_v2_gate_base_load(const uint8_t* aux,int thread)
+// IQ2R-v2 book in LDS from copy 0 by a workgroup of Threads (256 or 512)
+// threads, instead of a 16 KB copy stage: each thread loads 4096 / Threads
+// bytes of copy 0 (iq2r_v2_book_base_load) and forms their four copies
+// (iq2r_v2_book_form), which a caller may delay until its other loads are
+// issued.
+template<int Threads>
+using IQ2RV2BookBase=std::conditional_t<Threads==256,uint4,uint2>;
+
+template<int Threads>
+__device__ __forceinline__ IQ2RV2BookBase<Threads> iq2r_v2_book_base_load(const uint8_t* aux,int thread)
 {
-    const uint2 base=reinterpret_cast<const uint2*>(aux)[thread];
+    static_assert(Threads==256 || Threads==512);
+    const IQ2RV2BookBase<Threads> base=reinterpret_cast<const IQ2RV2BookBase<Threads>*>(aux)[thread];
     asm volatile("" ::: "memory");
     return base;
 }
 
-__device__ __forceinline__ void iq2r_v2_gate_form(uint64_t* lds,uint2 base,int thread)
+template<int Threads>
+__device__ __forceinline__ void iq2r_v2_book_form(uint64_t* lds,IQ2RV2BookBase<Threads> base,int thread)
 {
+    using Vector=IQ2RV2BookBase<Threads>;
+    constexpr int Words=sizeof(Vector)/4;
     // materialized here rather than hoisted into VGPRs held by the caller's loops
     uint32_t k2=0x05040403u,k3=0x06060605u;
     asm volatile("" : "+v"(k2),"+v"(k3));
-    uint32_t r1[2],r2[2],r3[2];
-    iq2r_v2_copy_words(base.x,k2,k3,r1[0],r2[0],r3[0]);
-    iq2r_v2_copy_words(base.y,k2,k3,r1[1],r2[1],r3[1]);
-    uint2* book=reinterpret_cast<uint2*>(lds);
+    uint32_t w[Words],copies[3][Words];
+    __builtin_memcpy(w,&base,sizeof(base));
+#pragma unroll
+    for(int d=0;d<Words;++d) iq2r_v2_copy_words(w[d],k2,k3,copies[0][d],copies[1][d],copies[2][d]);
+    Vector* book=reinterpret_cast<Vector*>(lds);
     book[thread]=base;
-    book[512+thread]=make_uint2(r1[0],r1[1]);
-    book[1024+thread]=make_uint2(r2[0],r2[1]);
-    book[1536+thread]=make_uint2(r3[0],r3[1]);
+#pragma unroll
+    for(int c=1;c<4;++c) __builtin_memcpy(book+c*Threads+thread,copies[c-1],sizeof(Vector));
 }
 
 // IQ2R-v2 output gains (even rows, odd rows): the auxiliary's last 8 bytes.
@@ -791,7 +801,7 @@ __global__ __launch_bounds__(512,1) void glm53_gate_m1_kernel(
         // The codebook DMA (IQ2R-v2: copy 0, formed below), scales, gain and
         // first weights load together.
         [[maybe_unused]] uint2 gate_base;
-        if constexpr(Classes>0) gate_base=iq2r_v2_gate_base_load(aux,wave*64+lane);
+        if constexpr(Classes>0) gate_base=iq2r_v2_book_base_load<512>(aux,wave*64+lane);
         else iq2r_stage_codebook_async<BookWords,8>(shared.codebook,aux,wave,lane);
         const int nbase=n_tile*4;
         uint32_t bases=0;
@@ -815,7 +825,7 @@ __global__ __launch_bounds__(512,1) void glm53_gate_m1_kernel(
         opus::vector_t<float,4> accumulators[MAtoms][4]={};
         int base=(n_tile*48+wave*6)*kQuadBytes;
         IQ2RCompressedQuad pending=iq2r_scheduled_load_quad<Policy>(data,data_bytes,base,lane);
-        if constexpr(Classes>0) iq2r_v2_gate_form(shared.codebook,gate_base,wave*64+lane);
+        if constexpr(Classes>0) iq2r_v2_book_form<512>(shared.codebook,gate_base,wave*64+lane);
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         __syncthreads();
 #pragma unroll 6
@@ -1358,7 +1368,7 @@ __global__ __launch_bounds__(64*Waves,Occupancy) void glm53_down_tp4_kernel(
         if(previous_expert!=expert)
         {
             if constexpr(Classes==0) { for(int i=linear;i<512;i+=Threads)shared.codebook[i]=reinterpret_cast<const uint64_t*>(aux)[i]; }
-            else iq2r_stage_codebook_async<iq2r_codebook_words<Classes>(),Waves>(shared.codebook,aux,wave,lane);
+            else iq2r_v2_book_form<Threads>(shared.codebook,iq2r_v2_book_base_load<Threads>(aux,linear),linear);
             previous_expert=expert;
         }
         for(int row_base=begin;row_base<begin+count;row_base+=Rows)
@@ -1504,7 +1514,7 @@ __global__ __launch_bounds__(64*Waves,Occupancy) void glm53_down_prefill_tp4_ker
         if(previous_expert!=expert)
         {
             if constexpr(Classes==0) { for(int i=linear;i<512;i+=Threads)shared.codebook[i]=reinterpret_cast<const uint64_t*>(aux)[i]; }
-            else iq2r_stage_codebook_async<iq2r_codebook_words<Classes>(),Waves>(shared.codebook,aux,wave,lane);
+            else iq2r_v2_book_form<Threads>(shared.codebook,iq2r_v2_book_base_load<Threads>(aux,linear),linear);
             previous_expert=expert;
         }
         for(int row_base=begin;row_base<begin+count;row_base+=Rows)
@@ -1648,7 +1658,7 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_prefill_tp8_kernel(
         if(previous_expert!=expert)
         {
             if constexpr(Classes==0) { for(int i=linear;i<512;i+=Threads)shared.codebook[i]=reinterpret_cast<const uint64_t*>(aux)[i]; }
-            else iq2r_stage_codebook_async<iq2r_codebook_words<Classes>(),Waves>(shared.codebook,aux,wave,lane);
+            else iq2r_v2_book_form<Threads>(shared.codebook,iq2r_v2_book_base_load<Threads>(aux,linear),linear);
             previous_expert=expert;
         }
         for(int row_base=begin;row_base<begin+count;row_base+=Rows)
@@ -2369,7 +2379,7 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_tp8_ordered_kernel(
         if(previous_expert!=expert)
         {
             if constexpr(Classes==0) { for(int i=linear;i<512;i+=Threads)shared.codebook[i]=reinterpret_cast<const uint64_t*>(aux)[i]; }
-            else iq2r_stage_codebook_async<iq2r_codebook_words<Classes>(),Waves>(shared.codebook,aux,wave,lane);
+            else iq2r_v2_book_form<Threads>(shared.codebook,iq2r_v2_book_base_load<Threads>(aux,linear),linear);
             previous_expert=expert;
         }
         for(int row_base=begin;row_base<begin+count;row_base+=Rows)
@@ -3121,8 +3131,8 @@ __global__ __launch_bounds__(512,4) void glm53_gate_decode_nobarrier_v2_kernel(
         const bool new_expert=expert!=current_expert;
         uint2 book_base{};
         if(new_expert) {
-            book_base=iq2r_v2_gate_base_load(aux,wave*64+lane);
-            if constexpr(!LateForm) iq2r_v2_gate_form(shared.codebook,book_base,wave*64+lane);
+            book_base=iq2r_v2_book_base_load<512>(aux,wave*64+lane);
+            if constexpr(!LateForm) iq2r_v2_book_form<512>(shared.codebook,book_base,wave*64+lane);
             current_expert=expert;
         }
         const float2 gains=iq2r_gains<Classes>(aux,auxiliary_bytes);
@@ -3152,7 +3162,7 @@ __global__ __launch_bounds__(512,4) void glm53_gate_decode_nobarrier_v2_kernel(
         uint64_t pending_book[4]={};
         IQ2RCompressedQuad pending=iq2r_scheduled_load_quad<2>(data,data_bytes,base,lane);
         if(new_expert) {
-            if constexpr(LateForm) iq2r_v2_gate_form(shared.codebook,book_base,wave*64+lane);
+            if constexpr(LateForm) iq2r_v2_book_form<512>(shared.codebook,book_base,wave*64+lane);
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
             __syncthreads();
         }
