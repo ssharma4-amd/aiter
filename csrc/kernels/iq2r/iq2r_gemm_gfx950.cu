@@ -684,9 +684,6 @@ __device__ __forceinline__ void iq2r_v2_form_copies(uint64_t* lds,const uint4 (&
     }
 }
 
-constexpr bool kGlm53PrefillGateForm = true;
-constexpr int kGlm53PrefillDownGroups = 2;  // TMP experiment
-constexpr int kPG(int c) { return c > 0 ? kGlm53PrefillDownGroups : 2; }
 
 // IQ2R-v2 book in LDS from copy 0 by a workgroup of Threads (256 or 512)
 // threads, instead of a 16 KB copy stage: each thread loads 4096 / Threads
@@ -973,10 +970,9 @@ __global__ __launch_bounds__(64*Waves,Classes>0?2:1) void glm53_gate_prefill_ker
         const uint8_t* aux=all_auxiliary+static_cast<int64_t>(expert)*auxiliary_bytes;
         if(expert!=previous_expert)
         {
-            // IQ2R-v2's 16 KB lands by the first K step's vmcnt(0) + barrier.
+            // IQ2R-v2 forms its copies from copy 0; the barrier below publishes them.
             if constexpr(Classes==0) { for(int i=linear;i<BookWords;i+=Threads)shared.codebook[i]=reinterpret_cast<const uint64_t*>(aux)[i]; }
-            else if constexpr(kGlm53PrefillGateForm) iq2r_v2_book_form<Threads>(shared.codebook,iq2r_v2_book_base_load<Threads>(aux,linear),linear);
-            else iq2r_stage_codebook_async<BookWords,Waves>(shared.codebook,aux,wave,lane);
+            else iq2r_v2_book_form<Threads>(shared.codebook,iq2r_v2_book_base_load<Threads>(aux,linear),linear);
             previous_expert=expert;
         }
         if(linear<Rows)shared.row_ids[linear]=gather[begin+min(linear,count-1)]/9;
@@ -3810,20 +3806,23 @@ void iq2r_glm53_down_reduce_out(const aiter_tensor_t& activations,
                        static_cast<const int32_t*>(task_count.data_ptr()), __VA_ARGS__,        \
                        static_cast<int>(data.size(1)), static_cast<int>(auxiliary.size(1)), chunk)
         // TP4: 16 persistent CTAs per CU with weight-stationary K loops; TP8:
-        // N-wave tiles sharing one cached activation tile.
+        // N-wave tiles sharing one cached activation tile. IQ2R-v2 TP4 items
+        // cover 768 columns instead of 384, which halves the activation
+        // staging and codebook formation per weight byte. (TP8 keeps 384:
+        // its tiled route output assumes 384-column items.)
         glm53_with_classes(classes, [&](auto tag) {
         constexpr int C = decltype(tag)::value;
         if(K == 512 && chunks == 1)
-            GLM53_PREFILL_DOWN((glm53_down_prefill_tp4_kernel<4, kPG(C), 8, 4, 4, 1, 3, C>), 16,
+            GLM53_PREFILL_DOWN((glm53_down_prefill_tp4_kernel<4, C > 0 ? 4 : 2, 8, 4, 4, 1, 3, C>), 16,
                                static_cast<__hip_bfloat16*>(route_output.data_ptr()), routes, static_cast<int>(data.size(0)));
         else if(K == 512)
-            GLM53_PREFILL_DOWN((glm53_down_prefill_tp4_kernel<4, kPG(C), 8, 4, 4, 2, 3, C>), 16,
+            GLM53_PREFILL_DOWN((glm53_down_prefill_tp4_kernel<4, C > 0 ? 4 : 2, 8, 4, 4, 2, 3, C>), 16,
                                static_cast<__hip_bfloat16*>(route_output.data_ptr()), routes, static_cast<int>(data.size(0)));
         else if(chunks == 1)
-            GLM53_PREFILL_DOWN((glm53_down_prefill_tp8_kernel<4, 2, kPG(C), 8, 4, 1, true, C>), 8,
+            GLM53_PREFILL_DOWN((glm53_down_prefill_tp8_kernel<4, 2, 2, 8, 4, 1, true, C>), 8,
                                static_cast<__hip_bfloat16*>(route_output.data_ptr()), routes, static_cast<int>(data.size(0)));
         else
-            GLM53_PREFILL_DOWN((glm53_down_prefill_tp8_kernel<4, 2, kPG(C), 8, 4, 2, true, C>), 8,
+            GLM53_PREFILL_DOWN((glm53_down_prefill_tp8_kernel<4, 2, 2, 8, 4, 2, true, C>), 8,
                                static_cast<__hip_bfloat16*>(route_output.data_ptr()), routes, static_cast<int>(data.size(0)));
         });
 #undef GLM53_PREFILL_DOWN
