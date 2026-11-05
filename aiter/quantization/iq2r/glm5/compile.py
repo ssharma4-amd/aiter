@@ -36,6 +36,9 @@ cost ~5 AIME-60 points on GLM-5.3). Each step of the recipe:
   search, then an exhaustive search of d and every group's level;
 * gain: each matrix's output is scaled so its reconstruction gain
   <W, Wq> / <W, W> is ``--target-gain`` (0.98).
+
+``docs/iq2r_glm53.md`` explains why each step is there and gives the
+calibration corpus and the build commands.
 """
 
 from __future__ import annotations

@@ -108,8 +108,7 @@ In a lane group `g`, the metadata high nibble holds the exponent of block
 `s = (0, 2, 1, 3)`. The classes a lane needs for its own codewords are then
 in its own nibble or its neighbour group's, one `v_permlane16_swap` away.
 
-The kernels recognize the format from the packed auxiliary size, so
-`iq2r_glm53_moe_out` and ATOM's call are unchanged. A packed IQ2R-v2
+The kernels recognize the format from the packed auxiliary size. A packed IQ2R-v2
 auxiliary holds the codebook copies, the `d` table laid out per lane
 (`[N/64][K/256][16][4]` for gate/up, `[N/48][K/256][16][4]` for down) and
 the two gains. `iq2r_glm53_pack_v2` builds it; `iq2r_glm53_v2_slice_gate_aux`
@@ -117,47 +116,97 @@ and `iq2r_glm53_v2_slice_down_aux` take TP shards.
 
 ### Recipe
 
-The recipe is fixed: every step below is the code's default, and a build
-with the commands at the end of this section reproduces it. It is meant to
-apply unchanged to other MoE models; nothing in it is tuned to one benchmark.
+The recipe is fixed: every step below is the code's default, and the
+commands under Build reproduce it. The method does not depend on GLM-5.3
+and is not tuned to one benchmark; the compiler itself targets GLM-5.3's
+shapes.
 
-1. Scope. Only the 256 routed experts of each MoE layer are encoded. The
-   shared expert, which every token passes through, keeps its block-FP8
-   weights in the checkpoint shards and runs unfused; `iq2r_modules` lists
-   only the routed experts. At 2 bits the shared expert cost about 5 AIME-60
-   points on GLM-5.3 (49 and 50 of 60 against 54 and 54 with it in FP8).
-2. Calibration. `calibrate.py --per-row` runs the FP8 model over the
-   calibration corpus below, each row (one whole conversation, rendered with
-   the chat template) its own sequence of up to 16,384 tokens, and records
-   for every routed expert the router-weighted second moment
-   `sum r^2 x^2 / sum r^2` of each input channel (the MoE input for gate/up,
-   `silu(gate) * up` for down).
-3. Importance. That moment divided by its mean, floored at 1e-6. An expert
-   that fewer than 256 corpus tokens reach (3 of 19,200 on GLM-5.3) uses its
-   weight's column energy `sum_n W[n, k]^2` instead.
-4. Codebook (`iq2r_v2_learn_codebook`). One codebook per expert for the
-   interleaved gate/up matrix and one for down, learned from scratch: seeded
-   with the IQ2_XXS grid at 1x and sqrt(2)x, then 4 rounds of
-   importance-weighted k-means on 65,536 sampled 8-vectors, alternating with
-   the encoder. Codewords stay below the seed maximum and a round is kept
-   only if the weighted cost of the whole matrix drops.
-5. Encoder (`iq2r_v2_encode`), after the IQ2_XXS quantizer of ggml/llama.cpp
-   as adapted by antirez: each weight's error is weighted by
-   `importance * sqrt(sigma^2 + w^2)` (sigma^2 the mean square of its
-   256-weight block); a group's starting scale comes from 13 candidate
-   least-squares fits; then `d` (three exponents) and every group's level
-   (all 16 of c4e4q) are searched exhaustively with codeword re-assignment.
-6. Gain. Each matrix's output gain makes `<W, Wq> / <W, W>` equal 0.98 (a
-   slight shrink lowered KL in the study); gate and up rows get separate
-   gains.
+1. **Only the routed experts are 2-bit; the shared expert stays FP8.**
+   - What: the 256 routed experts of each MoE layer are encoded. The shared
+     expert keeps its block-FP8 weights in the checkpoint shards, and
+     `iq2r_modules` lists only the routed experts, so it runs as an ordinary
+     FP8 MLP next to the MoE instead of being fused as expert 256.
+   - Why: each token picks 8 of the 256 routed experts, so a routed expert
+     sees about 1 token in 32, and its output is scaled by the routing
+     weight. Every token passes through the shared expert, with weight 1, so
+     the shared expert's quantization error lands on every token in every
+     layer. It is also small: keeping it FP8 costs about 2 GB on GLM-5.3
+     (75 layers x 37.7 M weights x ~0.7 byte that 2 bits would save).
+   - Measured: with everything else the same, the shared expert at 2 bits
+     scored 49 and 50 of 60 on AIME-60, against 54 and 54 in FP8.
+   - Serving needs the MoE to take 256 experts with top-8 routing; the
+     kernels on this branch still expect 257 experts and top-9.
+2. **Calibration: router-weighted statistics, one conversation per sequence.**
+   - What: `calibrate.py --per-row` runs the FP8 model over the calibration
+     corpus below, each row (one whole conversation, rendered with the chat
+     template) its own sequence of up to 16,384 tokens. For every routed
+     expert it records `sum r^2 x^2 / sum r^2` per input channel: x is the
+     MoE input for gate/up and `silu(gate) * up` for down, r the token's
+     routing weight to that expert.
+   - Why per row: as in serving, each token attends only to its own
+     conversation, and long agent sessions keep their full context. Packing
+     unrelated texts into short windows would give activations the model
+     never produces in use.
+   - Why router-weighted: an expert's output is multiplied by r, so a
+     token's error in that expert reaches the layer output scaled by r, and
+     its squared error by r^2. Tokens the router barely sends to the expert
+     should barely shape its importance.
+3. **Importance: normalized, with a floor and a fallback.**
+   - What: that moment divided by its mean, floored at 1e-6. An expert that
+     fewer than 256 corpus tokens reach (3 of 19,200 on GLM-5.3) uses its
+     weight's column energy `sum_n W[n, k]^2` instead.
+   - Why: dividing by the mean keeps the cost on the same scale for every
+     matrix; the floor keeps every channel in the cost. With under 256
+     tokens the moment is mostly noise from a few tokens, and column energy
+     is a data-free stand-in.
+4. **Codebook: learned per matrix, from scratch.**
+   - What (`iq2r_v2_learn_codebook`): one 512-entry codebook per expert for
+     the interleaved gate/up matrix and one for down, seeded with the
+     IQ2_XXS grid at 1x and sqrt(2)x, then 4 rounds of importance-weighted
+     k-means on 65,536 sampled 8-vectors, alternating with the encoder.
+     Codewords stay below the seed maximum, and a round is kept only if the
+     weighted cost of the whole matrix drops.
+   - Why: each matrix's weights have their own distribution, and a codebook
+     fitted to it lowers the error a fixed grid leaves. Starting from the
+     public IQ2_XXS grid, not from an earlier study's codebooks, keeps the
+     recipe independent of any previous checkpoint. Judging each round on
+     the whole matrix stops k-means from overfitting its sample. Gate and up
+     share a codebook because separate ones lowered the weighted error by
+     only 0.09% for twice the memory.
+5. **Encoder: weighted error, exhaustive scale search.**
+   - What (`iq2r_v2_encode`, after the IQ2_XXS quantizer of ggml/llama.cpp
+     as adapted by antirez): each weight's squared error is weighted by
+     `importance * sqrt(sigma^2 + w^2)` (sigma^2 the mean square of its
+     256-weight block). A group's starting scale comes from 13 candidate
+     least-squares fits; then `d` (three exponents) and every group's level
+     (all 16 of c4e4q) are searched exhaustively, re-assigning codewords
+     for each choice.
+   - Why: importance puts the error where activations are large;
+     `sqrt(sigma^2 + w^2)` protects the large weights of a block more than
+     its small ones. The search space is small (3 x 16 choices per group),
+     so searching it exactly costs little and finds the best scales the
+     format can store.
+6. **Gain: a slight output shrink.**
+   - What: each matrix's output is scaled by one FP32 gain so that
+     `<W, Wq> / <W, W> = 0.98` (separate gains for the gate and the up
+     rows), applied once per output in the kernel.
+   - Why: quantization leaves Wq slightly too large or too small as a
+     whole, which one number per matrix corrects. Aiming a little below 1
+     follows least squares: when the reconstruction carries noise, scaling
+     it slightly down lowers the expected output error. 0.98 was chosen by
+     KL divergence on GLM-5.3.
 
 The layer files record the calibration hash and every setting above, so
 `--resume` only keeps layers built the same way.
 
 ### Calibration corpus
 
-A general mix of 164 conversations, 266,396 tokens, every reply generated by
-GLM-5.3 (FP8) and rendered with the serving chat template:
+A general mix of 164 conversations, 266,396 tokens. Every reply is
+generated by GLM-5.3 (FP8) and rendered with the serving chat template, so
+the captured activations are the ones the model produces in use. The mix
+covers agent work, chat, reasoning, code, other languages, long context and
+plain prose, so no single use dominates the importance; an earlier
+agent-heavy corpus (61% SWE-bench trajectories) was replaced by it.
 
 | Share | Rows | Tokens | Source |
 |---:|---:|---:|---|
@@ -208,10 +257,14 @@ and served by decoding the experts to FP8 at load (TP8, FP8 KV cache):
 | | AIME-60, 2 passes | SWE-bench Lite subset (29) |
 |---|---:|---:|
 | IQ2R-v2 (this recipe) | 54, 53 | 26 |
-| IQ2R-v2, shared expert at 2 bits | 49, 50 | 3 |
+| IQ2R-v2, earlier build, shared expert FP8 | 54, 54 | - |
+| IQ2R-v2, earlier build, shared expert 2-bit | 49, 50 | 3 |
 | MXFP4 (4 AIME runs) | 55, 55, 55, 54 | 22 |
 
-The SWE-bench numbers come from one run and move by 2-3 between runs. On
+The earlier build used the agent-heavy corpus and codebooks refined from a
+previous study instead of learned from scratch; its two rows differ only in
+the shared expert. The SWE-bench
+numbers come from one run each and move by 2-3 between runs. On
 SWE-bench the 2-bit model takes more steps than MXFP4 (median 88 against 76
 per task) and about 1.4x the output tokens.
 
