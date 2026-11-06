@@ -3,8 +3,10 @@
 
 """GLM-5.3 IQ2R-v2 packed MoE (TP4/TP8, gfx950) against a dense Torch reference.
 
-The same kernels as IQ2R run IQ2R-v2 weights (aiter/ops/iq2r_v2.py); the
-format is recognized from the packed auxiliary size. ``python3
+IQ2R-v2 weights (aiter/ops/iq2r_v2.py) run on IQ2R's launch structure, some
+stages with IQ2R-v2 kernels (docs/iq2r_v2_kernels.md); the format is
+recognized from the packed auxiliary size. Stacks of 257 experts take top-9
+routing, stacks of 256 (shared expert outside the MoE) top-8. ``python3
 op_tests/test_iq2r_glm53_v2.py`` times IQ2R and IQ2R-v2 side by side over a
 token sweep, then runs the tests.
 """

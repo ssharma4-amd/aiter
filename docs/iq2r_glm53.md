@@ -134,8 +134,9 @@ shapes.
      (75 layers x 37.7 M weights x ~0.7 byte that 2 bits would save).
    - Measured: with everything else the same, the shared expert at 2 bits
      scored 49 and 50 of 60 on AIME-60, against 54 and 54 in FP8.
-   - Serving needs the MoE to take 256 experts with top-8 routing; the
-     kernels on this branch still expect 257 experts and top-9.
+   - Serving runs the MoE on the 256 routed experts with top-8 routing:
+     `iq2r_glm53_moe_out` takes `[256, ...]` stacks with `[tokens, 8]` ids and
+     weights (see [iq2r_v2_kernels.md](iq2r_v2_kernels.md)).
 2. **Calibration: router-weighted statistics, one conversation per sequence.**
    - What: `calibrate.py --per-row` runs the FP8 model over the calibration
      corpus below, each row (one whole conversation, rendered with the chat
@@ -275,8 +276,10 @@ and (`python3 op_tests/test_iq2r_glm53_v2.py`) times IQ2R against IQ2R-v2.
 ## Dispatch
 
 `iq2r_glm53_moe_out` looks up the launch choice for the token count in
-`aiter/configs/iq2r_glm53_tuned.csv` (keyed on gfx, cu_num, token and
-inter_dim). Other token counts use the next tuned row up that can run
+`aiter/configs/iq2r_glm53_tuned.csv` (keyed on gfx, cu_num, token, inter_dim
+and the expert count: rows with 257 experts and top-9 for stacks with the
+fused shared expert, rows with 256 experts and top-8 for IQ2R-v2 stacks
+without it). Other token counts use the next tuned row up that can run
 them, else `_default_config`.
 `AITER_LOG_TUNED_CONFIG=1` logs the choice once per shape. Each row names:
 
