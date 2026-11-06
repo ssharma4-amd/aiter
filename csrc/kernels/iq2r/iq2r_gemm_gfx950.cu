@@ -1613,7 +1613,7 @@ __global__ __launch_bounds__(64*Waves,Occupancy) void glm53_down_prefill_tp4_ker
 
 // TP8 (K=256) down: waves cover independent N tiles and share one A tile
 // cached per CTA. Each output is the sum of two zero-initialized K128 MFMAs.
-// Chunks splits N across launches; Tiled stores [N/Columns][M][Columns] for
+// Chunks splits N across launches; Tiled stores [N/384][M][384] for
 // glm53_reduce_chunk_kernel, otherwise rows are [M][6144].
 template<int Waves,int MAtoms,int Groups,int XCD,int TaskGroup,int Chunks,bool Tiled,int Classes=0>
 __global__ __launch_bounds__(64*Waves,1) void glm53_down_prefill_tp8_kernel(
@@ -1764,7 +1764,7 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_prefill_tp8_kernel(
                     {
                         packed[c]=__builtin_bit_cast(opus::bf16_t,__float2bfloat16((first[m][c]+second[c])*iq2r_gain<Classes>(aux,auxiliary_bytes,0)));
                     }
-                    out_buffer.template store<4>(packed,glm53_row_offset(out_r<row_count,(Tiled?(n_tile*M+row_base+out_r)*Columns+out_col%Columns:(row_base+out_r)*6144+out_col)));
+                    out_buffer.template store<4>(packed,glm53_row_offset(out_r<row_count,(Tiled?((Columns==384?n_tile:out_col/384)*M+row_base+out_r)*384+out_col%384:(row_base+out_r)*6144+out_col)));
                 }
             }
             {
@@ -1805,7 +1805,7 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_prefill_tp8_kernel(
                     {
                         packed[c]=__builtin_bit_cast(opus::bf16_t,__float2bfloat16((first[m][c]+second[c])*iq2r_gain<Classes>(aux,auxiliary_bytes,0)));
                     }
-                    out_buffer.template store<4>(packed,glm53_row_offset(out_r<row_count,(Tiled?(n_tile*M+row_base+out_r)*Columns+out_col%Columns:(row_base+out_r)*6144+out_col)));
+                    out_buffer.template store<4>(packed,glm53_row_offset(out_r<row_count,(Tiled?((Columns==384?n_tile:out_col/384)*M+row_base+out_r)*384+out_col%384:(row_base+out_r)*6144+out_col)));
                 }
             }
             {
@@ -1846,7 +1846,7 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_prefill_tp8_kernel(
                     {
                         packed[c]=__builtin_bit_cast(opus::bf16_t,__float2bfloat16((first[m][c]+second[c])*iq2r_gain<Classes>(aux,auxiliary_bytes,0)));
                     }
-                    out_buffer.template store<4>(packed,glm53_row_offset(out_r<row_count,(Tiled?(n_tile*M+row_base+out_r)*Columns+out_col%Columns:(row_base+out_r)*6144+out_col)));
+                    out_buffer.template store<4>(packed,glm53_row_offset(out_r<row_count,(Tiled?((Columns==384?n_tile:out_col/384)*M+row_base+out_r)*384+out_col%384:(row_base+out_r)*6144+out_col)));
                 }
             }
             }
@@ -3815,10 +3815,9 @@ void iq2r_glm53_down_reduce_out(const aiter_tensor_t& activations,
                        static_cast<const int32_t*>(task_count.data_ptr()), __VA_ARGS__,        \
                        static_cast<int>(data.size(1)), static_cast<int>(auxiliary.size(1)), chunk)
         // TP4: 16 persistent CTAs per CU with weight-stationary K loops; TP8:
-        // N-wave tiles sharing one cached activation tile. IQ2R-v2 TP4 items
-        // cover 768 columns instead of 384, which halves the activation
-        // staging and codebook formation per weight byte. (TP8 keeps 384:
-        // its tiled route output assumes 384-column items.)
+        // N-wave tiles sharing one cached activation tile. IQ2R-v2 items cover
+        // 768 columns instead of 384, which halves the activation staging and
+        // codebook formation per weight byte.
         glm53_with_classes(classes, [&](auto tag) {
         constexpr int C = decltype(tag)::value;
         if(K == 512 && chunks == 1)
@@ -3828,10 +3827,10 @@ void iq2r_glm53_down_reduce_out(const aiter_tensor_t& activations,
             GLM53_PREFILL_DOWN((glm53_down_prefill_tp4_kernel<4, (C > 0 ? 4 : 2), 8, 4, 4, 2, 3, C>), 16,
                                static_cast<__hip_bfloat16*>(route_output.data_ptr()), routes, static_cast<int>(data.size(0)));
         else if(chunks == 1)
-            GLM53_PREFILL_DOWN((glm53_down_prefill_tp8_kernel<4, 2, 2, 8, 4, 1, true, C>), 8,
+            GLM53_PREFILL_DOWN((glm53_down_prefill_tp8_kernel<4, 2, (C > 0 ? 4 : 2), 8, 4, 1, true, C>), 8,
                                static_cast<__hip_bfloat16*>(route_output.data_ptr()), routes, static_cast<int>(data.size(0)));
         else
-            GLM53_PREFILL_DOWN((glm53_down_prefill_tp8_kernel<4, 2, 2, 8, 4, 2, true, C>), 8,
+            GLM53_PREFILL_DOWN((glm53_down_prefill_tp8_kernel<4, 2, (C > 0 ? 4 : 2), 8, 4, 2, true, C>), 8,
                                static_cast<__hip_bfloat16*>(route_output.data_ptr()), routes, static_cast<int>(data.size(0)));
         });
 #undef GLM53_PREFILL_DOWN
