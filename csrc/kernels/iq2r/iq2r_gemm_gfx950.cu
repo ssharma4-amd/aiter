@@ -3090,11 +3090,7 @@ __global__ __launch_bounds__(512,1) void glm53_gate_decode_nobarrier_kernel(
 
 // IQ2R-v2 decode gate, glm53_gate_decode_nobarrier_kernel's structure:
 // - Items (N tiles of 16-row tasks) are split into 8 contiguous per-XCD
-//   ranges, which the XCD's workgroups take round-robin, so an expert's items
-//   share one XCD's L2. The hardware deals workgroups to the 8 XCDs
-//   round-robin by workgroup id (SPX mode), so workgroup b runs on XCD b % 8;
-//   rank = b / 8 is its index among that XCD's workgroups (not a CU: the XCD
-//   picks the CU). In other partition modes only the locality is lost.
+//   ranges, which the XCD's workgroups take round-robin.
 // - A new expert's book is formed in LDS from its 4 KB copy 0
 //   (iq2r_v2_book_form) instead of staging 16 KB of copies; the copy-0 load
 //   goes out first and the formation after the item's other loads, so the
