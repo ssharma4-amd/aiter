@@ -19,11 +19,34 @@ on the host:
 
 - Routes keep nine slots per token (`token * 9 + k`). With top-8, slot 8 is empty: the sort kernels
   (`TopK` template, `glm53_route_id`) read `[tokens, 8]` ids and put slot 8 into the invalid bucket.
-- They emit no tasks for those slots. The gate splits items into contiguous per-XCD ranges and invalid tasks
-  sort last, so their no-op items all fell to one XCD. Dropping them was worth 12-22% of the whole MoE at
-  M512-1024.
+- They emit no tasks for those slots (see Task lists and work split). Dropping them was worth 12-22% of the
+  whole MoE at M512-1024.
 - The reductions read `[tokens, 8]` weights; the route9 down runs 8 route waves (2 per SIMD) instead of 9.
 - 257-expert / top-9 stacks still run (IQ2R, and IQ2R-v2 with a fused shared expert).
+
+**Task lists and work split.**
+
+- **Sort and task building:**
+  - One launch sorts the routes and builds the task lists. For decode, CTA 0 of `glm53_sort_quant_kernel`
+    builds them while the other CTAs quantize token rows; prefill runs histogram, prefix, task emission and
+    scatter kernels.
+  - Routes are grouped by expert, in the order routed experts 0-255, the shared expert 256 (fused stacks only),
+    then invalid routes (id -1: dropped or masked routes, and the empty ninth slot with top-8).
+  - The sort writes `gather[sorted position] = route` and `scatter[route] = sorted position`, or -1 for an
+    invalid route.
+  - Tasks (`{first sorted row, rows, expert}`: 16-row tasks for the decode gate, 32 for the decode down, 64 for
+    prefill) cover the expert groups, with their count written to device memory.
+- **What the GEMM kernels see:** they loop over the task count the sort wrote, and the reductions skip
+  `scatter = -1`.
+- **Top-8 change:** with top-8 the sorts emit no tasks for invalid routes (`glm53_sort_routes<TopK>`,
+  `glm53_sort_expert_prefix<TopK>`). With top-9 they still emit tasks marked expert -1, which the kernels skip,
+  as IQ2R always did. In v2 the shared expert is not in the MoE, so it has no tasks.
+- **Why dropped routes must not become tasks:**
+  - The decode gate turns tasks into items (task x N tile) and cuts the item list into 8 contiguous ranges,
+    one per XCD. Hardware deals workgroups to XCDs round-robin by id (SPX mode), so workgroup `b` is on XCD
+    `b % 8`, and the XCD's workgroups (`rank = b / 8`) take its range round-robin.
+  - Skipped tasks sorted last therefore all landed in XCD 7's range, which then had little real work while the
+    other XCDs had more.
 
 **IQ2R-v2 kernel changes.** Ported from the kernel study (`fork/glm-5.3-iq2r-v2-kernel-exp`, its
 `docs/iq2r_v2_kernel_findings.md`) to the one-codebook format, with every experiment switch resolved to its
