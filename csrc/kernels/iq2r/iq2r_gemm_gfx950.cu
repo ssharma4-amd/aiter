@@ -3099,12 +3099,10 @@ __global__ __launch_bounds__(512,1) void glm53_gate_decode_nobarrier_kernel(
 //   descriptors with the K offset in an SGPR, and the quad offset is scalar:
 //   no per-iteration 64-bit address arithmetic.
 // - The MFMA scale op_sel selects each atom's byte of the scale word.
-// - Policy: the cache-policy operand of the weight (quad) loads, 2 (nt) or 0.
-//   Non-temporal loads are faster at small M and slower at high load (TP8
-//   M512); the tuned table picks per shape (gate nobarrier / nobarrier_t).
+// - Weight (quad) loads are non-temporal: an item reads them once.
 // At most 128 VGPRs, so two workgroups share a CU (launch bounds: 4 waves per
 // SIMD).
-template<int NT,int Classes,int Policy>
+template<int NT,int Classes>
 __global__ __launch_bounds__(512,4) void glm53_gate_decode_nobarrier_v2_kernel(
     const opus::fp8_t* __restrict__ activations,
     const uint8_t* __restrict__ scales,
@@ -3171,7 +3169,7 @@ __global__ __launch_bounds__(512,4) void glm53_gate_decode_nobarrier_v2_kernel(
         // d table: [N tile][24 K256 columns][16 rows] words after the copies.
         const int d_off=BookWords*8+(n_tile*24*16+lane_row)*4;
         uint64_t pending_book[4]={};
-        IQ2RCompressedQuad pending=iq2r_scheduled_load_quad<Policy>(data,data_bytes,base,lane);
+        IQ2RCompressedQuad pending=iq2r_scheduled_load_quad<2>(data,data_bytes,base,lane);
         if(new_expert) {
             // Plain LDS stores: the barrier publishes them, and the item's
             // first quad and activation loads stay in flight across it.
@@ -3198,7 +3196,7 @@ __global__ __launch_bounds__(512,4) void glm53_gate_decode_nobarrier_v2_kernel(
             const IQ2RCompressedQuad compressed=pending;
             if(iteration<5) {
                 base+=kQuadBytes;
-                pending=iq2r_scheduled_load_quad<Policy>(data,data_bytes,base,lane);
+                pending=iq2r_scheduled_load_quad<2>(data,data_bytes,base,lane);
             }
             glm53_cross_k_decode_mfma_carried<MAtoms,Classes>(compressed,pending,shared.codebook,bases,a,sa,accumulators,active_m,pending_book,iteration==0,iteration<5,levels);
         }
@@ -3593,8 +3591,8 @@ void iq2r_glm53_gate_out(const aiter_tensor_t& activations,
                 "GLM-5.3 IQ2R gate gather must be int32 [routes]");
     AITER_CHECK(grid_multiplier >= 1 && grid_multiplier <= 8, "GLM-5.3 IQ2R gate grid multiplier");
     const bool prefill = kernel == kGlm53GatePrefill;
-    const bool nobarrier = kernel == kGlm53GateDecodeNoBarrier || kernel == kGlm53GateDecodeNoBarrierTemporal;
-    AITER_CHECK(kernel == kGlm53GateDecode || prefill || nobarrier, "GLM-5.3 IQ2R gate kernel id");
+    AITER_CHECK(kernel == kGlm53GateDecode || prefill || kernel == kGlm53GateDecodeNoBarrier,
+                "GLM-5.3 IQ2R gate kernel id");
     AITER_CHECK(tokens >= 2 && tokens <= (prefill ? 4096 : 1024),
                 "GLM-5.3 IQ2R gate token range: decode 2..1024, prefill 2..4096");
     const int rows = prefill ? 64 : 16;
@@ -3612,18 +3610,13 @@ void iq2r_glm53_gate_out(const aiter_tensor_t& activations,
             launch = tp4 ? glm53_gate_prefill_kernel<4, 8, 4, 2, 16, C> : glm53_gate_prefill_kernel<4, 8, 4, 2, 8, C>;
             waves  = 4;
         }
-        else if(nobarrier)
+        else if(kernel == kGlm53GateDecodeNoBarrier)
         {
-            // IQ2R's kernel loads its weights with the default policy either way.
-            const bool temporal = kernel == kGlm53GateDecodeNoBarrierTemporal;
             if constexpr(C == 0)
                 launch = tp4 ? glm53_gate_decode_nobarrier_kernel<16> : glm53_gate_decode_nobarrier_kernel<8>;
-            else if(temporal)
-                launch = tp4 ? glm53_gate_decode_nobarrier_v2_kernel<16, C, 0>
-                             : glm53_gate_decode_nobarrier_v2_kernel<8, C, 0>;
             else
-                launch = tp4 ? glm53_gate_decode_nobarrier_v2_kernel<16, C, 2>
-                             : glm53_gate_decode_nobarrier_v2_kernel<8, C, 2>;
+                launch = tp4 ? glm53_gate_decode_nobarrier_v2_kernel<16, C>
+                             : glm53_gate_decode_nobarrier_v2_kernel<8, C>;
         }
         else
             launch = tp4 ? glm53_gate_decode_kernel<true, 16, C> : glm53_gate_decode_kernel<false, 8, C>;

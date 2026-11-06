@@ -57,9 +57,7 @@ INTERMEDIATE_SIZES = (256, 512)  # TP8, TP4
 _RECORD_BYTES = 3584
 _QUAD_BYTES = 48 * 2304
 
-# nobarrier_t: IQ2R-v2's nobarrier gate with default-policy (temporal) weight
-# loads instead of non-temporal ones; for IQ2R the same kernel as nobarrier.
-GATE_KERNELS = {"decode": 0, "nobarrier": 1, "prefill": 2, "nobarrier_t": 3}
+GATE_KERNELS = {"decode": 0, "nobarrier": 1, "prefill": 2}
 DOWN_KERNELS = {"packed": 0, "ordered": 1, "single": 2}
 
 
