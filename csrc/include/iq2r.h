@@ -29,12 +29,16 @@ void iq2r_materialize_out(const aiter_tensor_t& data,
                           int64_t logical_k);
 
 // GLM-5.3 IQ2R packed MoE (6144 hidden, 256 routed + 1 fused shared expert,
-// top-9). TP4 and TP8 are selected by the packed weight shapes.
+// top-9; or 256 routed experts, top-8). TP4 and TP8 are selected by the
+// packed weight shapes.
 enum Glm53GateKernel : int64_t
 {
     kGlm53GateDecode           = 0,
     kGlm53GateDecodeNoBarrier  = 1,
     kGlm53GatePrefill          = 2,
+    // IQ2R-v2: as kGlm53GateDecodeNoBarrier, with an item's d words loaded
+    // once (IQ2R loads its scales once per item anyway).
+    kGlm53GateDecodeNoBarrierItemD = 3,
 };
 
 enum Glm53DownKernel : int64_t

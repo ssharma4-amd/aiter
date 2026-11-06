@@ -214,13 +214,15 @@ def poison(output, workspace) -> None:
         scales.fill_(255)  # E8M0 NaN
 
 
-def candidates(tokens: int, intermediate_size: int):
+def candidates(tokens: int, intermediate_size: int, experts: int = EXPERTS):
     tp8 = intermediate_size == 256
     if tokens == 1:
         yield IQ2RGlm53Config("decode", 2, "route9", 4, 1)
         return
     if tokens <= MAX_DECODE_TOKENS:
         gates = ("decode", "nobarrier")
+        if experts != EXPERTS:
+            gates += ("nobarrier_d",)
         downs = [("route9", 4)] if tokens in (2, 4) else []
         down_kernels = ("packed", "ordered", "single") if tp8 else ("packed", "single")
         downs += list(itertools.product(down_kernels, (2, 4, 8)))
@@ -387,7 +389,7 @@ class IQ2RGlm53Tuner(TunerCommon):
             # the nine routes in a different order).
             reference = None
             tolerance = 0.0
-            for config in candidates(tokens, intermediate_size):
+            for config in candidates(tokens, intermediate_size, experts):
                 info = (key, *(getattr(config, f) for f in RESULTS[:-1]))
                 poison(shape.output, shape.workspace)
                 try:

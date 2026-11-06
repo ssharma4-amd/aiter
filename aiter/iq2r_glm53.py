@@ -57,7 +57,8 @@ INTERMEDIATE_SIZES = (256, 512)  # TP8, TP4
 _RECORD_BYTES = 3584
 _QUAD_BYTES = 48 * 2304
 
-GATE_KERNELS = {"decode": 0, "nobarrier": 1, "prefill": 2}
+# nobarrier_d: IQ2R-v2 loads an item's d words once (IQ2R: as nobarrier).
+GATE_KERNELS = {"decode": 0, "nobarrier": 1, "prefill": 2, "nobarrier_d": 3}
 DOWN_KERNELS = {"packed": 0, "ordered": 1, "single": 2}
 
 

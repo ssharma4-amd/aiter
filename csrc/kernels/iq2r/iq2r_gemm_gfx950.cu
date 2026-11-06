@@ -3099,9 +3099,13 @@ __global__ __launch_bounds__(512,1) void glm53_gate_decode_nobarrier_kernel(
 //   descriptors with the K offset in an SGPR, and the quad offset is scalar:
 //   no per-iteration 64-bit address arithmetic.
 // - The MFMA scale op_sel selects each atom's byte of the scale word.
+// - ItemD: a wave's 48 d words (lane 16c+r: K256 column c, row r) load once
+//   per item and permlane swaps broadcast each column to the four lane
+//   groups, instead of a d load every K step. Faster at high load (TP8
+//   M512), slower at small M; the tuned table picks it per shape.
 // At most 128 VGPRs, so two workgroups share a CU (launch bounds: 4 waves per
 // SIMD).
-template<int NT,int Classes>
+template<int NT,int Classes,bool ItemD>
 __global__ __launch_bounds__(512,4) void glm53_gate_decode_nobarrier_v2_kernel(
     const opus::fp8_t* __restrict__ activations,
     const uint8_t* __restrict__ scales,
@@ -3167,11 +3171,21 @@ __global__ __launch_bounds__(512,4) void glm53_gate_decode_nobarrier_v2_kernel(
         for(int m=0;m<MAtoms;++m) { act_off[m]=rows[m]*K+lane_group*16;scale_off[m]=rows[m]*192+lane_group; }
         // d table: [N tile][24 K256 columns][16 rows] words after the copies.
         const int d_off=BookWords*8+(n_tile*24*16+lane_row)*4;
+        [[maybe_unused]] uint32_t d_cols[3]={};
+        if constexpr(ItemD) {
+            const uint32_t x=iq2r_scheduled_buffer_load1(d_rsrc,BookWords*8+min(lane,47)*4,(n_tile*24+swave*3)*64,0);
+            // (x0,x0,x2,x2), (x1,x1,x3,x3); then lane groups 0-1 or 2-3 to all
+            const auto pairs=__builtin_amdgcn_permlane16_swap(x,x,false,true);
+            const auto even=__builtin_amdgcn_permlane32_swap(pairs[0],pairs[0],false,true);
+            const auto odd=__builtin_amdgcn_permlane32_swap(pairs[1],pairs[1],false,true);
+            d_cols[0]=even[0];d_cols[1]=odd[0];d_cols[2]=even[1];
+        }
         uint64_t pending_book[4]={};
         IQ2RCompressedQuad pending=iq2r_scheduled_load_quad<2>(data,data_bytes,base,lane);
         if(new_expert) {
+            // Plain LDS stores: the barrier publishes them, and the item's
+            // first quad and activation loads stay in flight across it.
             iq2r_v2_book_form<512>(shared.codebook,book_base,wave*64+lane);
-            asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
             __syncthreads();
         }
         IQ2RLevels levels=iq2r_levels<Classes>(pending.metadata);
@@ -3188,9 +3202,9 @@ __global__ __launch_bounds__(512,4) void glm53_gate_decode_nobarrier_v2_kernel(
                 sa[m]=iq2r_buffer_load_u8(scale_rsrc,scale_off[m],kt*4,0);
             }
             // d word of this K256, reloaded with the activations rather than
-            // held for the whole K768 slice (loading a wave's 48 d words once
-            // and broadcasting them by permlane swaps measured slower).
-            const uint32_t bases=iq2r_scheduled_buffer_load1(d_rsrc,d_off,(kt/2)*64,0);
+            // held for the whole K768 slice, unless ItemD.
+            const uint32_t bases=ItemD?(iteration<2?d_cols[0]:iteration<4?d_cols[1]:d_cols[2])
+                                      :iq2r_scheduled_buffer_load1(d_rsrc,d_off,(kt/2)*64,0);
             const IQ2RCompressedQuad compressed=pending;
             if(iteration<5) {
                 base+=kQuadBytes;
@@ -3589,8 +3603,8 @@ void iq2r_glm53_gate_out(const aiter_tensor_t& activations,
                 "GLM-5.3 IQ2R gate gather must be int32 [routes]");
     AITER_CHECK(grid_multiplier >= 1 && grid_multiplier <= 8, "GLM-5.3 IQ2R gate grid multiplier");
     const bool prefill = kernel == kGlm53GatePrefill;
-    AITER_CHECK(kernel == kGlm53GateDecode || prefill || kernel == kGlm53GateDecodeNoBarrier,
-                "GLM-5.3 IQ2R gate kernel id");
+    const bool nobarrier = kernel == kGlm53GateDecodeNoBarrier || kernel == kGlm53GateDecodeNoBarrierItemD;
+    AITER_CHECK(kernel == kGlm53GateDecode || prefill || nobarrier, "GLM-5.3 IQ2R gate kernel id");
     AITER_CHECK(tokens >= 2 && tokens <= (prefill ? 4096 : 1024),
                 "GLM-5.3 IQ2R gate token range: decode 2..1024, prefill 2..4096");
     const int rows = prefill ? 64 : 16;
@@ -3608,13 +3622,17 @@ void iq2r_glm53_gate_out(const aiter_tensor_t& activations,
             launch = tp4 ? glm53_gate_prefill_kernel<4, 8, 4, 2, 16, C> : glm53_gate_prefill_kernel<4, 8, 4, 2, 8, C>;
             waves  = 4;
         }
-        else if(kernel == kGlm53GateDecodeNoBarrier)
+        else if(nobarrier)
         {
+            const bool item_d = kernel == kGlm53GateDecodeNoBarrierItemD;
             if constexpr(C == 0)
                 launch = tp4 ? glm53_gate_decode_nobarrier_kernel<16> : glm53_gate_decode_nobarrier_kernel<8>;
+            else if(item_d)
+                launch = tp4 ? glm53_gate_decode_nobarrier_v2_kernel<16, C, true>
+                             : glm53_gate_decode_nobarrier_v2_kernel<8, C, true>;
             else
-                launch = tp4 ? glm53_gate_decode_nobarrier_v2_kernel<16, C>
-                             : glm53_gate_decode_nobarrier_v2_kernel<8, C>;
+                launch = tp4 ? glm53_gate_decode_nobarrier_v2_kernel<16, C, false>
+                             : glm53_gate_decode_nobarrier_v2_kernel<8, C, false>;
         }
         else
             launch = tp4 ? glm53_gate_decode_kernel<true, 16, C> : glm53_gate_decode_kernel<false, 8, C>;
