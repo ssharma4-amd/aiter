@@ -109,6 +109,10 @@ __global__ __launch_bounds__(512) void glm53_sort_chunk_prefix(int32_t* histogra
 #endif
 }
 
+// Top-8 sorts the empty ninth slots into the invalid bucket like dropped
+// routes, but gives them no tasks: they would be skipped anyway, and as the
+// last tasks they would all fall to one XCD in the gate's per-XCD split.
+template<int TopK>
 __global__ __launch_bounds__(512) void glm53_sort_expert_prefix(
     int32_t* histogram,int32_t* tasks,int32_t* task_count,
     int chunks,int task_rows,int task_capacity)
@@ -119,7 +123,7 @@ __global__ __launch_bounds__(512) void glm53_sort_expert_prefix(
     const int count=expert<258?histogram[chunks*512+expert]:0;
     const int begin=glm53_block_scan(count,waves)-count;
     histogram[chunks*512+512+expert]=begin;
-    const int nt=(count+task_rows-1)/task_rows;
+    const int nt=TopK==kGlm53TopK || expert<257?(count+task_rows-1)/task_rows:0;
     const int task_end=glm53_block_scan(nt,waves);
     if(expert==511)task_count[0]=task_end<=task_capacity?task_end:-1;
     for(int i=0;i<nt;++i)
@@ -352,7 +356,8 @@ __device__ __forceinline__ void glm53_sort_routes(
     const int routed_tasks=valid_task_count&65535;
     const int routed_gate_tasks=valid_task_count>>16;
     const int shared_count=counts[kRouted];
-    const int invalid_count=counts[kGlm53Experts];
+    // Top-8: no tasks for the empty ninth slots (see glm53_sort_expert_prefix).
+    const int invalid_count=TopK==kGlm53TopK?counts[kGlm53Experts]:0;
     const int shared_tasks=(shared_count+task_rows-1)/task_rows;
     const int shared_gate_tasks=(shared_count+15)/16;
     const int invalid_tasks=(invalid_count+task_rows-1)/task_rows;
@@ -667,17 +672,19 @@ void iq2r_glm53_prefill_sort_quant_out(const aiter_tensor_t& input,
     });
     hipLaunchKernelGGL(
         glm53_sort_chunk_prefix, dim3(258), dim3(512), 0, stream, histogram, chunks);
-    hipLaunchKernelGGL(glm53_sort_expert_prefix,
-                       dim3(1),
-                       dim3(512),
-                       0,
-                       stream,
-                       histogram,
-                       static_cast<int32_t*>(tasks.data_ptr()),
-                       static_cast<int32_t*>(task_count.data_ptr()),
-                       chunks,
-                       kTaskRows,
-                       static_cast<int>(tasks.size(0)));
+    glm53_with_topk(topk, [&](auto tag) {
+        hipLaunchKernelGGL(glm53_sort_expert_prefix<decltype(tag)::value>,
+                           dim3(1),
+                           dim3(512),
+                           0,
+                           stream,
+                           histogram,
+                           static_cast<int32_t*>(tasks.data_ptr()),
+                           static_cast<int32_t*>(task_count.data_ptr()),
+                           chunks,
+                           kTaskRows,
+                           static_cast<int>(tasks.size(0)));
+    });
     glm53_with_topk(topk, [&](auto tag) {
         hipLaunchKernelGGL(glm53_sort_scatter<decltype(tag)::value>,
                            dim3(chunks), dim3(256), 0, stream, ids, gather, scatter, histogram, count);
