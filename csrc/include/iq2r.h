@@ -36,9 +36,9 @@ enum Glm53GateKernel : int64_t
     kGlm53GateDecode           = 0,
     kGlm53GateDecodeNoBarrier  = 1,
     kGlm53GatePrefill          = 2,
-    // IQ2R-v2: as kGlm53GateDecodeNoBarrier, with an item's d words loaded
-    // once (IQ2R loads its scales once per item anyway).
-    kGlm53GateDecodeNoBarrierItemD = 3,
+    // As kGlm53GateDecodeNoBarrier; for IQ2R-v2 its weight loads keep the
+    // default cache policy instead of non-temporal (better at high load).
+    kGlm53GateDecodeNoBarrierTemporal = 3,
 };
 
 enum Glm53DownKernel : int64_t
