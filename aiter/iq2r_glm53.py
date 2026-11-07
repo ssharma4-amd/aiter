@@ -282,6 +282,120 @@ def iq2r_glm53_pack_v2(
     return quad, gate_aux, down, down_aux
 
 
+# Inverses of the record transforms above, for iq2r_glm53_unpack_v2.
+
+
+def _unpack_indices(data: Tensor, logical_k: int) -> None:
+    experts, k_tiles = _geometry(data, logical_k)
+    for record, out, third, dst_third, atom in _atoms(data, data, experts, k_tiles):
+        metadata = third[..., 8 + atom].to(torch.int64)
+        packed = sum(record[..., j].to(torch.int64) << (8 * j) for j in range(4))
+        packed = packed | ((metadata & 15) << 32)
+        ninth = torch.zeros_like(metadata)
+        for word in range(4):
+            index = (packed >> (word * 9)) & 511
+            out[..., word].copy_((index & 255).to(torch.uint8))
+            ninth |= (index >> 8) << word
+        dst_third[..., 8 + atom].copy_(((metadata & 240) | ninth).to(torch.uint8))
+
+
+def _untranspose_signs(data: Tensor, logical_k: int) -> None:
+    experts, k_tiles = _geometry(data, logical_k)
+    for record, out, _, _, _ in _atoms(data, data, experts, k_tiles):
+        new = sum(record[..., 4 + j].to(torch.int64) << (8 * j) for j in range(4))
+        old = torch.zeros_like(new)
+        for bit in range(32):
+            old |= ((new >> ((bit % 4) * 8 + bit // 4)) & 1) << bit
+        for j in range(4):
+            out[..., 4 + j].copy_(((old >> (8 * j)) & 255).to(torch.uint8))
+
+
+def _unquad_gate(quad: Tensor, logical_n: int) -> Tensor:
+    """Inverse of ``_quad_gate``: ``[experts, N/64, 48, 2304]`` -> K=6144 records.
+
+    The padding N blocks of the last 6-block group (``_quad_gate`` drops them)
+    come back as zeros, as ``iq2r_v2_write_data`` writes them.
+    """
+    blocks = logical_n // 16
+    if logical_n % 64 or quad.shape[1] != (blocks // 4) * 48 * 2304:
+        raise ValueError("packed gate/up size does not match N")
+    experts, groups = quad.shape[0], (blocks + 5) // 6
+    source = quad.reshape(experts, blocks // 4, 48, 2304)
+    target = torch.zeros(
+        (experts, groups, 48, _RECORD_BYTES), dtype=torch.uint8, device=quad.device
+    )
+    for block in range(blocks):
+        atom = block % 3
+        offset = (block % 6) // 3 * 1792
+        third = target[:, block // 6, :, offset + 1024 : offset + 1792].view(
+            experts, 48, 64, 12
+        )
+        if atom < 2:
+            pair = target[:, block // 6, :, offset : offset + 1024].view(
+                experts, 48, 64, 16
+            )
+            record = pair[..., atom * 8 : atom * 8 + 8]
+        else:
+            record = third[..., :8]
+        slot = block % 4
+        pair_base = (slot // 2) * 1024
+        pair_in = source[:, block // 4, :, pair_base : pair_base + 1024].reshape(
+            experts, 48, 64, 16
+        )
+        record.copy_(pair_in[..., slot % 2 * 8 : slot % 2 * 8 + 8])
+        metadata = source[:, block // 4, :, 2048:2304].reshape(experts, 48, 64, 4)
+        third[..., 8 + atom].copy_(metadata[..., slot])
+    return target.flatten(1)
+
+
+def _unpack_v2_d(table: Tensor, n: int, atoms: int) -> Tensor:
+    """Inverse of ``_pack_v2_d``: ``[E, N/(16*atoms), K/256, 16, 4]`` -> ``[E, N, K/256]``."""
+    experts, _, columns = table.shape[:3]
+    return table[..., :atoms].permute(0, 1, 4, 3, 2).reshape(experts, n, columns)
+
+
+@torch.no_grad()
+def iq2r_glm53_unpack_v2(
+    gate_quad: Tensor,
+    gate_auxiliary: Tensor,
+    down_data: Tensor,
+    down_auxiliary: Tensor,
+    *,
+    intermediate_size: int,
+    levels,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Inverse of :func:`iq2r_glm53_pack_v2`: packed buffers (as stored in a
+    ``glm53-packed-v2`` checkpoint, full or a TP shard) -> canonical
+    ``(gate_up_data, gate_up_auxiliary, down_data, down_auxiliary)`` for
+    ``iq2r_v2_materialize``.
+
+    The canonical auxiliary keeps codebook copy 0 (the codebook); copies 1..C-1
+    are recomputed by packing, so ``pack(unpack(x)) == x`` holds whenever the
+    stored copies are the ones packing computes.
+    """
+    classes = len(levels.multipliers)
+
+    def aux(packed: Tensor, n: int, k: int, atoms: int) -> Tensor:
+        experts, columns = packed.shape[0], k // 256
+        blocks = n // (16 * atoms)
+        if packed.shape[1] != classes * 4096 + blocks * columns * 64 + 8:
+            raise ValueError("packed IQ2R-v2 auxiliary size does not match N, K")
+        table = packed[:, classes * 4096 : -8].reshape(experts, blocks, columns, 16, 4)
+        d = _unpack_v2_d(table, n, atoms)
+        return torch.cat(
+            (packed[:, :4096], d.reshape(experts, -1), packed[:, -8:]), dim=1
+        ).contiguous()
+
+    gate = _unquad_gate(gate_quad, 2 * intermediate_size)
+    _untranspose_signs(gate, HIDDEN)
+    _unpack_indices(gate, HIDDEN)
+    down = down_data.clone(memory_format=torch.contiguous_format)
+    _unpack_indices(down, intermediate_size)
+    gate_aux = aux(gate_auxiliary, 2 * intermediate_size, HIDDEN, 4)
+    down_aux = aux(down_auxiliary, HIDDEN, intermediate_size, 3)
+    return gate.contiguous(), gate_aux, down, down_aux
+
+
 def iq2r_glm53_v2_slice_gate_aux(
     aux: Tensor, start: int, length: int, full_n: int, classes: int
 ) -> Tensor:
@@ -674,4 +788,5 @@ __all__ = [
     "iq2r_glm53_moe_out",
     "iq2r_glm53_pack",
     "iq2r_glm53_slice_gate",
+    "iq2r_glm53_unpack_v2",
 ]
