@@ -248,26 +248,61 @@ similar mix can stand in for it.
 Calibration takes about 25 minutes on 8 MI350X; encoding takes about 6 s
 per expert (gate/up and down) on one GPU.
 
-### Results
+### Two recipes and what they scored
 
-On GLM-5.3, a checkpoint built with this recipe, one run each. It was built
-with the same encoder functions and corpus, from statistics captured by an
-equivalent script (per-expert cosine to `calibrate.py`'s: median 0.9998),
-and served by decoding the experts to FP8 at load (TP8, FP8 KV cache):
+Two IQ2R-v2 recipes were evaluated on GLM-5.3. Both encode only the routed
+experts (the shared expert stays FP8), use router-weighted importance, the
+`importance * sqrt(sigma^2 + w^2)` encoder and a 0.98 output gain.
 
-| | AIME-60, 2 passes | SWE-bench Lite subset (29) |
-|---|---:|---:|
-| IQ2R-v2 (this recipe) | 54, 53 | 26 |
-| IQ2R-v2, earlier build, shared expert FP8 | 54, 54 | - |
-| IQ2R-v2, earlier build, shared expert 2-bit | 49, 50 | 3 |
-| MXFP4 (4 AIME runs) | 55, 55, 55, 54 | 22 |
+| | **Shipped recipe** (this code) | **v2-B-rw** (study recipe, not in this code) |
+|---|---|---|
+| Scales | E8M0 `d` per row and 256 inputs + 4-bit level per 32 (2-bit exponent, 2-bit class `2^(c/4)`) | FP16 `d` per 256 + 4-bit `ls` per 32, scale `d * (2*ls + 1) / 8` |
+| Codebooks | one per expert for gate/up, one for down, learned from the IQ2_XXS grid | separate gate, up and down, refined from an earlier study's codebooks |
+| Calibration corpus | corpus v2 (general mix, above) | v1: 61% SWE-bench agent trajectories |
+| Bits per weight | ~2.28 | ~2.32 |
+| Runs on | the native gfx950 kernels | only by decoding the experts to FP8 at load: FP16 `d` and the odd multipliers are not MFMA scales |
 
-The earlier build used the agent-heavy corpus and codebooks refined from a
-previous study instead of learned from scratch; its two rows differ only in
-the shared expert. The SWE-bench
-numbers come from one run each and move by 2-3 between runs. On
-SWE-bench the 2-bit model takes more steps than MXFP4 (median 88 against 76
-per task) and about 1.4x the output tokens.
+Results (TP8 unless noted, FP8 KV cache, 16 concurrent sequences except two of
+the MXFP4 29-task runs at 64; one run per number unless several are listed):
+
+| Measure | Shipped recipe | v2-B-rw | MXFP4 |
+|---|---|---|---|
+| **SWE-bench Lite, 150 tasks** (Lite rounds 0-2, TP4, 24 agents) | **107** native (38, 38, 31) | **115** decode-to-FP8 (39, 41, 35) | **110** A8W4 (39, 36, 35); round 0 A4W4 38 |
+| SWE-bench Lite, 29-task subset | native 19, 20; decode-to-FP8 19, 24 (this checkpoint), 26, 21 (an earlier build of the same recipe) | 23 | 22, 22, 22 (A4W4); 21 (newer serving stack) |
+| AIME-60, sampled, 24K thinking budget | native 55, 53; decode-to-FP8 54, 53 | 55 | 55, 55, 55, 54 |
+| KL vs FP8 (teacher-forced, 4 SWE agent + 1 math 8K windows) | 0.090 | not measured (v2-B, same encoder: 0.084) | 0.034 |
+
+What the numbers say:
+- **Shipped vs MXFP4: level.** On the 150 tasks, 6 solved only by the shipped
+  model and 9 only by MXFP4: well within run-to-run noise (about +-5 on 150).
+- **Shipped vs v2-B-rw: v2-B-rw is better on SWE-bench.** 9 tasks solved only
+  by v2-B-rw against 1 only by the shipped model (sign test p ~0.02). The
+  native kernels and packing were ruled out: the checkpoint's packed bytes
+  unpack and repack exactly, the kernels match the dense reference on its own
+  bytes (`docs/iq2r_v2_debug_report.md`), and the same weights score the same
+  through the decode-to-FP8 path. The difference is in the recipe; the most
+  likely cause for SWE-bench specifically is the calibration corpus (v2-B-rw's
+  was agent-heavy). Not isolated yet.
+- **29 tasks are too few to compare recipes:** the same checkpoint scored 19
+  and 24 in two runs.
+- **Behaviour:** the 2-bit models take more agent steps than MXFP4 (median 88
+  against 76 per task) and about 1.4x the output tokens; no collapses; about
+  0.7% of replies switch to another script (none for MXFP4).
+- **The shared expert must stay FP8:** at 2 bits it cost AIME 54, 54 -> 49, 50
+  and SWE-bench 29-task 3.
+- **Speed:** the native IQ2R-v2 MoE is faster than IQ2R v1 at every tuned
+  token count, TP4 and TP8, on MI355X (worst point -4.5%;
+  `docs/iq2r_v2_kernels.md`). Its FP8 shared expert runs outside the MoE and
+  was not in that timing.
+
+Upgrades tested and not adopted (KL with only layers 10, 30, 50 and 70
+re-encoded, rest FP8; shipped 0.01552): LDLQ error feedback on gate/up
+(damped; no extra bits) 0.01467 (-5.5%); per-8-weight quarter-octave scales
+(+0.19 bits/weight, a kernel change) 0.01445 (-6.9%); both 0.01323 (-14.8%).
+LDLQ with the usual 1% damping was worse than the shipped encoder on held-out
+inputs: 2-5K calibration tokens per expert are too few for a 6,144-dimension
+Hessian. These would move full-model KL from about 0.090 to 0.077-0.085,
+against MXFP4's 0.034.
 
 `op_tests/test_iq2r_glm53_v2.py` checks the IQ2R-v2 MoE against a dense
 reference at both TP widths, checks that TP slicing commutes with packing,
