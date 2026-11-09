@@ -267,14 +267,19 @@ the MXFP4 29-task runs at 64; one run per number unless several are listed):
 
 | Measure | Shipped recipe | v2-B-rw | MXFP4 |
 |---|---|---|---|
-| **SWE-bench Lite, 150 tasks** (Lite rounds 0-2, TP4, 24 agents) | **107** native (38, 38, 31) | **115** decode-to-FP8 (39, 41, 35) | **110** A8W4 (39, 36, 35); round 0 A4W4 38 |
+| **SWE-bench Lite, 150 tasks** (Lite rounds 0-2, TP4, 24 agents) | **107** native (38, 38, 31); ~107 with the 15 disagreeing tasks rerun twice | **115** decode-to-FP8 (39, 41, 35) | **110** A8W4 (39, 36, 35); ~111.7 with the 15 tasks rerun; round 0 A4W4 38 |
 | SWE-bench Lite, 29-task subset | native 19, 20; decode-to-FP8 19, 24 (this checkpoint), 26, 21 (an earlier build of the same recipe) | 23 | 22, 22, 22 (A4W4); 21 (newer serving stack) |
 | AIME-60, sampled, 24K thinking budget | native 55, 53; decode-to-FP8 54, 53 | 55 | 55, 55, 55, 54 |
 | KL vs FP8 (teacher-forced, 4 SWE agent + 1 math 8K windows) | 0.090 | not measured (v2-B, same encoder: 0.084) | 0.034 |
 
 What the numbers say:
-- **Shipped vs MXFP4: level.** On the 150 tasks, 6 solved only by the shipped
-  model and 9 only by MXFP4: well within run-to-run noise (about +-5 on 150).
+- **Shipped vs MXFP4: about 4-5 tasks behind on SWE-bench.** On the 150 tasks,
+  6 were solved only by the shipped model and 9 only by MXFP4. Those 15 tasks
+  were run twice more on both: shipped 7 and 5, MXFP4 11 and 12. Over the three
+  runs MXFP4 did better on 11 of the 15, the shipped model on 1 (sign test p
+  ~0.006). With the 135 tasks both agreed on held fixed, the 150-task estimate
+  is about 107 for the shipped model and 111.7 for MXFP4 A8W4 (~3 points of
+  resolve rate). AIME is level.
 - **Shipped vs v2-B-rw: v2-B-rw is better on SWE-bench.** 9 tasks solved only
   by v2-B-rw against 1 only by the shipped model (sign test p ~0.02). The
   native kernels and packing were ruled out: the checkpoint's packed bytes
