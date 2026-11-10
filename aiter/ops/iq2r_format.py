@@ -3,8 +3,8 @@
 
 """Storage layout of AITER's native-basis IQ2R weights.
 
-CPU-only, with no compiled extension, so checkpoint tooling can size, slice
-and validate IQ2R byte buffers before touching a GPU.
+CPU-only, with no compiled extension, so checkpoint tooling can size and
+slice IQ2R byte buffers before touching a GPU.
 """
 
 from __future__ import annotations
@@ -14,7 +14,6 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-IQ2R_FORMAT_NAME = "iq2r-512-fullsign-e8m0-native-v1"
 IQ2R_ACTIVATION_BASIS = "native"
 
 IQ2R_CODEBOOK_ENTRIES = 512
@@ -36,7 +35,6 @@ IQ2R_TRIPLET_BYTES = IQ2R_ATOM_PAIR_RECORDS_BYTES + (
 )
 IQ2R_GROUP_BYTES = IQ2R_TRIPLETS_PER_GROUP * IQ2R_TRIPLET_BYTES
 IQ2R_CODEBOOK_BYTES = IQ2R_CODEBOOK_ENTRIES * IQ2R_VECTOR_SIZE
-IQ2R_BASE_PADDING_BYTES = 3
 
 
 def _require_int(name: str, value: int, *, positive: bool = False) -> None:
@@ -73,10 +71,6 @@ def iq2r_physical_n_blocks(n: int) -> int:
     ) * IQ2R_N_BLOCKS_PER_GROUP
 
 
-def iq2r_padded_k(k: int) -> int:
-    return iq2r_k_tiles(k) * IQ2R_TILE_K
-
-
 def iq2r_data_bytes(n: int, k: int) -> int:
     physical_n_blocks = iq2r_physical_n_blocks(n)
     return (
@@ -87,21 +81,6 @@ def iq2r_data_bytes(n: int, k: int) -> int:
     )
 
 
-def iq2r_aux_bytes(n: int) -> int:
-    return IQ2R_CODEBOOK_BYTES + iq2r_physical_n_blocks(n) + IQ2R_BASE_PADDING_BYTES
-
-
-def iq2r_packed_sizes(n: int, k: int) -> tuple[int, int]:
-    """Return ``(data_bytes, auxiliary_bytes)`` for one expert matrix."""
-
-    return iq2r_data_bytes(n, k), iq2r_aux_bytes(n)
-
-
-def iq2r_storage_bits_per_weight(n: int, k: int) -> float:
-    data_bytes, auxiliary_bytes = iq2r_packed_sizes(n, k)
-    return 8.0 * (data_bytes + auxiliary_bytes) / (n * k)
-
-
 @dataclass(frozen=True, slots=True)
 class IQ2RMetadata:
     """Shape of one IQ2R expert projection (``N`` outputs, ``K`` inputs)."""
@@ -110,8 +89,8 @@ class IQ2RMetadata:
     logical_k: int
 
     def __post_init__(self) -> None:
-        # Also applies the type and divisibility checks.
-        iq2r_packed_sizes(self.logical_n, self.logical_k)
+        # Applies the type and divisibility checks.
+        iq2r_data_bytes(self.logical_n, self.logical_k)
 
     @property
     def n_blocks(self) -> int:
@@ -126,65 +105,8 @@ class IQ2RMetadata:
         return iq2r_k_tiles(self.logical_k)
 
     @property
-    def padded_k(self) -> int:
-        return iq2r_padded_k(self.logical_k)
-
-    @property
     def data_bytes(self) -> int:
         return iq2r_data_bytes(self.logical_n, self.logical_k)
-
-    @property
-    def auxiliary_bytes(self) -> int:
-        return iq2r_aux_bytes(self.logical_n)
-
-    @property
-    def storage_bits_per_weight(self) -> float:
-        return iq2r_storage_bits_per_weight(self.logical_n, self.logical_k)
-
-
-def _validate_output_slice(metadata: IQ2RMetadata, start: int, length: int) -> None:
-    _require_int("start", start)
-    _require_int("length", length, positive=True)
-    if (
-        start < 0
-        or start % IQ2R_TILE_N
-        or length % IQ2R_TILE_N
-        or start + length > metadata.logical_n
-    ):
-        raise ValueError(
-            f"IQ2R output slice must be in range and aligned to {IQ2R_TILE_N} columns"
-        )
-
-
-def iq2r_slice_output_auxiliary(
-    auxiliary: Tensor,
-    metadata: IQ2RMetadata,
-    start: int,
-    length: int,
-) -> Tensor:
-    """Slice codebooks/base exponents for an IQ2R output-column shard."""
-
-    _validate_byte_matrix("auxiliary", auxiliary, metadata.auxiliary_bytes)
-    _validate_output_slice(metadata, start, length)
-    target = IQ2RMetadata(logical_n=length, logical_k=metadata.logical_k)
-    output = torch.full(
-        (auxiliary.shape[0], target.auxiliary_bytes),
-        127,
-        dtype=torch.uint8,
-        device=auxiliary.device,
-    )
-    output[:, :IQ2R_CODEBOOK_BYTES].copy_(auxiliary[:, :IQ2R_CODEBOOK_BYTES])
-    source_block_start = start // IQ2R_TILE_N
-    output[:, IQ2R_CODEBOOK_BYTES : IQ2R_CODEBOOK_BYTES + target.n_blocks].copy_(
-        auxiliary[
-            :,
-            IQ2R_CODEBOOK_BYTES
-            + source_block_start : IQ2R_CODEBOOK_BYTES
-            + source_block_start
-            + target.n_blocks,
-        ]
-    )
-    return output
 
 
 def iq2r_slice_input_data(
@@ -239,48 +161,11 @@ def _validate_byte_matrix(name: str, value: Tensor, expected_bytes: int) -> None
         raise ValueError(f"{name} must be contiguous")
 
 
-def iq2r_validate_expert_weights(
-    data: Tensor,
-    auxiliary: Tensor,
-    metadata: IQ2RMetadata,
-    *,
-    expert_count: int | None = None,
-    verify_reserved_zero: bool = True,
-) -> None:
-    """Validate stacked public buffers ``data`` and ``auxiliary``."""
-
-    _validate_byte_matrix("data", data, metadata.data_bytes)
-    _validate_byte_matrix("auxiliary", auxiliary, metadata.auxiliary_bytes)
-    if data.shape[0] != auxiliary.shape[0]:
-        raise ValueError(
-            "data and auxiliary expert counts differ: "
-            f"{data.shape[0]} != {auxiliary.shape[0]}"
-        )
-    if data.device != auxiliary.device:
-        raise ValueError("data and auxiliary must be on the same device")
-    if expert_count is not None:
-        _require_int("expert_count", expert_count, positive=True)
-        if data.shape[0] != expert_count:
-            raise ValueError(
-                f"IQ2R buffers have {data.shape[0]} experts, expected {expert_count}"
-            )
-    if verify_reserved_zero:
-        zero_vectors = auxiliary[:, :IQ2R_VECTOR_SIZE]
-        if torch.count_nonzero(zero_vectors).item() != 0:
-            raise ValueError("IQ2R codebook entry zero must be the all-zero vector")
-
-
 __all__ = [name for name in globals() if name.startswith("IQ2R_")] + [
     "IQ2RMetadata",
-    "iq2r_aux_bytes",
     "iq2r_data_bytes",
     "iq2r_k_tiles",
     "iq2r_n_blocks",
-    "iq2r_packed_sizes",
-    "iq2r_padded_k",
     "iq2r_physical_n_blocks",
     "iq2r_slice_input_data",
-    "iq2r_slice_output_auxiliary",
-    "iq2r_storage_bits_per_weight",
-    "iq2r_validate_expert_weights",
 ]
