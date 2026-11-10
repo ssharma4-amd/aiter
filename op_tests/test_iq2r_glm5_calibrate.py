@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import aiter.quantization.iq2r.glm5.calibrate as calibrate_module
 from aiter.quantization.iq2r.glm5.calibrate import (
     DiagonalSecondMomentAccumulator,
     TargetSpec,
@@ -15,17 +16,19 @@ from aiter.quantization.iq2r.glm5.calibrate import (
     load_texts,
     main,
     routed_target,
-    shared_target,
+    save_calibration,
     token_batches,
 )
 from aiter.quantization.iq2r.glm5.compile import GLM5Layout, load_glm5_importance
 
 
 class _CharTokenizer:
+    """Rows already carry the chat template's special tokens."""
+
     eos_token_id = 1
 
     def encode(self, text, add_special_tokens=True):
-        assert add_special_tokens
+        assert not add_special_tokens
         return [2 + ord(char) % 60 for char in text]
 
 
@@ -82,29 +85,19 @@ _TEXTS = [
 
 
 def _record_moe_inputs(model):
-    """Return each MoE layer's routed-expert call and shared-expert inputs from one run."""
+    """Return each MoE layer's routed-expert calls from one run."""
 
     records = {}
     handles = []
     for index, layer in enumerate(model.model.layers):
         if not hasattr(layer.mlp, "experts"):
             continue
-        record = records.setdefault(index, {"routed": [], "gate_up": [], "down": []})
+        record = records.setdefault(index, [])
 
         def routed(module, args, record=record):
-            record["routed"].append(tuple(arg.detach().clone() for arg in args))
-
-        def shared(projection, record=record):
-            return lambda module, args: record[projection].append(args[0].detach())
+            record.append(tuple(arg.detach().clone() for arg in args))
 
         handles.append(layer.mlp.experts.register_forward_pre_hook(routed))
-        shared_experts = layer.mlp.shared_experts
-        handles.append(
-            shared_experts.gate_proj.register_forward_pre_hook(shared("gate_up"))
-        )
-        handles.append(
-            shared_experts.down_proj.register_forward_pre_hook(shared("down"))
-        )
     return records, handles
 
 
@@ -139,18 +132,16 @@ def test_accumulator_weights_rows_by_squared_route():
         accumulator.observe("target", 2, values)
 
 
-def test_token_batches_append_eos_and_cycle_texts():
+def test_token_batches_feed_each_row_truncated_without_special_tokens():
     tokenizer = _CharTokenizer()
-    texts = ["ab", "c"]
-    batches = list(token_batches(tokenizer, texts, sequence_length=4, max_tokens=10))
-    a, b, c = (tokenizer.encode(char)[0] for char in "abc")
-    stream = [a, b, 1, c, 1, a, b, 1, c, 1]
-    assert [batch.tolist() for batch in batches] == [
-        [stream[:4]],
-        [stream[4:8]],
-        [stream[8:]],
-    ]
+    texts = ["abcde", "f", "", "gh"]
+    batches = list(token_batches(tokenizer, texts, sequence_length=3, max_tokens=5))
+    a, b, c, f, g = (2 + ord(char) % 60 for char in "abcfg")
+    # One pass: the token budget cuts the last row, the empty row is skipped.
+    assert [batch.tolist() for batch in batches] == [[[a, b, c]], [[f]], [[g]]]
     assert all(batch.dtype == torch.long for batch in batches)
+    batches = list(token_batches(tokenizer, texts, sequence_length=8, max_tokens=99))
+    assert [batch.shape[1] for batch in batches] == [5, 1, 2]
 
 
 def test_load_texts_reads_jsonl_fields_and_plain_lines(tmp_path):
@@ -175,7 +166,7 @@ def test_load_texts_reads_jsonl_fields_and_plain_lines(tmp_path):
         load_texts(bad)
 
 
-def test_target_specs_cover_routed_and_shared_experts_per_layer():
+def test_target_specs_cover_routed_experts_per_layer():
     config = SimpleNamespace(
         first_k_dense_replace=3,
         num_hidden_layers=5,
@@ -185,28 +176,21 @@ def test_target_specs_cover_routed_and_shared_experts_per_layer():
         moe_intermediate_size=2,
     )
     specs = glm5_target_specs(config)
-    assert [spec.name for spec in specs[:4]] == [
+    assert [spec.name for spec in specs] == [
         routed_target(3, "gate_up"),
         routed_target(3, "down"),
-        shared_target(3, "gate_up"),
-        shared_target(3, "down"),
+        routed_target(4, "gate_up"),
+        routed_target(4, "down"),
     ]
-    assert [(spec.groups, spec.width) for spec in specs[:4]] == [
-        (4, 6),
-        (4, 2),
-        (1, 6),
-        (1, 2),
-    ]
-    assert len(specs) == 8
-    config.n_shared_experts = 2
-    with pytest.raises(ValueError, match="one shared expert"):
-        glm5_target_specs(config)
+    assert [(spec.groups, spec.width) for spec in specs[:2]] == [(4, 6), (4, 2)]
 
 
-def test_capture_matches_routed_and_shared_references():
+def test_capture_matches_routed_references():
     model = _tiny_model()
-    tokens = 48
-    reference_input = next(token_batches(_CharTokenizer(), _TEXTS, tokens, tokens))
+    tokens = 32
+    texts = _TEXTS[:1]
+    reference_input = next(token_batches(_CharTokenizer(), texts, tokens, tokens))
+    assert reference_input.shape == (1, tokens)
     records, handles = _record_moe_inputs(model)
     with torch.inference_mode():
         reference_logits = model(input_ids=reference_input, use_cache=False).logits
@@ -216,7 +200,7 @@ def test_capture_matches_routed_and_shared_references():
     payload = capture_glm5_calibration(
         model,
         _CharTokenizer(),
-        _TEXTS,
+        texts,
         sequence_length=tokens,
         max_tokens=tokens,
         device="cpu",
@@ -228,8 +212,15 @@ def test_capture_matches_routed_and_shared_references():
 
     targets = payload["targets"]
     config = model.config
-    for layer in range(config.first_k_dense_replace, config.num_hidden_layers):
-        hidden, top_k_index, top_k_weights = records[layer]["routed"][0]
+    moe_layers = range(config.first_k_dense_replace, config.num_hidden_layers)
+    # Routed experts only: the shared expert stays FP8 in IQ2R-v2.
+    assert set(targets) == {
+        routed_target(layer, projection)
+        for layer in moe_layers
+        for projection in ("gate_up", "down")
+    }
+    for layer in moe_layers:
+        hidden, top_k_index, top_k_weights = records[layer][0]
         experts = model.model.layers[layer].mlp.experts
         gate_up = targets[routed_target(layer, "gate_up")]
         down = targets[routed_target(layer, "down")]
@@ -251,18 +242,10 @@ def test_capture_matches_routed_and_shared_references():
                 _weighted_moment(activated, route).float(),
             )
 
-        ones = torch.ones(tokens)
-        for projection in ("gate_up", "down"):
-            shared = targets[shared_target(layer, projection)]
-            assert shared["hit_count"].tolist() == [tokens]
-            assert shared["denominator"].tolist() == [float(tokens)]
-            values = records[layer][projection][0].reshape(tokens, -1)
-            torch.testing.assert_close(
-                shared["importance"][0], _weighted_moment(values, ones).float()
-            )
-
     metadata = payload["metadata"]
     assert metadata["token_count"] == tokens
+    assert metadata["sequence_length"] == tokens
+    assert metadata["per_row"] is True
     assert metadata["forced_layer_input_tokens"] == 0
     assert metadata["forced_layer_experts"] == []
 
@@ -303,63 +286,26 @@ def test_capture_forces_dormant_experts_from_layer_inputs():
         assert gate_up["hit_count"][dormant] == 32
         assert gate_up["forced_hit_count"][dormant] == 32
         assert int(gate_up["forced_hit_count"].sum()) == 32
-        # The shared expert keeps natural-token statistics only.
-        shared = payload["targets"][shared_target(layer, "gate_up")]
-        assert shared["hit_count"].tolist() == [tokens]
 
 
-def test_cli_artifact_loads_into_iq2r_compiler(tmp_path):
+def test_artifact_loads_into_iq2r_compiler(tmp_path):
     model = _tiny_model()
-    tokenizers = pytest.importorskip("tokenizers")
-    from transformers import PreTrainedTokenizerFast
-
-    vocab = {"[UNK]": 0, "</s>": 1}
-    for word in " ".join(_TEXTS).replace(",", "").split():
-        vocab.setdefault(word, len(vocab))
-    backend = tokenizers.Tokenizer(
-        tokenizers.models.WordLevel(vocab, unk_token="[UNK]")
-    )
-    backend.pre_tokenizer = tokenizers.pre_tokenizers.Whitespace()
-    model_dir = tmp_path / "model"
-    PreTrainedTokenizerFast(
-        tokenizer_object=backend, unk_token="[UNK]", eos_token="</s>"
-    ).save_pretrained(model_dir)
-    model.save_pretrained(model_dir)
-    corpus = tmp_path / "corpus.jsonl"
-    corpus.write_text(
-        "".join(json.dumps({"text": text}) + "\n" for text in _TEXTS),
-        encoding="utf-8",
+    payload = capture_glm5_calibration(
+        model,
+        _CharTokenizer(),
+        _TEXTS,
+        sequence_length=16,
+        max_tokens=96,
+        device="cpu",
     )
     output = tmp_path / "out" / "calibration.pt"
-
-    assert (
-        main(
-            [
-                "--model-dir",
-                str(model_dir),
-                "--text-file",
-                str(corpus),
-                "--output",
-                str(output),
-                "--sequence-length",
-                "16",
-                "--max-tokens",
-                "96",
-                "--device",
-                "cpu",
-            ]
-        )
-        == 0
-    )
+    save_calibration(payload, output)
     # The atomic save leaves no temporary file behind.
     assert [entry.name for entry in output.parent.iterdir()] == ["calibration.pt"]
     payload = torch.load(output, map_location="cpu", weights_only=True)
     assert payload["format"] == "iq2r-calibration"
-    assert len(payload["targets"]) == 8
-    metadata = payload["metadata"]
-    assert metadata["token_count"] == 96
-    assert metadata["model_type"] == "glm_moe_dsa"
-    assert len(metadata["model_config_sha256"]) == 64
+    assert len(payload["targets"]) == 4
+    assert payload["metadata"]["token_count"] == 48
 
     config = model.config
     layout = GLM5Layout(
@@ -378,8 +324,43 @@ def test_cli_artifact_loads_into_iq2r_compiler(tmp_path):
         loaded.gate_up[1], targets[routed_target(2, "gate_up")]["importance"]
     )
     assert torch.equal(
-        loaded.shared_down[0], targets[shared_target(1, "down")]["importance"][0]
+        loaded.routed_hits[0], targets[routed_target(1, "gate_up")]["hit_count"]
     )
+
+
+def test_cli_takes_only_the_corpus_paths(monkeypatch, capsys):
+    calls = []
+
+    def fake_calibrate(model_dir, text_file, output, **kwargs):
+        calls.append((model_dir, text_file, output, kwargs))
+        return {"format": "iq2r-calibration", "targets": {}, "metadata": {}}
+
+    monkeypatch.setattr(calibrate_module, "calibrate_glm5", fake_calibrate)
+    paths = ["--model-dir", "m", "--text-file", "c.jsonl", "--output", "o.pt"]
+    assert main(paths) == 0
+    assert main([*paths, "--fp8-kernel-dir", "k"]) == 0
+    assert calls == [
+        ("m", "c.jsonl", "o.pt", {"fp8_kernel_dir": None}),
+        ("m", "c.jsonl", "o.pt", {"fp8_kernel_dir": "k"}),
+    ]
+    capsys.readouterr()
+    for removed in (
+        ["--per-row"],
+        ["--sequence-length", "16"],
+        ["--max-tokens", "96"],
+        ["--force-unobserved-tokens", "0"],
+        ["--device", "cpu"],
+        ["--device-map", "balanced"],
+    ):
+        with pytest.raises(SystemExit):
+            main([*paths, *removed])
+    with pytest.raises(SystemExit):
+        main(paths[:4])
+    assert len(calls) == 2
+    # The recipe is fixed.
+    assert calibrate_module.SEQUENCE_LENGTH == 16384
+    assert calibrate_module.MAX_TOKENS == 1_000_000
+    assert calibrate_module.FORCE_UNOBSERVED_TOKENS == 512
 
 
 if __name__ == "__main__":
