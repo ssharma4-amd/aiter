@@ -11,7 +11,7 @@ lowest ``us * package watts``.
 
     python3 csrc/kernels/iq2r/iq2r_glm53_tune.py               # untuned shapes
     python3 csrc/kernels/iq2r/iq2r_glm53_tune.py --all         # retune them all
-    python3 csrc/kernels/iq2r/iq2r_glm53_tune.py --run_config  # time the CSV
+    python3 csrc/kernels/iq2r/iq2r_glm53_tune.py --run_config aiter/configs/iq2r_glm53_tuned.csv
 
 Candidates are timed by CUDA graph replay, as serving runs decode batches.
 Each call in the graph reads its own copy of the layer with its own routing,
@@ -41,12 +41,18 @@ from aiter.iq2r_glm53 import (
     IQ2RGlm53Config,
     IQ2RGlm53Workspace,
     iq2r_glm53_moe_out,
-    iq2r_glm53_pack,
+    iq2r_glm53_pack_v2,
 )
 from aiter.jit import core
-from aiter.ops.iq2r import iq2r_encode_device, iq2r_materialize_device
-from aiter.ops.iq2r_encoder import iq2r_initial_codebook
-from aiter.ops.iq2r_format import IQ2RMetadata
+from aiter.ops.iq2r_v2 import (
+    IQ2R_V2_LEVELS_C4,
+    iq2r_v2_encode,
+    iq2r_v2_gains,
+    iq2r_v2_materialize,
+    iq2r_v2_seed_codebook,
+    iq2r_v2_write_auxiliary,
+    iq2r_v2_write_data,
+)
 from aiter.utility.base_tuner import TunerCommon
 
 CONFIG_ENV = "AITER_CONFIG_IQ2R_GLM53"
@@ -56,49 +62,47 @@ ROTATE_BYTES = 1 << 30  # expert weights read per graph replay: 4x the MALL
 
 
 def synthetic_weights(intermediate_size: int, device: str):
-    """Three encoded random experts tiled over all 257, with their dense weights.
+    """Three encoded random experts tiled over all 256, with their dense weights.
 
     Returns ``(packed, gate, down, pick)``: expert ``e`` uses ``gate[pick[e]]``.
     """
-    codebook = iq2r_initial_codebook(device)
+    levels = IQ2R_V2_LEVELS_C4
+    codebook = iq2r_v2_seed_codebook(device)
 
-    def matrix(n: int, k: int):
-        records = [
-            iq2r_encode_device(
-                torch.randn((n, k), device=device) * 0.02,
-                torch.ones((k,), device=device),
-                codebook,
-                exponent_radius=8,
+    def matrix(n: int, k: int, interleaved: bool):
+        records, dense = [], []
+        for _ in range(3):
+            weight = torch.randn((n, k), device=device) * 0.02
+            enc = iq2r_v2_encode(
+                weight, torch.ones((k,), device=device), codebook, levels
             )
-            for _ in range(3)
-        ]
-        dense = [
-            iq2r_materialize_device(d.view(1, -1), a.view(1, -1), IQ2RMetadata(n, k))
-            for d, a in records
-        ]
+            gains = iq2r_v2_gains(
+                weight, enc.reconstruction, 0.98, interleaved=interleaved
+            )
+            data = iq2r_v2_write_data(enc.indices, enc.negative, enc.levels, levels)
+            aux = iq2r_v2_write_auxiliary(codebook[None], enc.d, gains)
+            records.append((data, aux))
+            dense.append(iq2r_v2_materialize(data, aux, n, k, levels))
         data, aux = (torch.stack(parts)[pick] for parts in zip(*records))
         return data, aux, dense
 
     pick = torch.arange(EXPERTS, device=device) % 3
-    gate, gate_aux, gate_dense = matrix(2 * intermediate_size, HIDDEN)
-    down, down_aux, down_dense = matrix(HIDDEN, intermediate_size)
-    packed = iq2r_glm53_pack(
+    gate, gate_aux, gate_dense = matrix(2 * intermediate_size, HIDDEN, True)
+    down, down_aux, down_dense = matrix(HIDDEN, intermediate_size, False)
+    packed = iq2r_glm53_pack_v2(
         gate, gate_aux, down, down_aux, intermediate_size=intermediate_size
     )
     return packed, gate_dense, down_dense, pick
 
 
 def routing(tokens: int, device: str):
-    """Random top-8 routes plus the shared expert 256.
+    """Random top-8 routes over the 256 experts.
 
     Every route weighs at least 0.5, so a dropped route fails the check.
     """
-    routed = torch.rand((tokens, EXPERTS - 1), device=device).topk(TOPK - 1).indices
-    shared = torch.full((tokens, 1), EXPERTS - 1, dtype=routed.dtype, device=device)
-    ids = torch.cat((routed, shared), 1).to(torch.int32).contiguous()
+    ids = torch.rand((tokens, EXPERTS), device=device).topk(TOPK).indices
     weights = 0.5 + 0.5 * torch.rand((tokens, TOPK), device=device)
-    weights[:, -1] = 1.0  # shared expert
-    return weights, ids
+    return weights, ids.to(torch.int32).contiguous()
 
 
 def mxfp8(values: torch.Tensor) -> torch.Tensor:
@@ -162,14 +166,13 @@ def poison(output, workspace) -> None:
 def candidates(tokens: int, intermediate_size: int):
     tp8 = intermediate_size == 256
     if tokens == 1:
-        yield IQ2RGlm53Config("decode", 2, "route9", 4, 1)
+        yield IQ2RGlm53Config("nobarrier", 2, "route9", 4, 1)
         return
     if tokens <= MAX_DECODE_TOKENS:
-        gates = ("decode", "nobarrier")
         downs = [("route9", 4)] if tokens in (2, 4) else []
-        down_kernels = ("packed", "ordered", "single") if tp8 else ("packed", "single")
+        down_kernels = ("ordered", "single") if tp8 else ("single",)
         downs += list(itertools.product(down_kernels, (2, 4, 8)))
-        for gate, grid in itertools.product(gates, (1, 2, 4)):
+        for gate, grid in itertools.product(("nobarrier",), (1, 2, 4)):
             for down, down_grid in downs:
                 yield IQ2RGlm53Config(gate, grid, down, down_grid, 1)
     if tokens > 16:
@@ -262,7 +265,7 @@ class IQ2RGlm53Tuner(TunerCommon):
         )
         if unsupported.any():
             raise ValueError(
-                "the GLM-5.3 tuner covers hidden 6144, 257 experts, top-9 and "
+                "the GLM-5.3 tuner covers hidden 6144, 256 experts, top-8 and "
                 f"inter_dim {glm53.INTERMEDIATE_SIZES}"
             )
 

@@ -1,19 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""GLM-5.3 IQ2R MoE on the packed layout (TP4 and TP8, gfx950).
+"""GLM-5.3 IQ2R-v2 MoE on the packed layout (TP4 and TP8, gfx950).
 
-The packed layout is a byte-exact relayout of the canonical IQ2R records, so
-decoded FP8 weights are unchanged:
+256 routed experts with top-8 routing; the shared expert stays FP8 outside the
+MoE. The packed layout is a byte-exact relayout of the canonical IQ2R-v2
+records (``aiter.ops.iq2r_v2``):
 
-* codebook signs move into the record sign bytes (codebook bit 7 cleared);
 * the four 9-bit indices of an atom pack as low32 + high4;
 * gate/up record signs transpose into four 8-bit planes, and the gate/up
-  records are regrouped into quads of four 16-column blocks.
+  records are regrouped into quads of four 16-column blocks;
+* the auxiliary holds the codebook copies, a per-lane d table and the gains.
 
-Every transform is per record, so packing a full checkpoint and then taking
-a tensor-parallel shard (``iq2r_glm53_slice_gate``, ``iq2r_slice_output_auxiliary``,
-``iq2r_slice_input_data``) equals packing that shard.
+Every transform is per record, so packing a full checkpoint and then taking a
+tensor-parallel shard (``iq2r_glm53_slice_gate``, ``iq2r_glm53_v2_slice_gate_aux``,
+``iq2r_slice_input_data``, ``iq2r_glm53_v2_slice_down_aux``) equals packing
+that shard. ``iq2r_glm53_unpack_v2`` inverts the packing.
 
 Launch choices per token count come from ``aiter/configs/iq2r_glm53_tuned.csv``
 (override with ``AITER_CONFIG_IQ2R_GLM53``). Other token counts use the next
@@ -24,6 +26,7 @@ from __future__ import annotations
 
 import functools
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import pandas as pd
 import torch
@@ -46,9 +49,13 @@ from .ops.iq2r import (
     iq2r_glm53_sort_quant_out,
 )
 
+if TYPE_CHECKING:
+    from .ops.iq2r_v2 import IQ2RV2Levels
+
 HIDDEN = 6144
-EXPERTS = 257
-TOPK = 9
+EXPERTS = 256
+TOPK = 8
+ROUTE_SLOTS = 9  # routes per token in the kernels' layout; slot 8 is empty
 MAX_DECODE_TOKENS = 1024  # decode kernels cover M2..1024 (tuned rows may pick them)
 DEFAULT_DECODE_TOKENS = 256  # untuned shapes switch to the prefill kernels above this
 MAX_CHUNK_TOKENS = 4096
@@ -57,8 +64,8 @@ INTERMEDIATE_SIZES = (256, 512)  # TP8, TP4
 _RECORD_BYTES = 3584
 _QUAD_BYTES = 48 * 2304
 
-GATE_KERNELS = {"decode": 0, "nobarrier": 1, "prefill": 2}
-DOWN_KERNELS = {"packed": 0, "ordered": 1, "single": 2}
+GATE_KERNELS = {"nobarrier": 1, "prefill": 2}
+DOWN_KERNELS = {"ordered": 1, "single": 2}
 
 
 # --------------------------------------------------------------------------
@@ -98,26 +105,6 @@ def _atoms(src: Tensor, dst: Tensor, experts: int, k_tiles: int):
 
 # The record transforms below rewrite ``data`` in place: each atom's new bytes
 # depend only on that atom's old bytes, which are read first.
-
-
-def _normalize_codebook_signs(
-    data: Tensor, auxiliary: Tensor, logical_k: int
-) -> Tensor:
-    """Folds the codebook signs into the record signs; returns the new auxiliary."""
-    experts, k_tiles = _geometry(data, logical_k)
-    aux = auxiliary.clone()
-    book = auxiliary[:, :4096].reshape(experts, 512, 8)
-    signs = torch.zeros((experts, 512), device=data.device, dtype=torch.int64)
-    for byte in range(8):
-        signs |= (book[:, :, byte].to(torch.int64) >> 7) << byte
-    for record, out, third, _, atom in _atoms(data, data, experts, k_tiles):
-        metadata = third[..., 8 + atom].to(torch.int64)
-        for word in range(4):
-            index = record[..., word].to(torch.int64) + (((metadata >> word) & 1) << 8)
-            flip = signs.gather(1, index.flatten(1)).reshape_as(index).to(torch.uint8)
-            out[..., 4 + word].copy_(record[..., 4 + word] ^ flip)
-    aux[:, :4096] &= 127
-    return aux
 
 
 def _pack_indices(data: Tensor, logical_k: int) -> None:
@@ -181,29 +168,230 @@ def _quad_gate(data: Tensor, logical_n: int) -> Tensor:
     return target.flatten(1).contiguous()
 
 
+# The packed auxiliary is
+#   [C * 4096]          codebook copies E4M3(codebook * m[c])
+#   [d table]           E8M0 d, one uint32 per (row block, K256, lane row):
+#                       gate/up [N/64][K/256][16][4 quad atoms],
+#                       down    [N/48][K/256][16][3 triplet atoms + 1 pad]
+#   [8]                 two FP32 output gains (even rows, odd rows)
+# so a lane loads its atoms' d bytes for one K256 with a single dword.
+
+
+def _pack_v2_d(d: Tensor, atoms: int) -> Tensor:
+    """``d [E, N, K/256]`` -> ``[E, N/(16*atoms), K/256, 16, 4]`` bytes (pad byte 127)."""
+    experts, n, columns = d.shape
+    blocks = n // (16 * atoms)
+    grouped = d.reshape(experts, blocks, atoms, 16, columns).permute(0, 1, 4, 3, 2)
+    out = torch.full(
+        (experts, blocks, columns, 16, 4), 127, dtype=torch.uint8, device=d.device
+    )
+    out[..., :atoms] = grouped
+    return out
+
+
+def iq2r_glm53_v2_aux_bytes(n: int, k: int, classes: int, *, gate: bool) -> int:
+    """Bytes per expert of a packed IQ2R-v2 auxiliary tensor (gate/up or down)."""
+    atoms = 4 if gate else 3
+    return classes * 4096 + (n // (16 * atoms)) * (k // 256) * 64 + 8
+
+
 @torch.no_grad()
-def iq2r_glm53_pack(
+def iq2r_glm53_pack_v2(
     gate_up_data: Tensor,
     gate_up_auxiliary: Tensor,
     down_data: Tensor,
     down_auxiliary: Tensor,
     *,
     intermediate_size: int,
+    levels: IQ2RV2Levels | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    """Relayout one GLM-5.3 MoE layer (full checkpoint or a TP shard).
+    """Relayout one GLM-5.3 IQ2R-v2 MoE layer (full checkpoint or a TP shard).
 
-    Returns ``(gate_quad, gate_auxiliary, down_data, down_auxiliary)``.
+    Inputs are canonical IQ2R-v2 buffers (``aiter.ops.iq2r_v2``), one codebook
+    per matrix (gate and up share one); ``levels`` defaults to the
+    kernels' level set. Returns
+    ``(gate_quad, gate_auxiliary, down_data, down_auxiliary)``.
     """
+    from .ops.iq2r_v2 import (
+        IQ2R_V2_LEVELS_C4,
+        iq2r_v2_check_codebook,
+        iq2r_v2_codebook_copies,
+    )
+
+    levels = levels or IQ2R_V2_LEVELS_C4
+
+    def aux(auxiliary: Tensor, n: int, k: int, atoms: int) -> Tensor:
+        experts = auxiliary.shape[0]
+        codebooks = auxiliary[:, :4096].view(torch.float8_e4m3fn).float()
+        # The decode kernels form copies 1..C-1 from copy 0 in LDS.
+        iq2r_v2_check_codebook(codebooks)
+        copies = iq2r_v2_codebook_copies(codebooks.reshape(-1, 512, 8), levels)
+        copies = copies.permute(1, 0, 2, 3)  # [E, C, 512, 8]
+        d = auxiliary[:, 4096 : 4096 + n * (k // 256)].reshape(experts, n, -1)
+        return torch.cat(
+            (
+                copies.to(torch.float8_e4m3fn).view(torch.uint8).reshape(experts, -1),
+                _pack_v2_d(d, atoms).reshape(experts, -1),
+                auxiliary[:, -8:],
+            ),
+            dim=1,
+        ).contiguous()
+
     gate = gate_up_data.clone(memory_format=torch.contiguous_format)
-    gate_aux = _normalize_codebook_signs(gate, gate_up_auxiliary, HIDDEN)
     _pack_indices(gate, HIDDEN)
     _transpose_signs(gate, HIDDEN)
     quad = _quad_gate(gate, 2 * intermediate_size)
     del gate
     down = down_data.clone(memory_format=torch.contiguous_format)
-    down_aux = _normalize_codebook_signs(down, down_auxiliary, intermediate_size)
     _pack_indices(down, intermediate_size)
+    gate_aux = aux(gate_up_auxiliary, 2 * intermediate_size, HIDDEN, 4)
+    down_aux = aux(down_auxiliary, HIDDEN, intermediate_size, 3)
     return quad, gate_aux, down, down_aux
+
+
+# Inverses of the record transforms above, for iq2r_glm53_unpack_v2.
+
+
+def _unpack_indices(data: Tensor, logical_k: int) -> None:
+    experts, k_tiles = _geometry(data, logical_k)
+    for record, out, third, dst_third, atom in _atoms(data, data, experts, k_tiles):
+        metadata = third[..., 8 + atom].to(torch.int64)
+        packed = sum(record[..., j].to(torch.int64) << (8 * j) for j in range(4))
+        packed = packed | ((metadata & 15) << 32)
+        ninth = torch.zeros_like(metadata)
+        for word in range(4):
+            index = (packed >> (word * 9)) & 511
+            out[..., word].copy_((index & 255).to(torch.uint8))
+            ninth |= (index >> 8) << word
+        dst_third[..., 8 + atom].copy_(((metadata & 240) | ninth).to(torch.uint8))
+
+
+def _untranspose_signs(data: Tensor, logical_k: int) -> None:
+    experts, k_tiles = _geometry(data, logical_k)
+    for record, out, _, _, _ in _atoms(data, data, experts, k_tiles):
+        new = sum(record[..., 4 + j].to(torch.int64) << (8 * j) for j in range(4))
+        old = torch.zeros_like(new)
+        for bit in range(32):
+            old |= ((new >> ((bit % 4) * 8 + bit // 4)) & 1) << bit
+        for j in range(4):
+            out[..., 4 + j].copy_(((old >> (8 * j)) & 255).to(torch.uint8))
+
+
+def _unquad_gate(quad: Tensor, logical_n: int) -> Tensor:
+    """Inverse of ``_quad_gate``: ``[experts, N/64, 48, 2304]`` -> K=6144 records.
+
+    The padding N blocks of the last 6-block group (``_quad_gate`` drops them)
+    come back as zeros, as ``iq2r_v2_write_data`` writes them.
+    """
+    blocks = logical_n // 16
+    if logical_n % 64 or quad.shape[1] != (blocks // 4) * 48 * 2304:
+        raise ValueError("packed gate/up size does not match N")
+    experts, groups = quad.shape[0], (blocks + 5) // 6
+    source = quad.reshape(experts, blocks // 4, 48, 2304)
+    target = torch.zeros(
+        (experts, groups, 48, _RECORD_BYTES), dtype=torch.uint8, device=quad.device
+    )
+    for block in range(blocks):
+        atom = block % 3
+        offset = (block % 6) // 3 * 1792
+        third = target[:, block // 6, :, offset + 1024 : offset + 1792].view(
+            experts, 48, 64, 12
+        )
+        if atom < 2:
+            pair = target[:, block // 6, :, offset : offset + 1024].view(
+                experts, 48, 64, 16
+            )
+            record = pair[..., atom * 8 : atom * 8 + 8]
+        else:
+            record = third[..., :8]
+        slot = block % 4
+        pair_base = (slot // 2) * 1024
+        pair_in = source[:, block // 4, :, pair_base : pair_base + 1024].reshape(
+            experts, 48, 64, 16
+        )
+        record.copy_(pair_in[..., slot % 2 * 8 : slot % 2 * 8 + 8])
+        metadata = source[:, block // 4, :, 2048:2304].reshape(experts, 48, 64, 4)
+        third[..., 8 + atom].copy_(metadata[..., slot])
+    return target.flatten(1)
+
+
+def _unpack_v2_d(table: Tensor, n: int, atoms: int) -> Tensor:
+    """Inverse of ``_pack_v2_d``: ``[E, N/(16*atoms), K/256, 16, 4]`` -> ``[E, N, K/256]``."""
+    experts, _, columns = table.shape[:3]
+    return table[..., :atoms].permute(0, 1, 4, 3, 2).reshape(experts, n, columns)
+
+
+@torch.no_grad()
+def iq2r_glm53_unpack_v2(
+    gate_quad: Tensor,
+    gate_auxiliary: Tensor,
+    down_data: Tensor,
+    down_auxiliary: Tensor,
+    *,
+    intermediate_size: int,
+    levels: IQ2RV2Levels | None = None,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Inverse of :func:`iq2r_glm53_pack_v2`: packed buffers (as stored in a
+    ``glm53-packed-v2`` checkpoint, full or a TP shard) -> canonical
+    ``(gate_up_data, gate_up_auxiliary, down_data, down_auxiliary)`` for
+    ``iq2r_v2_materialize``.
+
+    The canonical auxiliary keeps codebook copy 0 (the codebook); copies 1..C-1
+    are recomputed by packing, so ``pack(unpack(x)) == x`` holds whenever the
+    stored copies are the ones packing computes.
+    """
+    from .ops.iq2r_v2 import IQ2R_V2_LEVELS_C4
+
+    classes = (levels or IQ2R_V2_LEVELS_C4).classes
+
+    def aux(packed: Tensor, n: int, k: int, atoms: int) -> Tensor:
+        experts, columns = packed.shape[0], k // 256
+        blocks = n // (16 * atoms)
+        if packed.shape[1] != classes * 4096 + blocks * columns * 64 + 8:
+            raise ValueError("packed IQ2R-v2 auxiliary size does not match N, K")
+        table = packed[:, classes * 4096 : -8].reshape(experts, blocks, columns, 16, 4)
+        d = _unpack_v2_d(table, n, atoms)
+        return torch.cat(
+            (packed[:, :4096], d.reshape(experts, -1), packed[:, -8:]), dim=1
+        ).contiguous()
+
+    gate = _unquad_gate(gate_quad, 2 * intermediate_size)
+    _untranspose_signs(gate, HIDDEN)
+    _unpack_indices(gate, HIDDEN)
+    down = down_data.clone(memory_format=torch.contiguous_format)
+    _unpack_indices(down, intermediate_size)
+    gate_aux = aux(gate_auxiliary, 2 * intermediate_size, HIDDEN, 4)
+    down_aux = aux(down_auxiliary, HIDDEN, intermediate_size, 3)
+    return gate.contiguous(), gate_aux, down, down_aux
+
+
+def iq2r_glm53_v2_slice_gate_aux(
+    aux: Tensor, start: int, length: int, full_n: int, classes: int
+) -> Tensor:
+    """Output-row slice of a packed v2 gate/up auxiliary (64-row aligned)."""
+    if start % 64 or length % 64:
+        raise ValueError("packed gate/up slices must be aligned to 64 columns")
+    books = classes * 4096
+    table = aux[:, books:-8].reshape(aux.shape[0], full_n // 64, -1)
+    picked = table[:, start // 64 : (start + length) // 64].reshape(aux.shape[0], -1)
+    return torch.cat((aux[:, :books], picked, aux[:, -8:]), dim=1).contiguous()
+
+
+def iq2r_glm53_v2_slice_down_aux(
+    aux: Tensor, start: int, length: int, full_k: int, classes: int
+) -> Tensor:
+    """Input-column slice of a packed v2 down auxiliary (256-aligned).
+
+    The down data slices like IQ2R's (``iq2r_slice_input_data``).
+    """
+    if start % 256 or length % 256:
+        raise ValueError("IQ2R-v2 down slices must be aligned to 256 columns")
+    books = classes * 4096
+    table = aux[:, books:-8].reshape(aux.shape[0], HIDDEN // 48, full_k // 256, 64)
+    picked = table[:, :, start // 256 : (start + length) // 256].reshape(
+        aux.shape[0], -1
+    )
+    return torch.cat((aux[:, :books], picked, aux[:, -8:]), dim=1).contiguous()
 
 
 def iq2r_glm53_gate_bytes(logical_n: int) -> int:
@@ -244,8 +432,8 @@ class IQ2RGlm53Config:
 def _default_config(tokens: int) -> IQ2RGlm53Config:
     if tokens > DEFAULT_DECODE_TOKENS:
         return IQ2RGlm53Config("prefill", 2, "prefill", 0, 1 if tokens <= 2560 else 2)
-    down = "route9" if tokens in (1, 2, 4) else "packed"
-    return IQ2RGlm53Config("decode", 2, down, 4, 1)
+    down = "route9" if tokens in (1, 2, 4) else "single"
+    return IQ2RGlm53Config("nobarrier", 2, down, 4, 1)
 
 
 def _config_problem(
@@ -254,9 +442,9 @@ def _config_problem(
     """Why ``config`` cannot run ``tokens`` tokens as written, or None.
 
     The fields each path reads: M1 only the down kernel (route9); decode
-    (gate ``decode``/``nobarrier``, M2..1024) all but ``down_chunks``, and
-    ``down_grid`` only for a non-route9 down; prefill (gate and down
-    ``prefill``) the gate grid and ``down_chunks``.
+    (gate ``nobarrier``, M2..1024) all but ``down_chunks``, and ``down_grid``
+    only for a non-route9 down; prefill (gate and down ``prefill``) the gate
+    grid and ``down_chunks``.
     """
     if tokens == 1:
         return None if config.down_kernel == "route9" else "M1 needs down route9"
@@ -347,7 +535,8 @@ def iq2r_glm53_config(tokens: int, intermediate_size: int) -> IQ2RGlm53Config:
 
 
 def _task_capacity(routes: int, rows: int) -> int:
-    return (routes + rows - 1) // rows + min(routes, EXPERTS + 1)
+    # One partial task per expert bucket at most (the kernels check the same bound).
+    return (routes + rows - 1) // rows + min(routes, 258)
 
 
 @dataclass(slots=True)
@@ -382,9 +571,9 @@ class IQ2RGlm53Workspace:
             )
         # Longer batches run in MAX_CHUNK_TOKENS pieces.
         max_tokens = min(max(max_tokens, 1), MAX_CHUNK_TOKENS)
-        routes = max_tokens * TOPK
-        rows = max(max_tokens, TOPK)  # M1 quantizes each of its nine routes
-        decode_routes = min(max_tokens, MAX_DECODE_TOKENS) * TOPK
+        routes = max_tokens * ROUTE_SLOTS
+        rows = max(max_tokens, ROUTE_SLOTS)  # M1 quantizes each of its route slots
+        decode_routes = min(max_tokens, MAX_DECODE_TOKENS) * ROUTE_SLOTS
         i32 = {"dtype": torch.int32, "device": device}
         u8 = {"dtype": torch.uint8, "device": device}
         fp8 = {"dtype": torch.float8_e4m3fn, "device": device}
@@ -426,11 +615,10 @@ def iq2r_glm53_moe_out(
     """Routed GLM-5.3 MoE on packed weights: ``output = sum_k w_k * expert_k(x)``.
 
     ``hidden_states`` is BF16 [tokens, 6144]; ``topk_ids``/``topk_weights``
-    are int32/float32 [tokens, 9] (eight routed experts plus the fused shared
-    expert 256); the weights come from :func:`iq2r_glm53_pack`. Routes with an
-    id outside 0..256 contribute nothing. ``config`` overrides the tuned launch
-    choice (used by the tuner); it must fit ``tokens``, and ``tokens`` must fit
-    the workspace.
+    are int32/float32 [tokens, 8] over the 256 routed experts; the weights come
+    from :func:`iq2r_glm53_pack_v2`. Routes with an id outside 0..255
+    contribute nothing. ``config`` overrides the tuned launch choice (used by
+    the tuner); it must fit ``tokens``, and ``tokens`` must fit the workspace.
     """
     # The gate and down kernel bodies are built for gfx950 only and are empty
     # on other targets, which would leave ``output`` unwritten.
@@ -462,7 +650,7 @@ def iq2r_glm53_moe_out(
     if tokens == 0:
         return
     if topk_ids.shape != (tokens, TOPK) or topk_weights.shape != (tokens, TOPK):
-        raise ValueError("GLM-5.3 IQ2R expects top-9 routing [tokens, 9]")
+        raise ValueError("GLM-5.3 IQ2R expects top-8 routing [tokens, 8]")
     if topk_weights.dtype != torch.float32 or not topk_weights.is_contiguous():
         raise ValueError("topk_weights must be contiguous float32")
     if config is None:
@@ -471,7 +659,7 @@ def iq2r_glm53_moe_out(
         problem = _config_problem(config, tokens, workspace.intermediate_size)
         if problem is not None:
             raise ValueError(f"{config} cannot run M={tokens}: {problem}")
-    routes = tokens * TOPK
+    routes = tokens * ROUTE_SLOTS
     ids = topk_ids.reshape(-1)
     gather = workspace.gather_indices[:routes]
     scatter = workspace.scatter_indices[:routes]
@@ -479,12 +667,12 @@ def iq2r_glm53_moe_out(
     count = workspace.task_count
     intermediate = workspace.intermediate_fp8[:routes]
     intermediate_scales = workspace.intermediate_scales[:routes]
-    quant_rows = TOPK if tokens == 1 else tokens
+    quant_rows = ROUTE_SLOTS if tokens == 1 else tokens
     quant = workspace.route_input_fp8[:quant_rows]
     quant_scales = workspace.route_input_scales[:quant_rows]
 
     if tokens == 1:
-        # Nine one-row tasks; each route gets its own copy of the quantized row.
+        # One-row tasks; each route gets its own copy of the quantized row.
         tasks = tasks[:routes]
         iq2r_glm53_m1_route_quant_out(
             hidden_states, ids, scatter, tasks, count, quant, quant_scales
@@ -526,7 +714,7 @@ def iq2r_glm53_moe_out(
         return
 
     if config.down_kernel == "route9":
-        # Token-owned down projection with the weighted top-9 sum fused in.
+        # Token-owned down projection with the weighted top-8 sum fused in.
         iq2r_glm53_down_route9_out(
             intermediate, intermediate_scales, down_data, down_auxiliary, ids,
             scatter, topk_weights, output,
@@ -546,6 +734,10 @@ __all__ = [
     "iq2r_glm53_config",
     "iq2r_glm53_gate_bytes",
     "iq2r_glm53_moe_out",
-    "iq2r_glm53_pack",
+    "iq2r_glm53_pack_v2",
     "iq2r_glm53_slice_gate",
+    "iq2r_glm53_unpack_v2",
+    "iq2r_glm53_v2_aux_bytes",
+    "iq2r_glm53_v2_slice_down_aux",
+    "iq2r_glm53_v2_slice_gate_aux",
 ]
