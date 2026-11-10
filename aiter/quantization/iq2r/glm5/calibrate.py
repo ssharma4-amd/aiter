@@ -1,20 +1,27 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Capture the GLM-5.3 importance statistics that IQ2R compilation weights with.
+"""Capture the GLM-5.3 importance statistics that IQ2R-v2 compilation weights with.
 
 The block-FP8 checkpoint runs prefill-only in Hugging Face Transformers over a
-text corpus. Input channel k of every routed and shared expert projection in
-layers ``first_k_dense_replace`` onwards accumulates a weighted diagonal
+text corpus, spread over every visible GPU (Accelerate device map
+"balanced"). Each corpus row (one text, or one whole conversation rendered
+with the chat template) is its own sequence of up to 16,384 tokens, fed as
+rendered (no special tokens added), over at most 1,000,000 tokens. Input
+channel k of every routed expert projection in layers
+``first_k_dense_replace`` onwards accumulates a router-weighted diagonal
 second moment
 
     importance[k] = sum_t r_t^2 * x_t[k]^2 / sum_t r_t^2
 
-x_t is the projection input of token t: the MoE input for gate/up and
-act(gate) * up for down. A routed expert sees the tokens routed to it, weighted
-by their routing weight r_t; the shared expert sees every token with r_t = 1.
-The output is an ``iq2r-calibration`` artifact for
-``aiter.quantization.iq2r.glm5.compile --calibration-cache``.
+over the tokens t routed to the expert, with routing weight r_t. x_t is the
+projection input: the MoE input for gate/up and act(gate) * up for down.
+Experts that no corpus token reaches get one forced pass over up to 512
+tokens of their layer's input. The output is an ``iq2r-calibration`` artifact
+for ``aiter.quantization.iq2r.glm5.compile --calibration-cache``:
+
+    python3 -m aiter.quantization.iq2r.glm5.calibrate --model-dir $FP8 \\
+        --text-file corpus.jsonl --output calibration.pt
 
 Needs Transformers with GLM MoE DSA support (5.16 or newer) and, for the FP8
 checkpoint, the ``kernels`` package.
@@ -47,15 +54,16 @@ from .compile import (
 )
 
 _ROUTED_EXPERTS = re.compile(r"(?:^|\.)layers\.(\d+)\.mlp\.experts$")
-_SHARED_EXPERTS = re.compile(r"(?:^|\.)layers\.(\d+)\.mlp\.shared_experts$")
+# The recipe.
+SEQUENCE_LENGTH = 16384
+MAX_TOKENS = 1_000_000
+FORCE_UNOBSERVED_TOKENS = 512
+_DEVICE_MAP = "balanced"
+_INPUT_DEVICE = "cuda:0"
 
 
 def routed_target(layer: int, projection: str) -> str:
     return f"model.layers.{layer}.mlp.experts.{projection}_proj.weight"
-
-
-def shared_target(layer: int, projection: str) -> str:
-    return f"model.layers.{layer}.mlp.shared_experts.{projection}_proj.weight"
 
 
 @dataclass(frozen=True)
@@ -66,10 +74,8 @@ class TargetSpec:
 
 
 def glm5_target_specs(config) -> list[TargetSpec]:
-    """Return the routed (one group per expert) and shared (one group) targets."""
+    """Return the routed-expert targets (one group per expert) per MoE layer."""
 
-    if getattr(config, "n_shared_experts", None) != 1:
-        raise ValueError("GLM-5 IQ2R calibration requires exactly one shared expert")
     widths = {"gate_up": config.hidden_size, "down": config.moe_intermediate_size}
     specs = []
     for layer in range(config.first_k_dense_replace, config.num_hidden_layers):
@@ -79,8 +85,6 @@ def glm5_target_specs(config) -> list[TargetSpec]:
                     routed_target(layer, projection), config.num_local_experts, width
                 )
             )
-        for projection, width in widths.items():
-            specs.append(TargetSpec(shared_target(layer, projection), 1, width))
     return specs
 
 
@@ -170,10 +174,9 @@ class GLM5CalibrationObserver:
     """Record the expert projection inputs of a Transformers GLM MoE DSA model.
 
     Each routed experts module runs the per-expert loop of Transformers' eager
-    implementation and records the gate/up and down inputs on the way; forward
-    pre-hooks record the shared expert's inputs. ``force`` limits recording to
-    experts with no hits so far and, for those still without hits, records
-    every token of the layer's input with weight 1.
+    implementation and records the gate/up and down inputs on the way.
+    ``force`` limits recording to experts with no hits so far and, for those
+    still without hits, records every token of the layer's input with weight 1.
     """
 
     def __init__(self, model, accumulator: DiagonalSecondMomentAccumulator):
@@ -186,54 +189,32 @@ class GLM5CalibrationObserver:
         )
         self.capture_mask[config.first_k_dense_replace :] = True
         self.force_mask = torch.zeros_like(self.capture_mask)
-        self.capture_shared = True
         self._forwards: list[tuple[torch.nn.Module, Any]] = []
-        self._handles = []
 
     def install(self) -> None:
         # The routed experts module is GlmMoeDsaExperts, or FP8Experts for the
         # block-FP8 checkpoint; the patterns match the module path only.
-        found = {"routed": {}, "shared": {}}
+        routed = {}
         for name, module in self.model.named_modules():
-            for kind, pattern in (
-                ("routed", _ROUTED_EXPERTS),
-                ("shared", _SHARED_EXPERTS),
-            ):
-                match = pattern.search(name)
-                if match is not None:
-                    found[kind][int(match.group(1))] = module
-        for kind, modules in found.items():
-            if sorted(modules) != list(self.layers):
-                raise RuntimeError(
-                    f"found GLM {kind} experts for layers {sorted(modules)}, "
-                    f"expected {self.layers.start}..{self.layers.stop - 1}"
-                )
-        routed, shared = found["routed"], found["shared"]
+            match = _ROUTED_EXPERTS.search(name)
+            if match is not None:
+                routed[int(match.group(1))] = module
+        if sorted(routed) != list(self.layers):
+            raise RuntimeError(
+                f"found GLM routed experts for layers {sorted(routed)}, "
+                f"expected {self.layers.start}..{self.layers.stop - 1}"
+            )
         for layer in self.layers:
             module = routed[layer]
             self._forwards.append((module, module.forward))
             module.forward = types.MethodType(self._routed_forward(layer), module)
-            for projection, linear in (
-                ("gate_up", shared[layer].gate_proj),
-                ("down", shared[layer].down_proj),
-            ):
-                self._handles.append(
-                    linear.register_forward_pre_hook(
-                        self._shared_hook(shared_target(layer, projection))
-                    )
-                )
 
     def restore(self) -> None:
         for module, forward in self._forwards:
             module.forward = forward
         self._forwards.clear()
-        for handle in self._handles:
-            handle.remove()
-        self._handles.clear()
 
     def force(self, missing: dict[str, Tensor]) -> None:
-        # The shared expert keeps natural-corpus statistics only.
-        self.capture_shared = False
         for layer in self.layers:
             unobserved = (
                 missing[routed_target(layer, "gate_up")]
@@ -244,14 +225,6 @@ class GLM5CalibrationObserver:
 
     def run(self, input_ids: Tensor) -> None:
         self.model.model(input_ids=input_ids, use_cache=False)
-
-    def _shared_hook(self, target: str):
-        def hook(module, args):
-            del module
-            if self.capture_shared:
-                self.accumulator.observe(target, 0, args[0].detach())
-
-        return hook
 
     @staticmethod
     def _project(module, projection: str, expert: int, values: Tensor) -> Tensor:
@@ -367,22 +340,22 @@ def corpus_digest(texts: list[str]) -> str:
 def token_batches(
     tokenizer, texts: list[str], sequence_length: int, max_tokens: int
 ) -> Iterator[Tensor]:
-    """Tokenize the texts in order, EOS after each, cycling until ``max_tokens``."""
+    """Feed each text as its own sequence, as rendered (no special tokens added).
 
-    tokens: list[int] = []
-    index = 0
-    while len(tokens) < max_tokens:
-        encoded = tokenizer.encode(texts[index % len(texts)], add_special_tokens=True)
-        if not encoded and tokenizer.eos_token_id is None:
-            raise ValueError("tokenizer produced no calibration tokens")
-        tokens.extend(encoded)
-        if tokenizer.eos_token_id is not None:
-            tokens.append(tokenizer.eos_token_id)
-        index += 1
-    tokens = tokens[:max_tokens]
-    for start in range(0, len(tokens), sequence_length):
-        chunk = tokens[start : start + sequence_length]
-        yield torch.tensor(chunk, dtype=torch.long).unsqueeze(0)
+    Each is truncated to ``sequence_length``; one pass over the texts or until
+    ``max_tokens``. A corpus of whole chat-template conversations so lets every
+    token attend to its own conversation only, as in serving.
+    """
+
+    total = 0
+    for text in texts:
+        if total >= max_tokens:
+            return
+        encoded = tokenizer.encode(text, add_special_tokens=False)
+        encoded = encoded[: min(sequence_length, max_tokens - total)]
+        if encoded:
+            total += len(encoded)
+            yield torch.tensor(encoded, dtype=torch.long).unsqueeze(0)
 
 
 def capture_glm5_calibration(
@@ -390,9 +363,9 @@ def capture_glm5_calibration(
     tokenizer,
     texts: list[str],
     *,
-    sequence_length: int = 512,
-    max_tokens: int = 32768,
-    force_unobserved_tokens: int = 512,
+    sequence_length: int = SEQUENCE_LENGTH,
+    max_tokens: int = MAX_TOKENS,
+    force_unobserved_tokens: int = FORCE_UNOBSERVED_TOKENS,
     device: torch.device | str | None = None,
 ) -> dict[str, Any]:
     """Run ``texts`` through ``model`` and return the calibration artifact payload.
@@ -508,11 +481,6 @@ def calibrate_glm5(
     text_file: str | os.PathLike[str],
     output: str | os.PathLike[str],
     *,
-    sequence_length: int = 512,
-    max_tokens: int = 32768,
-    force_unobserved_tokens: int = 512,
-    device: str = "cuda:0",
-    device_map: str | None = None,
     fp8_kernel_dir: str | os.PathLike[str] | None = None,
 ) -> dict[str, Any]:
     """Load the checkpoint, capture the corpus statistics and write the artifact."""
@@ -544,27 +512,15 @@ def calibrate_glm5(
     config = AutoConfig.from_pretrained(model_dir)
     if getattr(config, "model_type", None) != "glm_moe_dsa":
         raise ValueError(f"{model_dir} is not a GLM MoE DSA checkpoint")
-    target = torch.device(device)
-    if device_map is None:
-        index = target.index if target.type == "cuda" else None
-        device_map = {"": target if index is None else index}
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     model = AutoModelForCausalLM.from_pretrained(
         model_dir,
         config=config,
-        device_map=device_map,
+        device_map=_DEVICE_MAP,
         torch_dtype="auto",
         low_cpu_mem_usage=True,
     ).eval()
-    payload = capture_glm5_calibration(
-        model,
-        tokenizer,
-        texts,
-        sequence_length=sequence_length,
-        max_tokens=max_tokens,
-        force_unobserved_tokens=force_unobserved_tokens,
-        device=target,
-    )
+    payload = capture_glm5_calibration(model, tokenizer, texts, device=_INPUT_DEVICE)
     payload["metadata"].update(
         {
             "model_path": str(Path(model_dir).resolve()),
@@ -572,7 +528,7 @@ def calibrate_glm5(
             "model_type": config.model_type,
             "architectures": list(getattr(config, "architectures", None) or ()),
             "model_config_sha256": config_fingerprint(config),
-            "device_map": device_map if isinstance(device_map, str) else None,
+            "device_map": _DEVICE_MAP,
         }
     )
     save_calibration(payload, output)
@@ -581,32 +537,18 @@ def calibrate_glm5(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description=(
-            "Capture the IQ2R calibration artifact (per-expert diagonal second "
-            "moments) of a GLM-5.3 block-FP8 checkpoint"
-        )
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--model-dir", required=True)
+    parser.add_argument(
+        "--model-dir", required=True, help="GLM-5.3 block-FP8 checkpoint"
+    )
     parser.add_argument(
         "--text-file",
         required=True,
         help="UTF-8 corpus: one text per line, or JSONL with a text/prompt/content field",
     )
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--sequence-length", type=int, default=512)
-    parser.add_argument("--max-tokens", type=int, default=32768)
     parser.add_argument(
-        "--force-unobserved-tokens",
-        type=int,
-        default=512,
-        help="tokens of layer input recorded for experts the corpus never reaches",
-    )
-    parser.add_argument("--device", default="cuda:0", help="device of the input tokens")
-    parser.add_argument(
-        "--device-map",
-        choices=("auto", "balanced", "balanced_low_0", "sequential"),
-        default=None,
-        help="Accelerate device map for a checkpoint larger than one GPU",
+        "--output", required=True, help="calibration artifact to write (.pt)"
     )
     parser.add_argument(
         "--fp8-kernel-dir",
@@ -621,11 +563,6 @@ def main(argv: list[str] | None = None) -> int:
         args.model_dir,
         args.text_file,
         args.output,
-        sequence_length=args.sequence_length,
-        max_tokens=args.max_tokens,
-        force_unobserved_tokens=args.force_unobserved_tokens,
-        device=args.device,
-        device_map=args.device_map,
         fp8_kernel_dir=args.fp8_kernel_dir,
     )
     summary = {key: value for key, value in payload.items() if key != "targets"}
