@@ -8,26 +8,6 @@
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     AITER_SET_STREAM_PYBIND;
-    m.def("iq2r_encode_out",
-          &aiter::iq2r_encode_out,
-          py::arg("weight"),
-          py::arg("importance"),
-          py::arg("codebook"),
-          py::arg("indices"),
-          py::arg("scales"),
-          py::arg("data"),
-          py::arg("auxiliary"),
-          py::arg("scale_delta_overflow"),
-          py::arg("valid_k"),
-          py::arg("exponent_radius"),
-          py::arg("codebook_max"));
-    m.def("iq2r_materialize_out",
-          &aiter::iq2r_materialize_out,
-          py::arg("data"),
-          py::arg("auxiliary"),
-          py::arg("output"),
-          py::arg("logical_n"),
-          py::arg("logical_k"));
     m.def("iq2r_glm53_m1_route_quant_out",
           &aiter::iq2r_glm53_m1_route_quant_out,
           py::arg("input"),

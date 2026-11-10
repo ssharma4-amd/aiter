@@ -10,36 +10,16 @@ namespace aiter {
 // Raises unless the current GPU is gfx950; the IQ2R kernels are built for gfx950 only.
 void iq2r_check_gfx950();
 
-void iq2r_encode_out(const aiter_tensor_t& weight,
-                     const aiter_tensor_t& importance,
-                     const aiter_tensor_t& codebook,
-                     aiter_tensor_t& indices,
-                     aiter_tensor_t& scales,
-                     aiter_tensor_t& data,
-                     aiter_tensor_t& auxiliary,
-                     aiter_tensor_t& scale_delta_overflow,
-                     int64_t valid_k,
-                     int64_t exponent_radius,
-                     double codebook_max);
-
-void iq2r_materialize_out(const aiter_tensor_t& data,
-                          const aiter_tensor_t& auxiliary,
-                          aiter_tensor_t& output,
-                          int64_t logical_n,
-                          int64_t logical_k);
-
-// GLM-5.3 IQ2R packed MoE (6144 hidden, 256 routed + 1 fused shared expert,
-// top-9). TP4 and TP8 are selected by the packed weight shapes.
+// GLM-5.3 IQ2R-v2 packed MoE (6144 hidden, 256 routed experts, top-8). TP4
+// and TP8 are selected by the packed weight shapes.
 enum Glm53GateKernel : int64_t
 {
-    kGlm53GateDecode           = 0,
     kGlm53GateDecodeNoBarrier  = 1,
     kGlm53GatePrefill          = 2,
 };
 
 enum Glm53DownKernel : int64_t
 {
-    kGlm53DownPacked  = 0,
     kGlm53DownOrdered = 1,
     kGlm53DownSingle  = 2,
 };
