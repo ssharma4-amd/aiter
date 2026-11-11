@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""GLM-5.3 IQ2R-v2 packed MoE (TP4/TP8, gfx950) against a dense Torch reference.
+"""GLM-5 IQ2R-v2 packed MoE (TP4/TP8, gfx950) against a dense Torch reference.
+
+Every MoE test runs for GLM-5.3 (hidden 6144, 256 experts) and GLM-5.3-Flash
+(hidden 4096, 288 experts, clamped SwiGLU).
 
 ``python3 op_tests/test_iq2r_glm53.py`` times the tuned and default launch
 configs over a token sweep, prints a summary table, then runs the tests.
@@ -19,6 +22,8 @@ import torch
 
 import aiter
 from aiter.iq2r_glm53 import (
+    GLM5_NEXT,
+    GLM53,
     MAX_CHUNK_TOKENS,
     IQ2RGlm53Config,
     IQ2RGlm53Workspace,
@@ -50,9 +55,10 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 SUPPORTED_GFX = ["gfx950"]
 LEVELS = IQ2R_V2_LEVELS_C4
 
-_EXPERTS = 256
+_EXPERTS = GLM53.experts
 _TOPK = 8
-_HIDDEN = 6144
+_HIDDEN = GLM53.hidden
+_SHAPES = {shape.name: shape for shape in (GLM53, GLM5_NEXT)}
 
 
 def _has_gfx950() -> bool:
@@ -112,7 +118,9 @@ def _encode_down(weight, book, importance):
 
 
 @functools.lru_cache(maxsize=1)
-def _glm53_layer(intermediate: int):
+def _glm53_layer(intermediate: int, shape_name: str = "glm53"):
+    shape = _SHAPES[shape_name]
+    hidden_size, experts = shape.hidden, shape.experts
     seed = iq2r_v2_seed_codebook("cuda")
     books = (seed, (seed * 1.0625).to(torch.float8_e4m3fn).float())
 
@@ -120,35 +128,39 @@ def _glm53_layer(intermediate: int):
         generator = torch.Generator(device="cuda").manual_seed(s)
         return torch.randn((n, k), generator=generator, device="cuda") * 0.02
 
-    ones_h = torch.ones(_HIDDEN, device="cuda")
+    ones_h = torch.ones(hidden_size, device="cuda")
     ones_i = torch.ones(intermediate, device="cuda")
     gate = [
         _encode_gate_up(
-            weight(intermediate, _HIDDEN, 0x5330 + i),
-            weight(intermediate, _HIDDEN, 0x5350 + i),
+            weight(intermediate, hidden_size, 0x5330 + i),
+            weight(intermediate, hidden_size, 0x5350 + i),
             books[1],
             ones_h,
         )
         for i in range(3)
     ]
     down = [
-        _encode_down(weight(_HIDDEN, intermediate, 0x5340 + i), books[i % 2], ones_i)
+        _encode_down(
+            weight(hidden_size, intermediate, 0x5340 + i), books[i % 2], ones_i
+        )
         for i in range(3)
     ]
-    pick = torch.arange(_EXPERTS, device="cuda") % 3
+    pick = torch.arange(experts, device="cuda") % 3
 
     def stack(parts, index):
         return torch.stack([p[index].reshape(-1) for p in parts])[pick].contiguous()
 
     layer = SimpleNamespace(
         intermediate=intermediate,
+        shape=shape,
         pick=pick,
         gate_weights=[
-            iq2r_v2_materialize(d, a, 2 * intermediate, _HIDDEN, LEVELS)
+            iq2r_v2_materialize(d, a, 2 * intermediate, hidden_size, LEVELS)
             for d, a in gate
         ],
         down_weights=[
-            iq2r_v2_materialize(d, a, _HIDDEN, intermediate, LEVELS) for d, a in down
+            iq2r_v2_materialize(d, a, hidden_size, intermediate, LEVELS)
+            for d, a in down
         ],
         gate_data=stack(gate, 0),
         gate_auxiliary=stack(gate, 1),
@@ -161,39 +173,60 @@ def _glm53_layer(intermediate: int):
         layer.down_data,
         layer.down_auxiliary,
         intermediate_size=intermediate,
+        shape=shape,
     )
     return layer
 
 
-@pytest.fixture(scope="module", params=[256, 512], ids=["tp8", "tp4"])
+@pytest.fixture(
+    scope="module",
+    params=[(256, "glm53"), (512, "glm53"), (256, "glm5next"), (512, "glm5next")],
+    ids=["tp8", "tp4", "flash-tp8", "flash-tp4"],
+)
 def glm53_layer(request):
-    return _glm53_layer(request.param)
+    return _glm53_layer(*request.param)
 
 
-def _routing(tokens: int, seed: int):
+def _workspace(layer, tokens: int):
+    return IQ2RGlm53Workspace.allocate(
+        tokens, layer.intermediate, device="cuda", shape=layer.shape
+    )
+
+
+# GLM-5.3-Flash activations are scaled so that the gate/up outputs (std ~8)
+# often pass the SwiGLU clamp at 10.
+_HIDDEN_SCALE = {"glm53": 0.2, "glm5next": 8.0}
+
+
+def _routing(tokens: int, seed: int, shape=GLM53):
     generator = torch.Generator(device="cuda").manual_seed(seed)
-    scores = torch.rand((tokens, _EXPERTS), generator=generator, device="cuda")
+    scores = torch.rand((tokens, shape.experts), generator=generator, device="cuda")
     topk_ids = scores.topk(_TOPK, dim=-1).indices.to(torch.int32).contiguous()
     topk_weights = torch.softmax(
         torch.randn((tokens, _TOPK), generator=generator, device="cuda"), dim=-1
     ).contiguous()
     hidden = (
-        torch.randn((tokens, _HIDDEN), generator=generator, device="cuda") * 0.2
+        torch.randn((tokens, shape.hidden), generator=generator, device="cuda")
+        * _HIDDEN_SCALE[shape.name]
     ).to(torch.bfloat16)
     return hidden, topk_weights, topk_ids
 
 
 def _reference_moe(layer, hidden, topk_weights, topk_ids):
-    """MXFP8 activations, SiLU(gate) * up in BF16, BF16 route outputs."""
+    """MXFP8 activations, SiLU(gate) * up in BF16 (gate and up clamped for
+    GLM-5.3-Flash), BF16 route outputs."""
+    limit = layer.shape.swiglu_limit
     a1 = _mxfp8(hidden)
     output = torch.zeros(hidden.shape, dtype=torch.float32, device=hidden.device)
     route_expert = layer.pick[topk_ids.long()]
     for expert, (gate, down) in enumerate(zip(layer.gate_weights, layer.down_weights)):
         weight = (topk_weights * (route_expert == expert)).sum(dim=-1, keepdim=True)
         gate_up = a1 @ gate.T
-        act = (torch.nn.functional.silu(gate_up[:, 0::2]) * gate_up[:, 1::2]).to(
-            torch.bfloat16
-        )
+        gate_part, up_part = gate_up[:, 0::2], gate_up[:, 1::2]
+        if limit is not None:
+            gate_part = gate_part.clamp(max=limit)
+            up_part = up_part.clamp(-limit, limit)
+        act = (torch.nn.functional.silu(gate_part) * up_part).to(torch.bfloat16)
         route = (_mxfp8(act) @ down.T).to(torch.bfloat16)
         output += weight * route.float()
     return output.to(torch.bfloat16)
@@ -215,11 +248,11 @@ def _check_moe(actual: torch.Tensor, expected: torch.Tensor) -> None:
 )
 def test_glm53_moe_matches_reference(glm53_layer, tokens):
     layer = glm53_layer
-    hidden, topk_weights, topk_ids = _routing(tokens, 0x5300 + tokens)
+    hidden, topk_weights, topk_ids = _routing(tokens, 0x5300 + tokens, layer.shape)
     expected = _reference_moe(layer, hidden, topk_weights, topk_ids)
 
     actual = torch.empty_like(hidden)
-    workspace = IQ2RGlm53Workspace.allocate(tokens, layer.intermediate, device="cuda")
+    workspace = _workspace(layer, tokens)
     iq2r_glm53_moe_out(hidden, *layer.packed, topk_weights, topk_ids, actual, workspace)
     _check_moe(actual, expected)
 
@@ -246,11 +279,11 @@ def test_glm53_moe_explicit_configs(glm53_layer, tokens, config):
     problem = _config_problem(config, tokens, layer.intermediate)
     if problem:
         pytest.skip(problem)
-    hidden, topk_weights, topk_ids = _routing(tokens, 0x5390 + tokens)
+    hidden, topk_weights, topk_ids = _routing(tokens, 0x5390 + tokens, layer.shape)
     expected = _reference_moe(layer, hidden, topk_weights, topk_ids)
 
     actual = torch.empty_like(hidden)
-    workspace = IQ2RGlm53Workspace.allocate(tokens, layer.intermediate, device="cuda")
+    workspace = _workspace(layer, tokens)
     iq2r_glm53_moe_out(
         hidden, *layer.packed, topk_weights, topk_ids, actual, workspace, config
     )
@@ -260,7 +293,7 @@ def test_glm53_moe_explicit_configs(glm53_layer, tokens, config):
 def test_glm53_moe_chunks_long_prefill(glm53_layer):
     layer = glm53_layer
     tokens = 600
-    hidden, topk_weights, topk_ids = _routing(tokens, 0x53C0)
+    hidden, topk_weights, topk_ids = _routing(tokens, 0x53C0, layer.shape)
     whole = torch.empty_like(hidden)
     iq2r_glm53_moe_out(
         hidden,
@@ -268,11 +301,11 @@ def test_glm53_moe_chunks_long_prefill(glm53_layer):
         topk_weights,
         topk_ids,
         whole,
-        IQ2RGlm53Workspace.allocate(tokens, layer.intermediate, device="cuda"),
+        _workspace(layer, tokens),
     )
     # A 300-token workspace runs the batch as two 300-token prefill chunks.
     chunked = torch.empty_like(hidden)
-    workspace = IQ2RGlm53Workspace.allocate(300, layer.intermediate, device="cuda")
+    workspace = _workspace(layer, 300)
     iq2r_glm53_moe_out(
         hidden, *layer.packed, topk_weights, topk_ids, chunked, workspace
     )
@@ -293,17 +326,18 @@ def test_glm53_moe_chunks_long_prefill(glm53_layer):
 
 @pytest.mark.parametrize("tokens", [1, 3, 4, 64, 1024])
 def test_glm53_moe_drops_invalid_routes(glm53_layer, tokens):
-    """Routes with ids outside 0..255 contribute nothing on every path."""
+    """Routes with ids outside the experts contribute nothing on every path."""
     layer = glm53_layer
-    hidden, topk_weights, topk_ids = _routing(tokens, 0x53E0 + tokens)
+    experts = layer.shape.experts
+    hidden, topk_weights, topk_ids = _routing(tokens, 0x53E0 + tokens, layer.shape)
     topk_ids[:, 0] = -1
-    topk_ids[1::2, 3] = _EXPERTS
-    valid = (topk_ids >= 0) & (topk_ids < _EXPERTS)
+    topk_ids[1::2, 3] = experts
+    valid = (topk_ids >= 0) & (topk_ids < experts)
     expected = _reference_moe(
-        layer, hidden, topk_weights * valid, topk_ids.clamp(0, _EXPERTS - 1)
+        layer, hidden, topk_weights * valid, topk_ids.clamp(0, experts - 1)
     )
 
-    workspace = IQ2RGlm53Workspace.allocate(tokens, layer.intermediate, device="cuda")
+    workspace = _workspace(layer, tokens)
     workspace.route_output.fill_(float("nan"))  # a dropped route must not be read
     actual = torch.empty_like(hidden)
     iq2r_glm53_moe_out(hidden, *layer.packed, topk_weights, topk_ids, actual, workspace)
@@ -312,9 +346,9 @@ def test_glm53_moe_drops_invalid_routes(glm53_layer, tokens):
 
 def test_glm53_moe_rejects_unfit_configs(glm53_layer):
     layer = glm53_layer
-    hidden, topk_weights, topk_ids = _routing(9, 0x53B0)
+    hidden, topk_weights, topk_ids = _routing(9, 0x53B0, layer.shape)
     output = torch.zeros_like(hidden)
-    workspace = IQ2RGlm53Workspace.allocate(8, layer.intermediate, device="cuda")
+    workspace = _workspace(layer, 8)
 
     def run(tokens, config):
         rows = slice(0, tokens)
@@ -349,9 +383,9 @@ def test_glm53_moe_rejects_other_archs(glm53_layer, monkeypatch):
     import aiter.iq2r_glm53 as glm53
 
     layer = glm53_layer
-    hidden, topk_weights, topk_ids = _routing(8, 0x53A0)
+    hidden, topk_weights, topk_ids = _routing(8, 0x53A0, layer.shape)
     output = torch.zeros_like(hidden)
-    workspace = IQ2RGlm53Workspace.allocate(8, layer.intermediate, device="cuda")
+    workspace = _workspace(layer, 8)
     monkeypatch.setattr(glm53, "get_gfx", lambda: "gfx942")
     with pytest.raises(RuntimeError, match="requires gfx950"):
         iq2r_glm53_moe_out(
@@ -420,6 +454,7 @@ def test_glm53_pack_rejects_codebook_outside_kernel_range(glm53_layer, byte):
                 layer.down_data,
                 aux["down"],
                 intermediate_size=layer.intermediate,
+                shape=layer.shape,
             )
 
 
@@ -446,6 +481,10 @@ def test_glm53_tuned_config():
         for tokens in range(1, MAX_CHUNK_TOKENS + 1):
             for config in (lookup(tokens), _default_config(tokens)):
                 assert _config_problem(config, tokens, intermediate) is None
+        # Every GLM-5.3-Flash token count gets a config it can run.
+        for tokens in range(1, MAX_CHUNK_TOKENS + 1):
+            config = iq2r_glm53_config(tokens, intermediate, GLM5_NEXT)
+            assert _config_problem(config, tokens, intermediate) is None
 
 
 def test_glm53_tuned_table_checks(tmp_path):
