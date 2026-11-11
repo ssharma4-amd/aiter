@@ -2,7 +2,8 @@
 
 `aiter/iq2r_glm53.py` runs the GLM-5.3 routed experts (256 experts, top-8, hidden 6144) from 2-bit IQ2R-v2
 weights on MI355X, at TP4 (`inter_dim` 512) and TP8 (`inter_dim` 256). The shared expert stays FP8 and runs as an
-ordinary MLP next to the MoE.
+ordinary MLP next to the MoE. The same kernels run GLM-5.3-Flash (288 experts, hidden 4096, clamped SwiGLU); see
+[GLM-5.3-Flash](#glm-53-flash) at the end.
 
 IQ2R was developed by the MK1 team at AMD. Its learned codebooks are seeded from the IQ2_XXS grid of
 ggml/llama.cpp (MIT).
@@ -346,6 +347,62 @@ What the numbers say:
 - **The shared expert must stay FP8:** at 2 bits it cost AIME 54, 54 -> 49, 50
   and SWE-bench 29-task 3.
 - **Speed:** see Measurements below.
+
+## GLM-5.3-Flash
+
+GLM-5.3-Flash (`glm5_next`) has 288 routed experts (top-8) and one shared expert, hidden 4096,
+`moe_intermediate_size` 2048 (the same TP4/TP8 shards as GLM-5.3) and a clamped SwiGLU,
+`silu(min(gate, 10)) * clamp(up, -10, 10)`. Its routed experts live in layers 3-44 under
+`model.language_model.`; layer 45 is the MTP layer.
+
+**Kernels.** Every MoE kernel takes a model shape (`Glm5MoeShape` in `csrc/include/iq2r_glm5_shape.h`;
+`GLM53` and `GLM5_NEXT` in `aiter/iq2r_glm53.py`) as a template parameter, so GLM-5.3's kernels compile as
+before (their output is bit-identical). The launchers pick the shape from the weight stacks' expert count or
+the activation width. For Flash:
+- the gate kernels run K = 4096 (32 K tiles, 4 per wave) and the clamp in their SwiGLU epilogue;
+- the down projection's N = 4096 is padded to 4608 rows (96 triplets) so every down tiling divides it;
+  packing appends zero records with zero `d` bytes. Route outputs are `[routes, 4608]`; the reductions and
+  route9 store only the first 4096 columns;
+- the decode sort CTA has 512 threads (one per expert, the invalid bucket at 288).
+
+**Checkpoint.** `compile` writes Flash's routed experts in the canonical IQ2R-v2 byte layout
+(`glm5next-canonical-v2`), which `iq2r_v2_materialize` decodes and which does not depend on the kernels'
+packing; `pack` turns it into the `glm5next-packed-v2` checkpoint ATOM serves; `decode_fp8` turns it back into
+a block-FP8 checkpoint with the source's names, which any FP8 runtime serves (a quick quality check without
+the kernels).
+
+    # calibration: Transformers 5.22+ (glm5_next), the FP8 weights dequantized to BF16 on load
+    python3 -m aiter.quantization.iq2r.glm5.calibrate --model-dir $FLASH_FP8 \
+        --text-file corpus.jsonl --output calibration.pt
+    # 16 processes on 8 GPUs, each on its own layers of 3..44, then one run that writes the checkpoint
+    for p in $(seq 0 15); do
+      HIP_VISIBLE_DEVICES=$((p % 8)) python3 -m aiter.quantization.iq2r.glm5.compile \
+          --model-dir $FLASH_FP8 --output-dir $OUT --calibration-cache calibration.pt \
+          --layers $(seq $((3 + p)) 16 44 | paste -sd,) &
+    done; wait
+    python3 -m aiter.quantization.iq2r.glm5.compile --model-dir $FLASH_FP8 \
+        --output-dir $OUT --calibration-cache calibration.pt
+    python3 -m aiter.quantization.iq2r.glm5.pack --iq2r-dir $OUT --output-dir $OUT-packed
+    python3 -m aiter.quantization.iq2r.glm5.decode_fp8 --iq2r-dir $OUT --output-dir $OUT-fp8   # optional
+
+Calibration took 18 minutes on 8 MI355X over corpus v2 (266,396 tokens): every one of the 12,096 experts was
+reached, 18 by fewer than 256 tokens (they fall back to their weights' column energy). Encoding took 1 h 48 min
+(16 processes on 8 GPUs). The canonical checkpoint is 107 GB (FP8: 328 GB); packing and decoding take about a
+minute each.
+
+**Quality** (ATOM TP4, BF16 KV cache, the rest of the model as stored in every arm). KL vs FP8 on 19,535
+held-out assistant tokens: IQ2R-v2 0.093 (top-1 91.1%), MXFP4 0.044 (93.3%). AIME-60:
+
+| | sampled, 24K thinking budget, 2 passes | median output tokens | greedy, no budget, 32K cap (capped) |
+|---|---|---|---|
+| FP8 | 51, 54 | 8.3K | 47 (13) |
+| MXFP4 A8W4 | 56, 51 | 8.9K | 48 (12) |
+| IQ2R-v2 native | 53, 50 | 17K | 33 (27) |
+| IQ2R-v2 decoded to FP8 | 52, 53 | 17K | 38 (22) |
+
+With a thinking budget IQ2R-v2 is level; it thinks about twice as long, and without a budget it often does not
+stop (in most capped runs the right answer is already in the reasoning, with about twice the "Hmm" rate of
+finished runs), as GLM-5.3's IQ2R-v2 does.
 
 ## Not measured
 
