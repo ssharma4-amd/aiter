@@ -14,6 +14,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 import aiter.quantization.iq2r.glm5.compile as compile_module
+from aiter.iq2r_glm53 import GLM5_NEXT, iq2r_glm53_pack_v2
 from aiter.ops.iq2r_v2 import IQ2R_V2_LEVELS_C4, iq2r_v2_materialize
 from aiter.quantization.iq2r.glm5.compile import (
     CANONICAL_LAYOUT,
@@ -24,6 +25,8 @@ from aiter.quantization.iq2r.glm5.compile import (
     iq2r_glm5_source_keys,
     iq2r_v2_canonical_aux_bytes,
 )
+from aiter.quantization.iq2r.glm5.decode_fp8 import decode_iq2r_to_fp8
+from aiter.quantization.iq2r.glm5.pack import PACKED_LAYOUT, pack_glm5_next
 
 _PREFIX = "model.language_model."
 _HIDDEN = 4096
@@ -162,6 +165,7 @@ def test_compile_writes_canonical_layers_that_decode(
     assert config["text_config"]["hidden_size"] == _HIDDEN
 
     shapes = {"gate_up": (2 * _INTERMEDIATE, _HIDDEN), "down": (_HIDDEN, _INTERMEDIATE)}
+    reference = {}
     for layer in (3, 4):
         for projection, suffix in (("gate_up", "gate-up"), ("down", "down")):
             keys = iq2r_compiled_tensor_keys(
@@ -183,6 +187,7 @@ def test_compile_writes_canonical_layers_that_decode(
                 decoded = iq2r_v2_materialize(
                     data[expert], auxiliary[expert], n, k, IQ2R_V2_LEVELS_C4
                 )
+                reference[layer, expert, projection] = decoded
                 # A 2-bit reconstruction: correlated with the source, scale kept.
                 cosine = torch.nn.functional.cosine_similarity(
                     decoded.flatten(), weight.flatten(), dim=0
@@ -200,6 +205,69 @@ def test_compile_writes_canonical_layers_that_decode(
     assert f"{_PREFIX}layers.4.mlp.shared_experts.up_proj.weight" in names
     assert "model.visual.blocks.0.attn.qkv.weight" in names
     assert (output / "chat_template.jinja").is_file()
+
+    # The block-FP8 decode serves the same 2-bit experts under the source names.
+    decoded_dir = tmp_path / "decoded"
+    assert decode_iq2r_to_fp8(output, decoded_dir, layer_indices=[3]) is None
+    config_path = decode_iq2r_to_fp8(output, decoded_dir)
+    config = json.loads(config_path.read_text())
+    assert config["quantization_config"]["quant_method"] == "fp8"
+    index = json.loads((decoded_dir / "model.safetensors.index.json").read_text())
+    names = set(index["weight_map"])
+    assert not any("iq2r" in name for name in names)
+    for layer in (3, 4):
+        for expert in range(_EXPERTS):
+            keys = iq2r_glm5_source_keys(layer, expert, _PREFIX)
+            matrices = {}
+            for projection in ("gate_proj", "up_proj", "down_proj"):
+                shard = index["weight_map"][keys[f"{projection}_weight"]]
+                with safe_open(decoded_dir / shard, "pt") as handle:
+                    values = handle.get_tensor(keys[f"{projection}_weight"])
+                    scale = handle.get_tensor(keys[f"{projection}_weight_scale_inv"])
+                assert values.dtype == torch.float8_e4m3fn
+                assert scale.dtype == torch.float32
+                n, k = values.shape
+                matrices[projection] = (
+                    values.float().reshape(n // 128, 128, k // 128, 128)
+                    * scale[:, None, :, None]
+                ).reshape(n, k)
+            for projection, expected in (
+                ("gate_proj", reference[layer, expert, "gate_up"][0::2]),
+                ("up_proj", reference[layer, expert, "gate_up"][1::2]),
+                ("down_proj", reference[layer, expert, "down"]),
+            ):
+                expected = expected.cpu()
+                error = (matrices[projection] - expected).norm() / expected.norm()
+                assert error < 0.05, (layer, expert, projection, float(error))
+
+    # The packed checkpoint holds the kernels' layout of the same layers under
+    # GLM-5.3's packed tensor names.
+    packed_dir = tmp_path / "packed"
+    config = json.loads(pack_glm5_next(output, packed_dir).read_text())
+    assert config["quantization_config"]["iq2r_layout"] == PACKED_LAYOUT
+    index = json.loads((packed_dir / "model.safetensors.index.json").read_text())
+    for layer in (3, 4):
+        canonical = []
+        for projection, suffix in (("gate_up", "gate-up"), ("down", "down")):
+            keys = iq2r_compiled_tensor_keys(
+                layer, projection, CANONICAL_LAYOUT, _PREFIX
+            )
+            path = output / f"iq2r-layer-{layer:04d}-{suffix}.safetensors"
+            with safe_open(path, "pt") as handle:
+                canonical += [handle.get_tensor(keys[k]).cuda() for k in keys]
+        expected = iq2r_glm53_pack_v2(
+            *canonical, intermediate_size=_INTERMEDIATE, shape=GLM5_NEXT
+        )
+        for projection, values in (("gate_up", expected[:2]), ("down", expected[2:])):
+            keys = iq2r_compiled_tensor_keys(layer, projection, prefix=_PREFIX)
+            assert keys["data"] not in names and keys["data"] in index["weight_map"]
+            with safe_open(packed_dir / index["weight_map"][keys["data"]], "pt") as f:
+                assert f.metadata()["iq2r_layout"] == PACKED_LAYOUT
+                assert torch.equal(f.get_tensor(keys["data"]), values[0].cpu())
+                assert torch.equal(f.get_tensor(keys["auxiliary"]), values[1].cpu())
+                assert f.get_tensor(keys["tile_n"]).tolist() == [128]
+    assert not any("iq2r_gate_up_data" in name for name in index["weight_map"])
+    assert f"{_PREFIX}layers.4.mlp.shared_experts.up_proj.weight" in index["weight_map"]
 
 
 if __name__ == "__main__":
