@@ -309,6 +309,15 @@ inputs: 2-5K calibration tokens per expert are too few for a 6,144-dimension
 Hessian. These would move full-model KL from about 0.090 to 0.077-0.085,
 against MXFP4's 0.034.
 
+LDLQ revisited (2026-11-16, study format v2-B-rw on corpus v2, decode-to-FP8; not yet in this code; see
+[iq2r_v2_ldlq_handoff.md](iq2r_v2_ldlq_handoff.md)). With one **layer-level** Hessian per MoE layer (all
+experts share the gate/up input, so it is estimated from every token rather than 2-5K per expert), strong
+damping (1.0) and a stop/act decision-position bucket (beta 1):
+- Held-out output error on gate/up drops to 0.55-0.76x of the normal encoder; MXFP4 is 0.16x.
+- Full-model re-encode, scored on AIME-60: 55, 55 vs 53, 54 without LDLQ. Median output tokens fall from ~23.8K to
+  ~15.8K (MXFP4 ~13K). Runs that ran out of the 24K thinking budget fall from 29 to 22.5 per 60.
+- Terminal-Bench, 3 hard tasks x 3 attempts: 4/9 vs 4/9. Still behind MXFP4 on hard agentic tasks.
+
 `op_tests/test_iq2r_glm53_v2.py` checks the IQ2R-v2 MoE against a dense
 reference at both TP widths, checks that TP slicing commutes with packing,
 and (`python3 op_tests/test_iq2r_glm53_v2.py`) times IQ2R against IQ2R-v2.
