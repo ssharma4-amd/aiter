@@ -314,9 +314,10 @@ LDLQ revisited (2026-11-16, study format v2-B-rw on corpus v2, decode-to-FP8; no
 experts share the gate/up input, so it is estimated from every token rather than 2-5K per expert), strong
 damping (1.0) and a stop/act decision-position bucket (beta 1):
 - Held-out output error on gate/up drops to 0.55-0.76x of the normal encoder; MXFP4 is 0.16x.
-- Full-model re-encode, scored on AIME-60: 55, 55 vs 53, 54 without LDLQ. Median output tokens fall from ~23.8K to
-  ~15.8K (MXFP4 ~13K). Runs that ran out of the 24K thinking budget fall from 29 to 22.5 per 60.
-- Terminal-Bench, 3 hard tasks x 3 attempts: 4/9 vs 4/9. Still behind MXFP4 on hard agentic tasks.
+- Full-model re-encode, scored on AIME-60 (4 passes): 55, 55, 55, 54 vs 53, 54 without LDLQ. Median output tokens
+  fall from ~23.8K to ~17.2K, against ~12.0K for MXFP4 in the same TP4 setup (54, 58): about half of the extra
+  thinking removed.
+- Terminal-Bench, 3 hard tasks: LDLQ 7/16 over two rounds vs MXFP4 13/15. Still behind MXFP4 on hard agentic tasks.
 
 `op_tests/test_iq2r_glm53_v2.py` checks the IQ2R-v2 MoE against a dense
 reference at both TP widths, checks that TP slicing commutes with packing,

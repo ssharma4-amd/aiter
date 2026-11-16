@@ -44,10 +44,13 @@ Full model, re-encoded with the layer-level H + decision bucket (beta 1, damping
 |---|---|---|---|---|
 | base (same format, no LDLQ) | 53, 54 | 30, 28 | 23.9K, 23.6K | 4/9 |
 | **LDLQ** | **55, 55** | **23, 22** | **15.9K, 15.8K** | 4/9 (+1 setup error) |
-| MXFP4 (earlier runs, TP8) | 55, 55, 55, 54 | 16-21 | ~12-14K | (6/6 in the full runs; 3x3 run pending) |
+| LDLQ, second round (same store) | 55, 54 | 26, 20 | 18.4K, 18.6K | 3/8 (+1 setup error) |
+| **MXFP4, same TP4 setup, same day** | **54, 58** | **20, 18** | **10.3K, 13.6K** | **7/9** (13/15 incl. earlier runs) |
 
-- LDLQ removes about 3/4 of the extra thinking (1.83x MXFP4's tokens -> 1.22x) and matches MXFP4's accuracy.
-- The 3 Terminal-Bench tasks are not yet solved like MXFP4 solves them. **Agentic parity is not reached.**
+- Against MXFP4 measured in the same setup (~12.0K median tokens), LDLQ (4 passes, ~17.2K) removes about half of the
+  2-bit model's extra thinking (1.98x -> 1.43x MXFP4). AIME accuracy is close (54.75 vs 56 average).
+- The 3 Terminal-Bench tasks: LDLQ 7/16 over two rounds vs MXFP4 13/15. cobol-modernization improves (base 0/10 -> 3/6;
+  it now commits to writing the solution); write-compressor is LDLQ 0/4 vs MXFP4 4/5. **Agentic parity is not reached.**
 
 ## How to port it into this recipe
 
