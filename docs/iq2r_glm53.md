@@ -348,6 +348,23 @@ What the numbers say:
   and SWE-bench 29-task 3.
 - **Speed:** see Measurements below.
 
+LDLQ revisited (2026-11-16, study format v2-B-rw on corpus v2, decode-to-FP8; not yet in this code; see
+[iq2r_v2_ldlq_handoff.md](iq2r_v2_ldlq_handoff.md)). With one **layer-level** Hessian per MoE layer (all
+experts share the gate/up input, so it is estimated from every token rather than 2-5K per expert), strong
+damping (1.0) and a stop/act decision-position bucket (beta 1):
+- Held-out output error on gate/up drops to 0.55-0.76x of the normal encoder; MXFP4 is 0.16x.
+- Full-model re-encode, scored on AIME-60 (4 passes): 55, 55, 55, 54 vs 53, 54 without LDLQ. Median output tokens
+  fall from ~23.8K to ~17.2K, against ~12.0K for MXFP4 in the same TP4 setup (54, 58): about half of the extra
+  thinking removed.
+- Terminal-Bench, 3 hard tasks: LDLQ 7/16 over two rounds vs MXFP4 13/15. Still behind MXFP4 on hard agentic tasks.
+
+Recipe v3 (2026-11-17, study format, decode-to-FP8; not yet in this code; see
+[iq2r_v2_recipe_v3_handoff.md](iq2r_v2_recipe_v3_handoff.md)): a 1,024-entry learned codebook (10-bit index,
++0.125 b/w, scales unchanged) + LDLQ on gate/up with a decision bucket from a separate 4,972-position decision corpus
+(beta 1). Terminal-Bench 3 hard tasks 8/9 in the first run (LDLQ 2/8 in the same paired run, 9/24 over all runs; MXFP4 13/15),
+AIME-60 55, 56 at 14.5K / 15.7K median tokens. Finer per-32 or per-8 scales gave less per bit than the larger
+codebook. Same-day paired runs against MXFP4 later did not confirm the 8/9: v3 18/29 vs MXFP4 29/36 on those tasks.
+
 ## GLM-5.3-Flash
 
 GLM-5.3-Flash (`glm5_next`) has 288 routed experts (top-8) and one shared expert, hidden 4096,
