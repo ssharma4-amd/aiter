@@ -113,16 +113,43 @@ Caveat: the codebook and the decision corpus were changed together, so their con
 ## Porting to the shipped format
 
 The shipped format (`aiter/ops/iq2r_v2.py`) keeps its scales: E8M0 `d` per row and 256 inputs, a 4-bit level per 32
-weights selecting one of four pre-scaled codebook copies, and FP32 gains. The changes:
+weights selecting one of four pre-scaled codebook copies, and FP32 gains.
 
-- **Codebook:** 1,024 entries instead of 512, seeded with the four quarter-octave grid copies above. Check that the
-  learned entries times the copy multipliers stay inside `IQ2R_V2_CODEBOOK_MIN_BYTE..MAX_BYTE`. Note that the learned
-  book uses smaller magnitudes than the 512 book.
+**The shipped scaling is the right base, and the 1,024 gain carries over to it (measured 2026-11-17).** Same 27
+matrices and importance as the format screen. Each format learns its own codebook per matrix with its own learner; no
+LDLQ. Held-out output error after the 0.98 gain, as a ratio to today's shipped format (c4e4q, 512 entries):
+
+| Scaling | Codebook | b/w | Error ratio | LDS per gate/up codebook |
+|---|---|---|---|---|
+| shipped c4e4q (today) | 512 | 2.28 | 1.000 | 16 KiB |
+| study (FP16 `d`, `d*(2*ls+1)`) | 512 | 2.31 | 1.001 | - |
+| shipped c8e2 | 512 | 2.28 | 0.978 | 32 KiB |
+| study (FP16 `d`, `d*(2*ls+1)`) | 1,024 | 2.44 | 0.839 | - |
+| **shipped c4e4q** | **1,024** | **2.41** | **0.822** | **32 KiB** |
+| shipped c8e2 | 1,024 | 2.41 | 0.802 | 64 KiB |
+
+- The study format's FP16 `d` and odd multipliers give no gain over the shipped scaling at 512 entries, and cost
+  0.03 b/w more.
+- With 1,024 entries the shipped c4e4q scaling is slightly better than the study format, at lower b/w. Port the
+  codebook size, not the study scales.
+- The shipped learner was seeded with the IQ2_XXS grid x 2^(j/4), j = 0..3 (native units).
+- Tool: `EXP/targeted-error-20261111/tools/scale_compare.py --book1024`. It loads `aiter/ops/iq2r_v2.py` from this
+  branch and swaps only `iq2r_v2_seed_codebook`.
+
+The changes:
+
+- **Codebook:** 1,024 entries instead of 512.
+  - `iq2r_v2_learn_codebook` already works with any codebook size; only `iq2r_v2_seed_codebook` (512) and the
+    512-specific constants (`IQ2R_CODEBOOK_ENTRIES`, the format name, the auxiliary layout) need to change.
+  - Seed: the IQ2_XXS grid at 2^(j/4), j = 0..3.
+  - Check that the learned entries times the copy multipliers stay inside `IQ2R_V2_CODEBOOK_MIN_BYTE..MAX_BYTE`.
 - **Records:** 10-bit indices. Each 8-weight vector grows by 1 bit (+0.125 b/w). The study format's packing
   (`v2_codec10.py`: `[fp16 d | 8 x 4-bit ls | 32 x 10-bit indices LSB-first | 32 sign bytes]`, 78 bytes per 256
   weights) is only a reference; the native record layout is the kernel owner's choice.
-- **Kernels:** the LDS codebook doubles (four copies x 1,024 x 8 E4M3 = 32 KiB per gate/up pair instead of 16 KiB),
-  and the index unpack moves from 9 to 10 bits. The MFMA stream and scale handling are unchanged.
+- **Kernels:**
+  - the LDS codebook doubles: four copies x 1,024 x 8 E4M3 = 32 KiB per gate/up codebook instead of 16 KiB;
+  - the index unpack moves from 9 to 10 bits;
+  - the MFMA stream and scale handling (E8M0 `d`, level exponent, class -> copy) are unchanged.
 - **Calibrate:**
   - the layer-level `H_all` (LDLQ handoff, step 1);
   - a `H_decision` capture over the decision corpus described above (~11 GB at fp32 for 75 layers).
@@ -145,5 +172,6 @@ weights selecting one of four pre-scaled codebook copies, and FP32 gains. The ch
 | 10-bit packing / decode, tests | `tools/v2_codec10.py`, `tools/v2_on_atom10/`, `tools/test_codec10.py` |
 | Decision corpus capture | `tools/decision_corpus_capture.py` (output `/models/zai-org/glm53-te-hess-dec`) |
 | Held-out checks | `tools/v3_screen.py`, `tools/deccorpus_check.py` |
+| Study vs shipped scaling, 1,024 entries in the shipped format | `tools/scale_compare.py` (`--book1024`) |
 | Paired evaluation | `tools/run_eval_pair.sh`, `tools/tb2_tally.py` |
 | Store | `/models/zai-org/GLM-5.3-IQ2Rv2-te-s3ldlq-dec` |
