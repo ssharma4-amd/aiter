@@ -5,7 +5,8 @@ builds on [iq2r_v2_ldlq_handoff.md](iq2r_v2_ldlq_handoff.md), which covers LDLQ 
 write-up is in the research repo: `research/glm53-2bit-quantization/08_targeted_error_reduction/`
 (`PLAN_V3_SCALES_AND_DECISION_CORPUS.md` for this step, `PLAN.md` for the whole study).
 
-This is the first 2-bit recipe that solves the three hard Terminal-Bench 2.0 tasks at close to MXFP4's rate.
+This is the best 2-bit recipe so far on the three hard Terminal-Bench 2.0 tasks, but it does not match MXFP4 there
+(same-day runs: 18/29 vs MXFP4 29/36). It matches MXFP4 on AIME.
 
 ## Recipe (three changes over the LDLQ handoff)
 
@@ -75,7 +76,18 @@ budget proxy 16K/4K. TB2 is Harbor terminus-2 at T 0.95 with leaderboard timeout
 | MXFP4 A8W4 | 4.25 | 5/5 | 4/5 | 4/5 | 13/15 | 54, 58 | ~12K |
 
 - The v3 and LDLQ rows marked 55, 56 were a paired run on the same day (LDLQ scored 2/8 on TB2 in that pair).
-- The v3 store is 207 GiB of routed experts.
+- The v3 store is 207 GiB of routed experts (2.44 b/w). The rest of the model stays FP8 (19.6 GiB, incl. the
+  2.7 GiB shared expert), ~227 GiB in total, vs 684 GiB of FP8 routed experts in the source checkpoint.
+- **Correction (same day, later runs):** the 8/9 was not confirmed. Paired with MXFP4 on the same day, same settings:
+  round 1 v3 4/8 vs MXFP4 12/15; round 2 4/6 vs 4/6; a clean run 10/15 vs 13/15. In total, **v3 18/29 (62%) vs MXFP4
+  29/36 (81%)**. One run of this 3-task x 5 gate swings by about +-4: MXFP4 scored 13/15 and 9/15 in two identical clean
+  runs.
+- Analysis (`08_targeted_error_reduction/ANALYSIS_DECISION_VS_GENERAL.md`):
+  - v3's teacher-forced KL vs FP8 is 1.7x MXFP4's.
+  - Its extra failures are late or missing solution writes.
+  - Serving by decode-to-FP8 is 13% slower than MXFP4.
+  - A `</think>` logit offset did not change its thinking length or help.
+  - The remaining gap is general 2-bit error plus serving speed.
 - Caveats: 3 trials per task, and the codebook and decision corpus were changed together, so the gain is not yet
   attributed. Next: a same-day paired run against MXFP4 (3 tasks x 5), then the two changes one at a time.
 

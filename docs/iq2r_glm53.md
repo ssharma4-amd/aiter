@@ -322,9 +322,9 @@ damping (1.0) and a stop/act decision-position bucket (beta 1):
 Recipe v3 (2026-11-17, study format, decode-to-FP8; not yet in this code; see
 [iq2r_v2_recipe_v3_handoff.md](iq2r_v2_recipe_v3_handoff.md)): a 1,024-entry learned codebook (10-bit index,
 +0.125 b/w, scales unchanged) + LDLQ on gate/up with a decision bucket from a separate 4,972-position decision corpus
-(beta 1). Terminal-Bench 3 hard tasks 8/9 (LDLQ 2/8 in the same paired run, 9/24 over all runs; MXFP4 13/15),
+(beta 1). Terminal-Bench 3 hard tasks 8/9 in the first run (LDLQ 2/8 in the same paired run, 9/24 over all runs; MXFP4 13/15),
 AIME-60 55, 56 at 14.5K / 15.7K median tokens. Finer per-32 or per-8 scales gave less per bit than the larger
-codebook. Confirmation against MXFP4 on the same day is pending.
+codebook. Same-day paired runs against MXFP4 later did not confirm the 8/9: v3 18/29 vs MXFP4 29/36 on those tasks.
 
 `op_tests/test_iq2r_glm53_v2.py` checks the IQ2R-v2 MoE against a dense
 reference at both TP widths, checks that TP slicing commutes with packing,

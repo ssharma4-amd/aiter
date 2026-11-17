@@ -98,7 +98,7 @@ Do not capture the Hessians on evaluation text: corpus v2 only, so TB2 / SWE / A
 ## Open: why the 2-bit model still loses the hard agentic tasks
 
 Update 2026-11-17: recipe v3 ([iq2r_v2_recipe_v3_handoff.md](iq2r_v2_recipe_v3_handoff.md)) adds a 1,024-entry
-codebook and a larger decision corpus to this LDLQ setup and scores 8/9 on these three tasks.
+codebook and a larger decision corpus to this LDLQ setup: 18/29 on these three tasks in same-day runs vs MXFP4 29/36.
 
 This is the current priority, ahead of the port. MXFP4 solves the three Terminal-Bench tasks (cobol-modernization,
 write-compressor, torch-tensor-parallelism) that the 2-bit model, with or without LDLQ, mostly times out on.
