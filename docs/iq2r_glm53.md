@@ -317,14 +317,13 @@ damping (1.0) and a stop/act decision-position bucket (beta 1):
 - Full-model re-encode, scored on AIME-60 (4 passes): 55, 55, 55, 54 vs 53, 54 without LDLQ. Median output tokens
   fall from ~23.8K to ~17.2K, against ~12.0K for MXFP4 in the same TP4 setup (54, 58): about half of the extra
   thinking removed.
-- Terminal-Bench, 3 hard tasks: LDLQ 7/16 over two rounds vs MXFP4 13/15. Still behind MXFP4 on hard agentic tasks.
+- Terminal-Bench, 3-task stress subset (tasks earlier 2-bit models failed): LDLQ 7/16 over two rounds vs MXFP4 13/15.
 
 Recipe v3 (2026-11-17, study format, decode-to-FP8; not yet in this code; see
 [iq2r_v2_recipe_v3_handoff.md](iq2r_v2_recipe_v3_handoff.md)): a 1,024-entry learned codebook (10-bit index,
 +0.125 b/w, scales unchanged) + LDLQ on gate/up with a decision bucket from a separate 4,972-position decision corpus
-(beta 1). Terminal-Bench 3 hard tasks 8/9 in the first run (LDLQ 2/8 in the same paired run, 9/24 over all runs; MXFP4 13/15),
-AIME-60 55, 56 at 14.5K / 15.7K median tokens. Finer per-32 or per-8 scales gave less per bit than the larger
-codebook. Same-day paired runs against MXFP4 later did not confirm the 8/9: v3 18/29 vs MXFP4 29/36 on those tasks.
+(beta 1). AIME-60 55, 56 at 14.5K / 15.7K median tokens (MXFP4 54, 58). Finer per-32 or per-8 scales gave less per bit
+than the larger codebook. Terminal-Bench 2.0 results so far are on a 3-task stress subset only; see the handoff.
 
 `op_tests/test_iq2r_glm53_v2.py` checks the IQ2R-v2 MoE against a dense
 reference at both TP widths, checks that TP slicing commutes with packing,

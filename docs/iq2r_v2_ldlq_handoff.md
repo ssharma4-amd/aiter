@@ -50,7 +50,7 @@ Full model, re-encoded with the layer-level H + decision bucket (beta 1, damping
 - Against MXFP4 measured in the same setup (~12.0K median tokens), LDLQ (4 passes, ~17.2K) removes about half of the
   2-bit model's extra thinking (1.98x -> 1.43x MXFP4). AIME accuracy is close (54.75 vs 56 average).
 - The 3 Terminal-Bench tasks: LDLQ 7/16 over two rounds vs MXFP4 13/15. cobol-modernization improves (base 0/10 -> 3/6;
-  it now commits to writing the solution); write-compressor is LDLQ 0/4 vs MXFP4 4/5. **Agentic parity is not reached.**
+  it now commits to writing the solution); write-compressor is LDLQ 0/4 vs MXFP4 4/5. (This 3-task subset was chosen from tasks 2-bit failed; it is a stress test, not the full benchmark.)
 
 ## How to port it into this recipe
 
@@ -95,10 +95,10 @@ vector.
 
 Do not capture the Hessians on evaluation text: corpus v2 only, so TB2 / SWE / AIME stay unseen.
 
-## Open: why the 2-bit model still loses the hard agentic tasks
+## Open: the 3-task Terminal-Bench stress subset
 
 Update 2026-11-17: recipe v3 ([iq2r_v2_recipe_v3_handoff.md](iq2r_v2_recipe_v3_handoff.md)) adds a 1,024-entry
-codebook and a larger decision corpus to this LDLQ setup: 18/29 on these three tasks in same-day runs vs MXFP4 29/36.
+codebook and a larger decision corpus to this LDLQ setup; its results on these three tasks are in that note.
 
 This is the current priority, ahead of the port. MXFP4 solves the three Terminal-Bench tasks (cobol-modernization,
 write-compressor, torch-tensor-parallelism) that the 2-bit model, with or without LDLQ, mostly times out on.

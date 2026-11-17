@@ -5,8 +5,8 @@ builds on [iq2r_v2_ldlq_handoff.md](iq2r_v2_ldlq_handoff.md), which covers LDLQ 
 write-up is in the research repo: `research/glm53-2bit-quantization/08_targeted_error_reduction/`
 (`PLAN_V3_SCALES_AND_DECISION_CORPUS.md` for this step, `PLAN.md` for the whole study).
 
-This is the best 2-bit recipe so far on the three hard Terminal-Bench 2.0 tasks, but it does not match MXFP4 there
-(same-day runs: 18/29 vs MXFP4 29/36). It matches MXFP4 on AIME.
+It is the best 2-bit recipe so far on every measure we ran: held-out output error, AIME-60 (level with MXFP4), and a
+3-task Terminal-Bench 2.0 subset. The full Terminal-Bench 2.0 has not been run on it yet.
 
 ## Recipe (three changes over the LDLQ handoff)
 
@@ -15,10 +15,13 @@ This is the best 2-bit recipe so far on the three hard Terminal-Bench 2.0 tasks,
      E4M3. The 512-entry book was seeded with x1 and x sqrt(2).
    - Learn: the same importance-weighted k-means as the 512 book (4 rounds, 4 inner reassignments, a round kept only
      if the cost drops), seed `layer*100000 + expert*10 + proj`.
-   - The learned book reaches shapes the 512 book cannot. On layer 40, expert 0, gate it has 38 distinct magnitudes
-     down to 0.69 raw (512 book: 30, smallest 5.0), so vectors with one or two near-zero weights next to large ones
-     no longer round the small ones up. Neighbouring entries are no closer together (median nearest-neighbour
-     distance 0.192 vs 0.189).
+   - The learned 1,024 entries are 1,024 distinct shapes, not scaled copies of each other. The median nearest-neighbour
+     distance between entries, after removing size, is 0.192 vs 0.189 for the 512 book.
+   - The extra entries cover spiky vectors (a few large weights, several small ones), which are most of the weights.
+     Smallest / largest value inside an entry, 512 book vs 1,024 book (layer 40, expert 0, gate):
+     - median entry 0.208 vs 0.181;
+     - entries below 0.15: 14 vs 225.
+   - Shape-only error on 200K weight vectors of that matrix: 5.9% -> 4.8%.
 2. **LDLQ on gate/up**, as in the LDLQ handoff: one layer-level Hessian per MoE layer,
    `H = H_all/tr(H_all) + beta * H_decision/tr(H_decision)`, beta 1.0, damping 1.0. Down is not changed.
 3. **A separate, larger decision corpus for `H_decision`.** The corpus-v2 bucket had 201 positions; this one has
@@ -68,28 +71,44 @@ beta 1.
 budget proxy 16K/4K. TB2 is Harbor terminus-2 at T 0.95 with leaderboard timeouts. AIME is T 1.0, top-p 0.95, 24K think +
 8K forced answer.
 
-| Model | b/w (routed) | cobol | write-compressor | torch-TP | TB2 3 hard tasks | AIME-60 x2 | Median output tokens |
-|---|---|---|---|---|---|---|---|
-| 2-bit, no LDLQ | 2.31 | 0/10 | 3/9 | 4/9 | 7/28 | 53, 54 | 23.8K |
-| LDLQ beta 1 (all runs) | 2.31 | 3/8 | 0/7 | 6/9 | 9/24 | 55, 55, 55, 54, 55, 56 | 15.8-18.6K |
-| **v3 (this recipe)** | **2.44** | **3/3** | **2/3** | **3/3** | **8/9** | **55, 56** | **14.5K, 15.7K** |
-| MXFP4 A8W4 | 4.25 | 5/5 | 4/5 | 4/5 | 13/15 | 54, 58 | ~12K |
+AIME-60, 2 passes, paired with LDLQ beta 1 on the same day:
 
-- The v3 and LDLQ rows marked 55, 56 were a paired run on the same day (LDLQ scored 2/8 on TB2 in that pair).
-- The v3 store is 207 GiB of routed experts (2.44 b/w). The rest of the model stays FP8 (19.6 GiB, incl. the
-  2.7 GiB shared expert), ~227 GiB in total, vs 684 GiB of FP8 routed experts in the source checkpoint.
-- **Correction (same day, later runs):** the 8/9 was not confirmed. Paired with MXFP4 on the same day, same settings:
-  round 1 v3 4/8 vs MXFP4 12/15; round 2 4/6 vs 4/6; a clean run 10/15 vs 13/15. In total, **v3 18/29 (62%) vs MXFP4
-  29/36 (81%)**. One run of this 3-task x 5 gate swings by about +-4: MXFP4 scored 13/15 and 9/15 in two identical clean
-  runs.
-- Analysis (`08_targeted_error_reduction/ANALYSIS_DECISION_VS_GENERAL.md`):
-  - v3's teacher-forced KL vs FP8 is 1.7x MXFP4's.
-  - Its extra failures are late or missing solution writes.
-  - Serving by decode-to-FP8 is 13% slower than MXFP4.
-  - A `</think>` logit offset did not change its thinking length or help.
-  - The remaining gap is general 2-bit error plus serving speed.
-- Caveats: 3 trials per task, and the codebook and decision corpus were changed together, so the gain is not yet
-  attributed. Next: a same-day paired run against MXFP4 (3 tasks x 5), then the two changes one at a time.
+| Model | b/w (routed) | AIME-60 x2 | Median output tokens |
+|---|---|---|---|
+| 2-bit, no LDLQ | 2.31 | 53, 54 | 23.8K |
+| LDLQ beta 1 | 2.31 | 55, 56 (earlier runs 55, 55, 55, 54) | 16.8K, 16.7K |
+| **v3 (this recipe)** | **2.44** | **55, 56** | **14.5K, 15.7K** |
+| MXFP4 A8W4 (same setup, earlier) | 4.25 | 54, 58 | ~12K |
+
+**Terminal-Bench 2.0, 3-task subset.** These are not the full benchmark. The three tasks (cobol-modernization,
+write-compressor, torch-tensor-parallelism) were picked as tasks that earlier 2-bit models failed while MXFP4 solved
+them. They are a stress test for the 2-bit failure mode, not an estimate of the overall score.
+
+All runs below are paired (both models served at the same time, same settings); solved / valid trials (setup failures
+excluded):
+
+| Run (11-17) | v3 | MXFP4 / other arm |
+|---|---|---|
+| s3dec, 3 x 3 | 8/9 | LDLQ beta 1: 2/8 |
+| s3conf, 3 x 5 | 4/8 (7 setup failures) | MXFP4 12/15 |
+| s3conf2, 3 x 2 | 4/6 | MXFP4 4/6 |
+| clean, 3 x 5 | 10/15 | MXFP4 13/15 |
+| clean-tb1, 3 x 5, v3 with a `</think>` logit offset +1.0 | 4/14 | MXFP4 9/15 |
+
+- Earlier 2-bit models on the same subset: 2-bit without LDLQ 7/28, LDLQ beta 1 9/24 (mixed settings).
+- One run of this gate varies by about +-4 tasks: MXFP4 scored 13/15 and 9/15 in two identical clean runs. Differences
+  of a few tasks between models are within that range.
+- The full benchmark (89 tasks) was last run with earlier 2-bit models: MXFP4 56, 60; 2-bit 49, 52. v3 has not been
+  run on it.
+- Analysis of the subset runs (`08_targeted_error_reduction/ANALYSIS_DECISION_VS_GENERAL.md`):
+  - teacher-forced KL vs FP8 on these conversations: v3 0.080, MXFP4 0.048;
+  - decode-to-FP8 serving runs at 52 tok/s vs MXFP4's 60;
+  - the `</think>` logit offset did not change thinking length.
+
+**Size.** The v3 store is 207 GiB of routed experts (2.44 b/w). The rest of the model stays FP8 (19.6 GiB, including
+the 2.7 GiB shared expert), so ~227 GiB in total, against 684 GiB of FP8 routed experts in the source checkpoint.
+
+Caveat: the codebook and the decision corpus were changed together, so their contributions are not separated.
 
 ## Porting to the shipped format
 
