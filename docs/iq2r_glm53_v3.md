@@ -57,37 +57,55 @@ Where the time goes (torch profiler, eager, rotated weights; µs per call):
 (Down above M4 is the down GEMM plus the route reduction; prefill sort is
 quantize plus sort.)
 
-## Serving baseline: native IQ2R-v2 against MXFP4, TP4
+## Serving baseline: native IQ2R-v2 against MXFP4, standard kernels
 
 ATOM `benchmark_serving`, random prompts, 1024 input and 1024 output tokens
 (`--random-range-ratio 1`, `--ignore-eos`), 10 x concurrency prompts after
-2 x concurrency warmups. One server at a time on GPUs 4-7, TP4, FP8 KV cache,
+2 x concurrency warmups. One server at a time, FP8 KV cache,
 `--max-model-len 262144`, `--max-num-seqs 256`, CUDA graphs for batch 1-256,
-non-expert layers PTPC FP8 in both arms.
+non-expert layers PTPC FP8 in both arms. Standard kernels only: ATOM's GLM
+MonoKernel (a fused decode for batch 1-2 that only supports MXFP4 experts) is
+off (`ATOM_MONO_ENABLE=0`); IQ2R-v2 never uses it.
 
 - IQ2R-v2: `GLM-5.3-IQ2Rv2-final`, native kernels, shared expert block FP8 as stored.
 - MXFP4: the `GLM-5.3` FP8 checkpoint with routed and shared experts quantized to
-  MXFP4 at load, **A4W4** (FP4 activations); ATOM's GLM MonoKernel decode is on (the default).
+  MXFP4 at load, **A4W4** (FP4 activations).
 
-Output tokens/s (mean TPOT, mean TTFT):
+TP4 (GPUs 4-7), output tokens/s (mean TPOT, mean TTFT):
 
 | Concurrency | MXFP4 | IQ2R-v2 | IQ2R-v2 / MXFP4 |
 |---|---|---|---|
-| 1 | 162 (6.1 ms, 0.10 s) | 80 (12.5 ms, 0.11 s) | 0.49 |
-| 2 | 295 (6.6 ms, 0.21 s) | 150 (12.6 ms, 0.78 s) | 0.51 |
-| 4 | 299 (11.7 ms, 1.74 s) | 288 (13.2 ms, 0.72 s) | 0.96 |
-| 8 | 562 (13.1 ms, 1.21 s) | 496 (15.1 ms, 1.09 s) | 0.88 |
+| 1 | 88 (11.3 ms, 0.10 s) | 80 (12.5 ms, 0.11 s) | 0.91 |
+| 2 | 181 (10.9 ms, 0.16 s) | 150 (12.6 ms, 0.78 s) | 0.83 |
+| 4 | 318 (11.8 ms, 0.87 s) | 288 (13.2 ms, 0.72 s) | 0.91 |
+| 8 | 530 (13.1 ms, 2.04 s) | 496 (15.1 ms, 1.09 s) | 0.93 |
 | 16 | 974 (15.8 ms, 0.65 s) | 910 (16.8 ms, 0.83 s) | 0.93 |
 | 32 | 1627 (19.1 ms, 0.60 s) | 1510 (20.3 ms, 0.90 s) | 0.93 |
 | 64 | 2504 (24.7 ms, 0.93 s) | 2372 (25.9 ms, 1.16 s) | 0.95 |
 | 128 | 3859 (31.6 ms, 1.63 s) | 3650 (33.0 ms, 2.11 s) | 0.95 |
 | 256 | 5784 (40.8 ms, 3.61 s) | 5495 (43.0 ms, 3.73 s) | 0.95 |
 
-- At concurrency 1-2 MXFP4 runs the MonoKernel (a fused small-batch decode for
-  MXFP4 experts) and is twice as fast; IQ2R-v2 runs the per-layer path.
-- From concurrency 4 up, IQ2R-v2 is 4-12% behind MXFP4 on this host and stack.
+TP8 (GPUs 0-7):
+
+| Concurrency | MXFP4 | IQ2R-v2 | IQ2R-v2 / MXFP4 |
+|---|---|---|---|
+| 1 | 87 (11.3 ms, 0.10 s) | 79 (12.6 ms, 0.11 s) | 0.90 |
+| 2 | 171 (11.6 ms, 0.17 s) | 148 (12.6 ms, 0.95 s) | 0.87 |
+| 4 | 328 (11.2 ms, 1.02 s) | 294 (12.8 ms, 0.85 s) | 0.90 |
+| 8 | 605 (12.2 ms, 1.07 s) | 536 (13.9 ms, 1.08 s) | 0.89 |
+| 16 | 1160 (13.2 ms, 0.64 s) | 1021 (15.0 ms, 0.74 s) | 0.88 |
+| 32 | 2055 (15.2 ms, 0.42 s) | 1851 (16.8 ms, 0.51 s) | 0.90 |
+| 64 | 3062 (19.3 ms, 1.67 s) | 3034 (20.4 ms, 0.77 s) | 0.99 |
+| 128 | 5236 (23.4 ms, 1.07 s) | 4807 (25.4 ms, 1.29 s) | 0.92 |
+| 256 | 7950 (30.3 ms, 1.97 s) | 7455 (32.0 ms, 2.37 s) | 0.94 |
+
+- IQ2R-v2 is 5-17% behind MXFP4 at TP4 on this host and stack.
+- At TP8 it is 6-13% behind (1% at concurrency 64, where the MXFP4 run had a slow
+  first-token time).
 - The MoE is about 37% of IQ2R-v2's TPOT at concurrency 16 (84 µs x 75 layers of
   16.8 ms), so each 1% of MoE time is about 0.4% of decode throughput.
+- MXFP4 with the MonoKernel on (the ATOM default) gives 162 and 295 tokens/s
+  at concurrency 1 and 2; above that the MonoKernel is not used.
 
 ## On-chip memory with a 1,024-entry codebook
 
