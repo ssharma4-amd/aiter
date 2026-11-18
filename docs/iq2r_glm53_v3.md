@@ -255,3 +255,118 @@ ATOM (`Iq2rMoEMethod`) reads the codebook size from `iq2r_layout`
 and checks the buffers accordingly; the AITER kernels pick their instantiation
 from the packed sizes. Serve as a v2 checkpoint (the shared expert stays block
 FP8: exclude `*.mlp.shared_experts*` from online quantization).
+
+## Results (phase 2 and 3)
+
+**Correctness.** `op_tests/test_iq2r_glm53.py` (202 passed: every MoE test on 512- and
+1,024-entry layers, every down kernel bit-exact), `test_iq2r_glm53_unpack.py`,
+`test_iq2r_glm5_compile.py` (17 passed, 512 and 1,024 builds) and ATOM's
+`tests/test_iq2r_moe_method.py` (27 passed). On the GLM-5.3 1,024-entry checkpoint
+(`/models/zai-org/GLM-5.3-IQ2Rv3-final`, built with the shipped calibration):
+`pack(unpack(x)) == x` on layer 3, and the MoE on its TP4 and TP8 rank-0 shards
+matches the dense reference from the unpacked bytes at M = 1..1024 (relative RMSE at
+most 0.019, cosine at least 0.99983; 16 experts, random top-8 routing).
+
+**MoE time, synthetic weights.** As the baseline: tuner graph replay, 16 rounds on one
+MI350X, every round timing v2 and v3 back to back; µs median, ratio = median of the
+per-round ratios. v2 rows are the shipped tuned rows, v3 the tuned 1,024-entry rows.
+
+| M | TP4 v2 | TP4 v3 | TP4 v3/v2 | TP8 v2 | TP8 v3 | TP8 v3/v2 | target |
+|---|---|---|---|---|---|---|---|
+| 1 | 18.34 | 20.66 | 1.126 | 16.96 | 18.11 | 1.068 | <= 1.07 |
+| 2 | 20.81 | 22.98 | 1.104 | 18.59 | 19.54 | 1.051 | <= 1.07 |
+| 4 | 32.20 | 36.77 | 1.128 | 21.62 | 22.91 | 1.061 | <= 1.07 |
+| 8 | 56.40 | 59.64 | 1.060 | 36.93 | 37.69 | 1.019 | <= 1.07 |
+| 16 | 84.32 | 89.32 | 1.060 | 51.72 | 55.07 | 1.065 | <= 1.07 |
+| 32 | 125.67 | 137.15 | 1.093 | 74.75 | 75.19 | 0.998 | <= 1.07 |
+| 64 | 172.84 | 181.06 | 1.049 | 92.69 | 94.87 | 1.027 | <= 1.07 |
+| 128 | 195.91 | 208.00 | 1.061 | 106.98 | 112.97 | 1.059 | <= 1.05 |
+| 256 | 210.38 | 227.05 | 1.077 | 120.90 | 122.71 | 1.013 | <= 1.05 |
+| 512 | 269.31 | 291.02 | 1.081 | 153.71 | 164.88 | 1.074 | <= 1.05 |
+| 1024 | 318.67 | 338.49 | 1.063 | 197.10 | 210.30 | 1.065 | <= 1.05 |
+| 2048 | 502.15 | 530.85 | 1.057 | 323.61 | 346.44 | 1.070 | <= 1.05 |
+| 4096 | 849.79 | 897.17 | 1.056 | 545.31 | 572.44 | 1.051 | <= 1.05 |
+
+**MoE time, real checkpoint layers** (v3/v2; same procedure on the rank-0 shard of
+each checkpoint's layer, random routing; 2 rounds):
+
+| M | TP4 layer 3 | TP4 layer 40 | TP8 layer 3 | TP8 layer 40 |
+|---|---|---|---|---|
+| 1 | 1.120 | 1.119 | 1.076 | 1.079 |
+| 2 | 1.119 | 1.118 | 1.067 | 1.071 |
+| 4 | 1.170 | 1.178 | 1.109 | 1.121 |
+| 8 | 1.065 | 1.041 | 1.020 | 1.037 |
+| 16 | 1.076 | 1.041 | 1.043 | 1.044 |
+| 32 | 1.049 | 1.059 | 1.050 | 0.998 |
+| 64 | 1.081 | 1.079 | 1.058 | 1.029 |
+| 128 | 1.071 | 1.081 | 1.065 | 1.071 |
+| 256 | 1.069 | 1.051 | 1.035 | 1.044 |
+| 512 | 1.088 | 1.086 | 1.071 | 1.080 |
+| 1024 | 1.066 | 1.067 | 1.069 | 1.060 |
+| 2048 | 1.072 | 1.055 | 1.070 | 1.080 |
+| 4096 | 1.059 | 1.049 | 1.050 | 1.051 |
+
+**Serving, TP4 (GPUs 4-7) and TP8 (GPUs 0-7)**, standard kernels (`ATOM_MONO_ENABLE=0`),
+the phase-1 setup; output tokens/s (mean TPOT, mean TTFT):
+
+TP4:
+
+| Concurrency | MXFP4 tok/s (TPOT, TTFT) | v2 tok/s (TPOT, TTFT) | v3 tok/s (TPOT, TTFT) | v2/MXFP4 | v3/MXFP4 |
+|---|---|---|---|---|---|
+| 1 | 88 (11.3 ms, 0.10 s) | 80 (12.5 ms, 0.11 s) | 79 (12.6 ms, 0.11 s) | 0.91 | 0.90 |
+| 2 | 181 (10.9 ms, 0.16 s) | 150 (12.6 ms, 0.78 s) | 149 (12.7 ms, 0.79 s) | 0.83 | 0.82 |
+| 4 | 318 (11.8 ms, 0.87 s) | 288 (13.2 ms, 0.72 s) | 279 (13.7 ms, 0.74 s) | 0.91 | 0.88 |
+| 8 | 530 (13.1 ms, 2.04 s) | 496 (15.1 ms, 1.09 s) | 491 (15.2 ms, 1.10 s) | 0.93 | 0.92 |
+| 16 | 974 (15.8 ms, 0.65 s) | 910 (16.8 ms, 0.83 s) | 890 (17.2 ms, 0.85 s) | 0.93 | 0.91 |
+| 32 | 1627 (19.1 ms, 0.60 s) | 1510 (20.3 ms, 0.90 s) | 1465 (21.0 ms, 0.91 s) | 0.93 | 0.90 |
+| 64 | 2504 (24.7 ms, 0.93 s) | 2372 (25.9 ms, 1.16 s) | 2305 (26.6 ms, 1.17 s) | 0.95 | 0.92 |
+| 128 | 3859 (31.6 ms, 1.63 s) | 3650 (33.0 ms, 2.11 s) | 3550 (34.0 ms, 2.08 s) | 0.95 | 0.92 |
+| 256 | 5784 (40.8 ms, 3.61 s) | 5495 (43.0 ms, 3.73 s) | 5265 (44.9 ms, 3.80 s) | 0.95 | 0.91 |
+
+TP8:
+
+| Concurrency | MXFP4 tok/s (TPOT, TTFT) | v2 tok/s (TPOT, TTFT) | v3 tok/s (TPOT, TTFT) | v2/MXFP4 | v3/MXFP4 |
+|---|---|---|---|---|---|
+| 1 | 87 (11.3 ms, 0.10 s) | 79 (12.6 ms, 0.11 s) | 79 (12.6 ms, 0.11 s) | 0.90 | 0.90 |
+| 2 | 171 (11.6 ms, 0.17 s) | 148 (12.6 ms, 0.95 s) | 146 (12.8 ms, 0.95 s) | 0.87 | 0.86 |
+| 4 | 328 (11.2 ms, 1.02 s) | 294 (12.8 ms, 0.85 s) | 289 (13.0 ms, 0.88 s) | 0.90 | 0.88 |
+| 8 | 605 (12.2 ms, 1.07 s) | 536 (13.9 ms, 1.08 s) | 530 (14.0 ms, 1.16 s) | 0.89 | 0.88 |
+| 16 | 1160 (13.2 ms, 0.64 s) | 1021 (15.0 ms, 0.74 s) | 1012 (15.2 ms, 0.65 s) | 0.88 | 0.87 |
+| 32 | 2055 (15.2 ms, 0.42 s) | 1851 (16.8 ms, 0.51 s) | 1832 (17.0 ms, 0.49 s) | 0.90 | 0.89 |
+| 64 | 3062 (19.3 ms, 1.67 s) | 3034 (20.4 ms, 0.77 s) | 2954 (20.9 ms, 0.75 s) | 0.99 | 0.96 |
+| 128 | 5236 (23.4 ms, 1.07 s) | 4807 (25.4 ms, 1.29 s) | 4743 (25.7 ms, 1.31 s) | 0.92 | 0.91 |
+| 256 | 7950 (30.3 ms, 1.97 s) | 7455 (32.0 ms, 2.37 s) | 7285 (32.8 ms, 2.41 s) | 0.94 | 0.92 |
+
+**Against the targets.**
+
+- Met: TP8 decode (M <= 64: 1.00-1.07), TP4 M8-16 and M64, TP8 M256.
+- Missed by up to 3 points: TP4 M32 (1.09), M128-256 (1.06-1.08); prefill at both
+  widths (1.05-1.08); TP8 M128 (1.06).
+- Missed by more: TP4 M1-4 (1.10-1.13 synthetic, 1.12-1.18 real) and TP8 M4 on real
+  weights (1.11-1.12).
+- Serving: v3 is 0.96-1.00 of v2 (TP4 0.96-0.99, TP8 0.97-1.00) and 0.86-0.96 of
+  MXFP4 A4W4; the stretch goal (v3 >= MXFP4) is not met.
+
+**Why.**
+
+- Bytes: +4.3% weights (+5.6% gate/up, +1.8% down), the floor for every memory-bound
+  point.
+- route9 (M1-4): eight routes' 32 KB copies do not fit, so each gathered codeword is
+  formed in registers; its compute phase is 72% longer (in-kernel timestamps:
+  3,526 -> 6,079 cycles), about 1.5 µs of TP4 M1.
+- Prefill gate: ALU-bound decode; the 10-bit unpack adds 13% ALU (218 -> 246 per 32
+  MFMAs), about +10% gate time.
+- M1 gate: loading phase about 20% longer than v2's (8 KB copy 0, more bytes); the
+  consumption-order loads recovered 0.8 µs.
+
+**Tried and dropped (measured):** a 16-bit tenth-bit word per tile and a 32-bit word
+per slab (extra loads); forming the decode downs' copies from registers (VGPRs,
+1.17-1.27); route9 with two waves per route (own or shared copy 0; 1.07-1.33); the
+M1 gate loading all tiles before decoding; a merged high-index byte per tile; the
+prefill gate at Unroll 1. Kept: copy-0 DMA plus per-wave LDS formation in the decode
+downs, TP8 scales in registers, the TP4 prefill down at two workgroups per CU, the
+single2 down (TP4 M8-16), and consumption-order loads in the M1 gate.
+
+**Open options** (not built): route9 with four routes per workgroup (four full 32 KB
+books, cross-workgroup top-8 sum) for M1-4; the redline-style split-K decode down
+with a separate top-k reduction.
