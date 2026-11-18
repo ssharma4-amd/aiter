@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""GLM-5.3 IQ2R-v2 packed MoE (TP4/TP8, gfx950) against a dense Torch reference.
+"""GLM-5.3 IQ2R-v2 packed MoE (TP4/TP8, 512- and 1,024-entry codebooks, gfx950)
+against a dense Torch reference.
 
 ``python3 op_tests/test_iq2r_glm53.py`` times the tuned and default launch
 configs over a token sweep, prints a summary table, then runs the tests.
@@ -100,20 +101,24 @@ def _encode_gate_up(gate, up, book, importance):
     weight = _interleave(gate, up)
     enc = iq2r_v2_encode(weight, importance, book, LEVELS)
     gains = iq2r_v2_gains(weight, enc.reconstruction, _TEST_GAIN, interleaved=True)
-    data = iq2r_v2_write_data(enc.indices, enc.negative, enc.levels, LEVELS)
+    data = iq2r_v2_write_data(
+        enc.indices, enc.negative, enc.levels, LEVELS, book.shape[0]
+    )
     return data, iq2r_v2_write_auxiliary(book[None], enc.d, gains)
 
 
 def _encode_down(weight, book, importance):
     enc = iq2r_v2_encode(weight, importance, book, LEVELS)
     gains = iq2r_v2_gains(weight, enc.reconstruction, _TEST_GAIN)
-    data = iq2r_v2_write_data(enc.indices, enc.negative, enc.levels, LEVELS)
+    data = iq2r_v2_write_data(
+        enc.indices, enc.negative, enc.levels, LEVELS, book.shape[0]
+    )
     return data, iq2r_v2_write_auxiliary(book[None], enc.d, gains)
 
 
 @functools.lru_cache(maxsize=1)
-def _glm53_layer(intermediate: int):
-    seed = iq2r_v2_seed_codebook("cuda")
+def _glm53_layer(intermediate: int, entries: int = 512):
+    seed = iq2r_v2_seed_codebook("cuda", entries)
     books = (seed, (seed * 1.0625).to(torch.float8_e4m3fn).float())
 
     def weight(n: int, k: int, s: int):
@@ -140,16 +145,15 @@ def _glm53_layer(intermediate: int):
     def stack(parts, index):
         return torch.stack([p[index].reshape(-1) for p in parts])[pick].contiguous()
 
+    def dense(data, aux, n, k):
+        return iq2r_v2_materialize(data, aux, n, k, LEVELS, codebook_entries=entries)
+
     layer = SimpleNamespace(
         intermediate=intermediate,
+        entries=entries,
         pick=pick,
-        gate_weights=[
-            iq2r_v2_materialize(d, a, 2 * intermediate, _HIDDEN, LEVELS)
-            for d, a in gate
-        ],
-        down_weights=[
-            iq2r_v2_materialize(d, a, _HIDDEN, intermediate, LEVELS) for d, a in down
-        ],
+        gate_weights=[dense(d, a, 2 * intermediate, _HIDDEN) for d, a in gate],
+        down_weights=[dense(d, a, _HIDDEN, intermediate) for d, a in down],
         gate_data=stack(gate, 0),
         gate_auxiliary=stack(gate, 1),
         down_data=stack(down, 0),
@@ -165,9 +169,13 @@ def _glm53_layer(intermediate: int):
     return layer
 
 
-@pytest.fixture(scope="module", params=[256, 512], ids=["tp8", "tp4"])
+@pytest.fixture(
+    scope="module",
+    params=[(256, 512), (512, 512), (256, 1024), (512, 1024)],
+    ids=["tp8", "tp4", "tp8-book1024", "tp4-book1024"],
+)
 def glm53_layer(request):
-    return _glm53_layer(request.param)
+    return _glm53_layer(*request.param)
 
 
 def _routing(tokens: int, seed: int):
@@ -222,6 +230,99 @@ def test_glm53_moe_matches_reference(glm53_layer, tokens):
     workspace = IQ2RGlm53Workspace.allocate(tokens, layer.intermediate, device="cuda")
     iq2r_glm53_moe_out(hidden, *layer.packed, topk_weights, topk_ids, actual, workspace)
     _check_moe(actual, expected)
+
+
+def _one_hot_rows(rows: int, k: int, columns: torch.Tensor):
+    """FP8 activations with a single 1.0 per row (at ``columns``), E8M0 scales 1."""
+    activations = torch.zeros((rows, k), device="cuda")
+    activations[torch.arange(rows, device="cuda"), columns] = 1.0
+    scales = torch.full((rows, k // 32), 127, dtype=torch.uint8, device="cuda")
+    return activations.to(torch.float8_e4m3fn), scales
+
+
+def _decoded_columns(layer, experts: torch.Tensor, columns: torch.Tensor):
+    """BF16 of gain * W[:, k]: what a down kernel writes for a one-hot row.
+
+    The single product of the one-hot row is exact in the MFMA's FP32
+    accumulator, so the kernel's decode must match the reference bit for bit.
+    """
+    dense = torch.stack(layer.down_weights)[layer.pick[experts.long()]]
+    return dense[torch.arange(len(columns), device="cuda"), :, columns].to(
+        torch.bfloat16
+    )
+
+
+@pytest.mark.parametrize("kernel", ["single", "ordered", "route9", "prefill"])
+def test_glm53_down_decode_bit_exact(glm53_layer, kernel):
+    """Every down kernel decodes the packed weights bit-exactly (vs iq2r_v2_materialize)."""
+    from aiter.ops.iq2r import (
+        iq2r_glm53_down_out,
+        iq2r_glm53_down_reduce_out,
+        iq2r_glm53_down_route9_out,
+    )
+
+    layer = glm53_layer
+    k = layer.intermediate
+    _, _, data, aux = layer.packed
+    generator = torch.Generator(device="cuda").manual_seed(0x53D0)
+    if kernel in ("single", "ordered"):
+        if kernel == "ordered" and k != 256:
+            pytest.skip("the ordered down kernel is TP8 only")
+        tokens = 64
+        routes = tokens * 9
+        # Rows 32 at a time per expert; row r reads column 37 r mod K, so
+        # every column of every expert pattern is covered.
+        columns = (torch.arange(routes, device="cuda") * 37) % k
+        experts = (torch.arange(routes, device="cuda") // 32) % 3
+        activations, scales = _one_hot_rows(routes, k, columns)
+        tasks = torch.zeros((routes // 32 + _EXPERTS, 3), dtype=torch.int32, device="cuda")
+        for task in range(routes // 32):
+            tasks[task] = torch.tensor([task * 32, 32, task % 3], dtype=torch.int32)
+        count = torch.tensor([routes // 32], dtype=torch.int32, device="cuda")
+        output = torch.full((routes, _HIDDEN), float("nan"), dtype=torch.bfloat16, device="cuda")
+        iq2r_glm53_down_out(
+            activations, scales, data, aux, tasks, count, output,
+            {"ordered": 1, "single": 2}[kernel], 4,
+        )  # fmt: skip
+        assert torch.equal(output, _decoded_columns(layer, experts, columns))
+        return
+
+    # route9 and prefill sum the eight routes of a token: a one-hot route
+    # weight makes the token's output exactly one route's.
+    for tokens in (1, 2, 4) if kernel == "route9" else (64,):
+        routes = tokens * 9
+        for trial in range(4):
+            columns = torch.randint(0, k, (routes,), generator=generator, device="cuda")
+            route_experts = (torch.arange(routes, device="cuda") // 64) % 3
+            if kernel == "route9":
+                route_experts = torch.randint(0, 3, (routes,), generator=generator, device="cuda")
+            activations, scales = _one_hot_rows(routes, k, columns)
+            chosen = torch.randint(0, _TOPK, (tokens,), generator=generator, device="cuda")
+            weights = torch.nn.functional.one_hot(chosen.long(), _TOPK).float().contiguous()
+            scatter = torch.arange(routes, dtype=torch.int32, device="cuda")
+            picked = torch.arange(tokens, device="cuda") * 9 + chosen
+            output = torch.full((tokens, _HIDDEN), float("nan"), dtype=torch.bfloat16, device="cuda")
+            if kernel == "route9":
+                ids = route_experts.reshape(tokens, 9)[:, :_TOPK].to(torch.int32).contiguous()
+                iq2r_glm53_down_route9_out(
+                    activations, scales, data, aux, ids, scatter, weights, output
+                )
+            else:
+                tasks = torch.zeros((routes // 64 + 1 + _EXPERTS, 3), dtype=torch.int32, device="cuda")
+                n_tasks = (routes + 63) // 64
+                for task in range(n_tasks):
+                    begin = task * 64
+                    tasks[task] = torch.tensor(
+                        [begin, min(64, routes - begin), task % 3], dtype=torch.int32
+                    )
+                count = torch.tensor([n_tasks], dtype=torch.int32, device="cuda")
+                route_output = torch.empty((routes, _HIDDEN), dtype=torch.bfloat16, device="cuda")
+                iq2r_glm53_down_reduce_out(
+                    activations, scales, data, aux, tasks, count, route_output,
+                    scatter, weights, output, 1 + trial % 2,
+                )  # fmt: skip
+            expected = _decoded_columns(layer, route_experts[picked], columns[picked])
+            assert torch.equal(output, expected), (tokens, trial)
 
 
 # Each gate and down kernel at grids and chunk counts the shipped table and
