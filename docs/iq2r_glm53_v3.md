@@ -171,3 +171,87 @@ loads of 8 instead of 4 KiB and twice the copy formation per gate/up item; the
 nibble that shares the metadata word with the level nibble; 10 bits need a
 byte of high bits per atom, so the metadata word no longer holds them and the
 record layout changes (2 more bytes per lane per quad).
+
+## Format: 1,024 entries, 10-bit indices (phase 2)
+
+Everything else is the shipped IQ2R-v2 format (`aiter/ops/iq2r_v2.py`): E8M0 `d`
+per row and 256 inputs, a 4-bit level per 32 weights selecting one of four
+pre-scaled copies `E4M3(codebook * 2^(c/4))`, explicit signs, FP32 gains for gate
+and up. The codebook size is a parameter (`codebook_entries`, 512 by default):
+
+- `iq2r_v2_seed_codebook(entries=1024)` seeds the IQ2_XXS grid at `2^(j/4)`,
+  j = 0..3 (256 entries each, scaled from the E4M3 grid: the recipe-v3 seed of
+  `scale_compare.py --book1024`); `iq2r_v2_learn_codebook(entries=1024)` learns
+  from it, still within bytes 0x08..0x78.
+- `iq2r_v2_write_data`, `iq2r_v2_read` and `iq2r_v2_materialize` take
+  `codebook_entries`; the reference decoder is unchanged otherwise.
+- Format name `iq2r-1024-fullsign-c4e4q-e8m0d256-native-v2`; packed layout
+  `glm53-packed-v3`. 512-entry checkpoints keep `glm53-packed-v2` and every
+  512-entry byte is unchanged.
+
+**Records.** An 8-weight index gains a tenth bit, four per atom and lane (an atom
+is 16 rows x 128 inputs, 32 weights per lane):
+
+- Atoms 0 and 1 of a triplet keep theirs in the atom-two record's fourth
+  metadata byte, which IQ2R-v2 leaves as padding.
+- Atom 2's go to one byte per lane after every two K tiles: records are stored in
+  slabs of two K tiles (256 inputs, the tensor-parallel slicing unit), the two
+  tiles' six-block groups (2 x 3,584 bytes), then 64 bytes per triplet.
+- Down records grow 1.8% over 512 entries (7,296 instead of 7,168 bytes per
+  slab), the information content; no new padding.
+- Packed gate/up quads (`iq2r_glm53_pack_v2`): an atom's packed indices are
+  `i0 | i1 << 10 | i2 << 20 | i3 << 30` (40 bits): bits 0-31 replace the index
+  bytes, bits 32-35 the metadata nibble, bits 36-39 a nibble of the lane's
+  tenth-bit word. Each six-tile K slice (one decode-gate wave's) stores its six
+  2,304-byte tiles, then a 12-byte word per lane (tile t's four nibbles in bits
+  16t..16t+15): 2,432 bytes per tile on average, +5.6% (the information
+  content).
+- In all, weights are 2.375 + 0.03 (`d`) bits per weight against 2.28: +4.3%
+  bytes.
+
+The packers infer the codebook size from the auxiliary size; pack/unpack and TP
+slicing round-trip bit for bit for both sizes.
+
+## Kernels (phase 2)
+
+Every gate and down kernel takes the codebook size as a template parameter; the
+host picks it from the packed sizes, so 512-entry checkpoints run the same
+instantiations as before (their generated code is unchanged).
+
+| Kernel | 1,024-entry change | LDS (bytes) | Workgroups per CU |
+|---|---|---|---|
+| M1 gate | 8 KB copy 0 per thread block, copies formed in LDS; each wave loads its six tiles and tenth bits at once and decodes with the decode gate's cross-atom pipelining | 65,536 | 2 (as v2) |
+| Decode gate | copies formed in LDS; one tenth-bit load per item and wave | 65,536 | 2 (as v2) |
+| Prefill gate | copies formed in LDS; one tenth-bit dword live | 49,920 | 2 (as v2) |
+| route9 (M1-4) | `glm53_down_route9_wide_kernel`: copy 0 per route (8 KB, DMA); a gathered codeword becomes its class's copy in registers (`b + delta_c[b & 7]`, per-class tables in LDS) | 68,736-71,552 | 1 (as v2) |
+| Decode downs (TP4 single, TP8 ordered) | copy 0 staged (8 KB instead of 32 KB of stored copies), copies 1-3 formed by each wave from the chunks it staged; TP8 activation scales in registers | 36,864-41,216 | 3 (TP4), 4 (TP8), as v2 |
+| Prefill downs | TP8: scales in registers (4 workgroups per CU as v2); TP4: 2 workgroups per CU (LDS), built for that occupancy with an unrolled K loop | 40,960 (TP8), 66,560 (TP4) | 4, 2 |
+
+Tests (`op_tests/test_iq2r_glm53.py`, `test_iq2r_glm53_unpack.py`): every MoE test
+runs on 512- and 1,024-entry layers (dense reference, explicit configs, invalid
+routes, chunked prefill); `test_glm53_down_decode_bit_exact` checks that every
+down kernel decodes bit-exactly (one-hot activations: each output is
+`BF16(gain * W[:, k])`, compared with `iq2r_v2_materialize`), for both sizes.
+
+## Building and serving a 1,024-entry checkpoint (phase 3)
+
+`compile` takes `--codebook-entries 1024`; everything else is the shipped recipe
+(the calibration artifact, importance, encoder, 0.98 gain, shared expert FP8):
+
+    # one process per GPU on its own MoE layers, then one run without --layers
+    HIP_VISIBLE_DEVICES=$i python3 -m aiter.quantization.iq2r.glm5.compile \
+        --model-dir $FP8 --output-dir $OUT --calibration-cache calibration.pt \
+        --codebook-entries 1024 --layers ...
+    python3 -m aiter.quantization.iq2r.glm5.compile --model-dir $FP8 \
+        --output-dir $OUT --calibration-cache calibration.pt --codebook-entries 1024
+
+Encoding takes about 9 s per expert (gate/up and down) on one MI350X, against
+6 s with 512 entries. Layer files record `iq2r_codebook_entries`, format
+`iq2r-1024-fullsign-c4e4q-e8m0d256-native-v2` and layout `glm53-packed-v3`;
+the config's `quantization_config.iq2r_layout` is `glm53-packed-v3`.
+
+ATOM (`Iq2rMoEMethod`) reads the codebook size from `iq2r_layout`
+(`glm53-packed-v2`: 512 entries, `glm53-packed-v3`: 1,024) and sizes, slices
+and checks the buffers accordingly; the AITER kernels pick their instantiation
+from the packed sizes. Serve as a v2 checkpoint (the shared expert stays block
+FP8: exclude `*.mlp.shared_experts*` from online quantization).
