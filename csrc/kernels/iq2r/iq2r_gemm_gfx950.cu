@@ -477,6 +477,34 @@ __device__ __forceinline__ void iq2r_v2_book_form(uint64_t* lds,const IQ2RV2Book
     }
 }
 
+// Copies 1-3 in LDS from copy 0 staged by iq2r_stage_codebook_async: each
+// wave forms the 1 KB chunks it staged (lane i's 16 bytes of each), so only
+// its own vmcnt wait has to precede, not a barrier.
+template<int Entries,int Waves>
+__device__ __forceinline__ void iq2r_v2_form_staged_copies(uint64_t* lds,int wave,int lane)
+{
+    constexpr int Chunks=Entries*8/1024,CopyUnits=Entries*8/16;
+    uint32_t k2=0x05040403u,k3=0x06060605u;
+    asm volatile("" : "+v"(k2),"+v"(k3));
+    uint4* book=reinterpret_cast<uint4*>(lds);
+#pragma unroll
+    for(int i=0;i<(Chunks+Waves-1)/Waves;++i)
+    {
+        const int chunk=wave+i*Waves;
+        if(Chunks%Waves!=0 && chunk>=Chunks)continue;
+        const int at=chunk*64+lane;
+        const uint4 w=book[at];
+        uint32_t r1[4],r2[4],r3[4];
+        iq2r_v2_copy_words(w.x,k2,k3,r1[0],r2[0],r3[0]);
+        iq2r_v2_copy_words(w.y,k2,k3,r1[1],r2[1],r3[1]);
+        iq2r_v2_copy_words(w.z,k2,k3,r1[2],r2[2],r3[2]);
+        iq2r_v2_copy_words(w.w,k2,k3,r1[3],r2[3],r3[3]);
+        book[CopyUnits+at]=make_uint4(r1[0],r1[1],r1[2],r1[3]);
+        book[2*CopyUnits+at]=make_uint4(r2[0],r2[1],r2[2],r2[3]);
+        book[3*CopyUnits+at]=make_uint4(r3[0],r3[1],r3[2],r3[3]);
+    }
+}
+
 // Output gains (even rows, odd rows): the auxiliary's last 8 bytes.
 template<int Classes>
 __device__ __forceinline__ float iq2r_gain(const uint8_t* aux,int auxiliary_bytes,int row)
@@ -516,6 +544,14 @@ __device__ __forceinline__ void glm53_quad_decode_mfma(
     const IQ2RCompressedQuad& compressed,const uint64_t* codebook,uint32_t bases,
     const IQ2RActivationFragment* activation,const uint32_t* scale_a,
     opus::vector_t<float,4> (&accumulators)[MAtoms][4],int active_m);
+
+template<int MAtoms,int Classes,int Entries>
+__device__ __forceinline__ void glm53_cross_k_decode_mfma(
+    const IQ2RCompressedQuad& compressed,const IQ2RCompressedQuad& next,
+    const uint64_t* codebook,uint32_t bases,
+    const IQ2RActivationFragment* activation,const uint32_t* scale_a,
+    opus::vector_t<float,4> (&accumulators)[MAtoms][4],int active_m,
+    uint64_t (&pending)[4],bool first_k,bool next_k,IQ2RLevels& carried);
 
 template<int NT,int Classes,int Entries>
 __global__ __launch_bounds__(512,1) void glm53_gate_m1_kernel(
@@ -566,12 +602,45 @@ __global__ __launch_bounds__(512,1) void glm53_gate_m1_kernel(
 #pragma unroll
         for(int m=0;m<MAtoms;++m) rows[m]=min(row_begin+m*16+lane_row,row_end-1);
         opus::vector_t<float,4> accumulators[MAtoms][4]={};
-        // Each wave's six K tiles are one quad slice (and, for 1,024 entries,
-        // one tenth-bit load).
+        // Each wave's six K tiles are one quad slice.
         int base=iq2r_quad_offset<Entries>(n_tile,wave*6);
+        if constexpr(Entries==1024)
+        {
+            // M1 runs at most one item per CU, so registers are plentiful: each
+            // wave loads its six tiles, their tenth bits and activations at
+            // once, one memory latency instead of six, then decodes as the
+            // decode gate does (codebook reads one atom ahead).
+            IQ2RCompressedQuad quads[6];
+#pragma unroll
+            for(int it=0;it<6;++it)
+                quads[it]=iq2r_scheduled_load_quad<Policy,Entries>(data,data_bytes,base+it*kQuadBytes,lane);
+            const iq2r_u32x3 ext_words=iq2r_load_quad_ext<Policy>(data,data_bytes,n_tile,wave,lane);
+            IQ2RActivationFragment a[6];uint32_t sa[6];
+            const auto* input=reinterpret_cast<const uint8_t*>(activations+static_cast<int64_t>(rows[0])*K);
+#pragma unroll
+            for(int it=0;it<6;++it)
+            {
+                const int ak=(wave*6+it)*128+lane_group*16;
+                *reinterpret_cast<uint4*>(a[it].bytes)=*reinterpret_cast<const uint4*>(input+ak);
+                *reinterpret_cast<uint4*>(a[it].bytes+16)=*reinterpret_cast<const uint4*>(input+ak+64);
+                // The MFMA reads byte 0 of the scale.
+                sa[it]=scales[static_cast<int64_t>(rows[0])*192+(wave*6+it)*4+lane_group];
+            }
+            iq2r_v2_book_form<512,Entries>(shared.codebook,gate_base,wave*64+lane);
+            asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+            __syncthreads();
+#pragma unroll
+            for(int it=0;it<6;++it)quads[it].ext=iq2r_quad_ext(ext_words,it);
+            uint64_t pending_book[4]={};
+            IQ2RLevels levels=iq2r_levels<Classes,Entries>(quads[0].metadata);
+#pragma unroll
+            for(int it=0;it<6;++it)
+                glm53_cross_k_decode_mfma<MAtoms,Classes,Entries>(quads[it],quads[it<5?it+1:5],shared.codebook,d_words[it/2],
+                                                                 &a[it],&sa[it],accumulators,MAtoms,pending_book,it==0,it<5,levels);
+        }
+        else
+        {
         IQ2RCompressedQuad pending=iq2r_scheduled_load_quad<Policy,Entries>(data,data_bytes,base,lane);
-        [[maybe_unused]] iq2r_u32x3 ext_words{};
-        if constexpr(Entries==1024)ext_words=iq2r_load_quad_ext<Policy>(data,data_bytes,n_tile,wave,lane);
         iq2r_v2_book_form<512,Entries>(shared.codebook,gate_base,wave*64+lane);
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         __syncthreads();
@@ -589,14 +658,14 @@ __global__ __launch_bounds__(512,1) void glm53_gate_m1_kernel(
                 *reinterpret_cast<uint4*>(a[m].bytes+16)=*reinterpret_cast<const uint4*>(input+ak+64);
                 sa[m]=scales[static_cast<int64_t>(rows[m])*192+kt*4+lane_group]*0x01010101u;
             }
-            auto compressed=pending;
-            if constexpr(Entries==1024)compressed.ext=iq2r_quad_ext(ext_words,iteration);
+            const auto compressed=pending;
             if(iteration<5)
             {
                 base+=kQuadBytes;
                 pending=iq2r_scheduled_load_quad<Policy,Entries>(data,data_bytes,base,lane);
             }
             glm53_quad_decode_mfma<MAtoms,Classes,Entries>(compressed,shared.codebook,d_words[iteration/2],a,sa,accumulators,MAtoms);
+        }
         }
         __syncthreads();
 #pragma unroll
@@ -1044,9 +1113,18 @@ __global__ __launch_bounds__(64*Waves,Occupancy) void glm53_down_tp4_kernel(
         if(begin<0 || count<=0 || begin+count>M || expert<0 || expert>=expert_count)continue;
         const uint8_t* data=all_data+static_cast<int64_t>(expert)*data_bytes;
         const uint8_t* aux=all_auxiliary+static_cast<int64_t>(expert)*auxiliary_bytes;
+        // 1,024 entries stage only copy 0 (8 KB rather than 32 KB of stored
+        // copies) and form copies 1-3 before the barrier.
+        bool form_book=false;
         if(previous_expert!=expert)
         {
-            iq2r_stage_codebook_async<iq2r_codebook_words<Classes,Entries>(),Waves>(shared.codebook,aux,wave,lane);
+            if constexpr(Entries==1024)
+            {
+                iq2r_stage_codebook_async<Entries,Waves>(shared.codebook,aux,wave,lane);
+                form_book=true;
+            }
+            else
+                iq2r_stage_codebook_async<iq2r_codebook_words<Classes,Entries>(),Waves>(shared.codebook,aux,wave,lane);
             previous_expert=expert;
         }
         for(int row_base=begin;row_base<begin+count;row_base+=Rows)
@@ -1080,6 +1158,12 @@ __global__ __launch_bounds__(64*Waves,Occupancy) void glm53_down_tp4_kernel(
                         pending[kt].third.w=pending[kt+1].third.w=*(data+glm53_ext_offset<KT>(nb,kt,lane));
             }
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+            if constexpr(Entries==1024)
+                if(form_book)
+                {
+                    iq2r_v2_form_staged_copies<Entries,Waves>(shared.codebook,wave,lane);
+                    form_book=false;
+                }
             __syncthreads();
 #pragma unroll 1
             for(int group=0;group<Groups;++group)
@@ -2134,9 +2218,18 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_tp8_ordered_kernel(
         if(begin<0 || count<=0 || begin+count>M || expert<0 || expert>=expert_count)continue;
         const uint8_t* data=all_data+static_cast<int64_t>(expert)*data_bytes;
         const uint8_t* aux=all_auxiliary+static_cast<int64_t>(expert)*auxiliary_bytes;
+        // 1,024 entries stage only copy 0 (8 KB rather than 32 KB of stored
+        // copies) and form copies 1-3 before the barrier.
+        bool form_book=false;
         if(previous_expert!=expert)
         {
-            iq2r_stage_codebook_async<iq2r_codebook_words<Classes,Entries>(),Waves>(shared.codebook,aux,wave,lane);
+            if constexpr(Entries==1024)
+            {
+                iq2r_stage_codebook_async<Entries,Waves>(shared.codebook,aux,wave,lane);
+                form_book=true;
+            }
+            else
+                iq2r_stage_codebook_async<iq2r_codebook_words<Classes,Entries>(),Waves>(shared.codebook,aux,wave,lane);
             previous_expert=expert;
         }
         for(int row_base=begin;row_base<begin+count;row_base+=Rows)
@@ -2185,6 +2278,12 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_tp8_ordered_kernel(
                 if constexpr(Entries==1024)pending[0].third.w=pending[1].third.w=*(data+glm53_ext_offset<2>(nb,0,lane));
             }
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+            if constexpr(Entries==1024)
+                if(form_book)
+                {
+                    iq2r_v2_form_staged_copies<Entries,Waves>(shared.codebook,wave,lane);
+                    form_book=false;
+                }
             __syncthreads();
 
 #pragma unroll 1
