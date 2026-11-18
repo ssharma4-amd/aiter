@@ -39,6 +39,37 @@ It is the best 2-bit recipe so far on every measure we ran: held-out output erro
 Everything is decided at encode time. Serving reads the same kind of record: scales, an index, 8 signs and a
 per-matrix codebook.
 
+## The decision corpus must cover every workload (measured 2026-11-18)
+
+The v3 bucket comes from one source, SWE-bench Verified mini-swe-agent trajectories. Decision Hessians captured
+separately from three sources (40 windows of 8,192 tokens each; layers 10/40/70) show that a bucket mostly helps its
+own workload. Setup:
+- 18 gate/up matrices; LDLQ fit on half A, scored on half B.
+- Relative output error `tr(D H D^T)/tr(W H W^T)` at held-out decision positions of each source, as a ratio to no
+  LDLQ.
+
+| LDLQ fit | SWE-agent decisions | Terminal-agent decisions | Math decisions |
+|---|---|---|---|
+| `H_all` only | 0.623 | 0.629 | 0.693 |
+| + SWE bucket | **0.296** | 0.572 | 0.692 |
+| + terminal-agent bucket | 0.597 | **0.317** | 0.707 |
+| + math bucket | 0.640 | 0.636 | **0.167** |
+| **+ equal mix of the three** | **0.330** | **0.322** | **0.183** |
+| + v3 bucket (SWE, 2,300 positions) | 0.295 | 0.565 | 0.689 |
+
+- Each bucket cuts its own source's decision error ~2x more than `H_all` alone, and the others' little or not at
+  all. The v3 bucket is in effect SWE-only.
+- An equal mix (each source normalized by its trace, then averaged) comes within ~10% of each specialist, at about
+  the same cost on ordinary tokens as any single bucket.
+- Build the shipped decision corpus as a balanced mix of the served workloads: SWE-style agents, terminal agents,
+  reasoning (`</think>`-heavy), code and chat.
+- The terminal-agent bucket above used Terminal-Bench 2.0 text as a diagnostic only. A shipped bucket needs
+  terminal-agent trajectories generated on non-evaluation tasks.
+- terminus-2 never emits `<tool_call>`; its decisions are end of turn and `</think>` only.
+
+Study write-up: `research/glm53-2bit-quantization/08_targeted_error_reduction/DECISION_CORPUS_SOURCE_STUDY.md`.
+Tools: `EXP/targeted-error-20261111/tools/hdec_by_source.py` (capture), `tools/srccheck.py` (cross-check).
+
 ## Measurements
 
 **Format screen.** 27 matrices (layers 10 / 40 / 70 x experts 0 / 77 / 200 x gate, up, down). The metric is held-out
@@ -152,7 +183,9 @@ The changes:
   - the MFMA stream and scale handling (E8M0 `d`, level exponent, class -> copy) are unchanged.
 - **Calibrate:**
   - the layer-level `H_all` (LDLQ handoff, step 1);
-  - a `H_decision` capture over the decision corpus described above (~11 GB at fp32 for 75 layers).
+  - a `H_decision` capture over a decision corpus that mixes the served workloads (see "The decision corpus must
+    cover every workload"), one capture per source, each normalized by its trace and then averaged (~11 GB at fp32 per
+    source for 75 layers).
   - Keep that corpus separate from the calibration corpus and away from evaluation text.
 - **Compile:**
   - learn the 1,024 book;
@@ -171,6 +204,7 @@ The changes:
 | LDLQ (`layer_factor`, `ldlq_fast`; `TE_BETA`, `TE_HDEC`) | `EXP/targeted-error-20261111/tools/s2_encode_ldlq.py` |
 | 10-bit packing / decode, tests | `tools/v2_codec10.py`, `tools/v2_on_atom10/`, `tools/test_codec10.py` |
 | Decision corpus capture | `tools/decision_corpus_capture.py` (output `/models/zai-org/glm53-te-hess-dec`) |
+| Per-source decision Hessians and cross-source check | `tools/hdec_by_source.py`, `tools/srccheck.py` |
 | Held-out checks | `tools/v3_screen.py`, `tools/deccorpus_check.py` |
 | Study vs shipped scaling, 1,024 entries in the shipped format | `tools/scale_compare.py` (`--book1024`) |
 | Paired evaluation | `tools/run_eval_pair.sh`, `tools/tb2_tally.py` |
