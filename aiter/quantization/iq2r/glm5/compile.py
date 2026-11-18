@@ -26,6 +26,9 @@ corpus tokens reach uses its weight's column energy instead.
     python3 -m aiter.quantization.iq2r.glm5.compile --model-dir $FP8 \\
         --output-dir $OUT --calibration-cache calibration.pt
 
+``--codebook-entries 1024`` builds the 1,024-entry variant (10-bit indices,
+layout ``glm53-packed-v3``); the default is the shipped 512 entries.
+
 Each process encodes on its first visible GPU; select it with
 HIP_VISIBLE_DEVICES. Layer files already in the output directory are checked
 and kept if they were built from the same calibration and recipe; any other
@@ -77,11 +80,14 @@ _TARGET_PATTERN = re.compile(
     r"(gate_up|down)_proj\.weight$"
 )
 LAYOUT = "glm53-packed-v2"
+# Layout of a checkpoint per codebook size.
+LAYOUTS = {512: LAYOUT, 1024: "glm53-packed-v3"}
 # The recipe: the kernels' level set, the reconstruction gain <W, Wq> / <W, W>,
 # the routed-token count below which an expert's importance falls back to its
 # weight energy, and the codebook learner's rounds and sample size.
 _LEVELS = IQ2R_V2_LEVELS_C4
 FORMAT = iq2r_v2_format_name(_LEVELS)
+_CODEBOOK_ENTRIES = 512
 _TARGET_GAIN = 0.98
 _MIN_ROUTED_TOKENS = 256
 _ITERATIONS = 4
@@ -447,30 +453,39 @@ def interleave_gate_up(gate: Tensor, up: Tensor) -> Tensor:
     return torch.stack((gate, up), dim=1).reshape(2 * gate.shape[0], gate.shape[1])
 
 
-def _projection_metadata(layout: GLM5Layout, projection: str) -> IQ2RMetadata:
+def _projection_metadata(
+    layout: GLM5Layout, projection: str, entries: int = _CODEBOOK_ENTRIES
+) -> IQ2RMetadata:
     if projection == "gate_up":
         return IQ2RMetadata(
             logical_n=2 * layout.intermediate_size,
             logical_k=layout.hidden_size,
+            codebook_entries=entries,
         )
     if projection == "down":
         return IQ2RMetadata(
             logical_n=layout.hidden_size,
             logical_k=layout.intermediate_size,
+            codebook_entries=entries,
         )
     raise ValueError(f"unknown projection {projection!r}")
 
 
 def _encoding_metadata(
-    importance: GLM5Importance, iterations: int, sample_vectors: int
+    importance: GLM5Importance,
+    iterations: int,
+    sample_vectors: int,
+    entries: int = _CODEBOOK_ENTRIES,
 ) -> dict[str, str]:
     """What decides the encoded bytes besides the source weights.
 
     Every layer file records it, so a later run keeps only layers built the
-    same way.
+    same way. 512-entry builds keep the shipped keys.
     """
 
+    extra = {} if entries == 512 else {"iq2r_codebook_entries": str(entries)}
     return {
+        **extra,
         "iq2r_quality": importance.quality,
         "iq2r_calibration_sha256": importance.sha256,
         "iq2r_codebook_iterations": str(iterations),
@@ -482,17 +497,22 @@ def _encoding_metadata(
     }
 
 
+def _encoding_entries(encoding: dict[str, str]) -> int:
+    return int(encoding.get("iq2r_codebook_entries", 512))
+
+
 def _layer_file_metadata(
     layer: int, projection: str, encoding: dict[str, str]
 ) -> dict[str, str]:
+    entries = _encoding_entries(encoding)
     return {
         "format": "pt",
-        "iq2r_format": FORMAT,
+        "iq2r_format": iq2r_v2_format_name(_LEVELS, entries),
         "iq2r_activation_basis": IQ2R_ACTIVATION_BASIS,
         "iq2r_layer": str(layer),
         "iq2r_projection": projection,
         **encoding,
-        "iq2r_layout": LAYOUT,
+        "iq2r_layout": LAYOUTS[entries],
     }
 
 
@@ -539,9 +559,10 @@ def _validate_projection_shard(
 ) -> None:
     """Check that an existing layer file is the one this run would write."""
 
-    metadata = _projection_metadata(layout, projection)
+    entries = _encoding_entries(encoding)
+    metadata = _projection_metadata(layout, projection, entries)
     data_bytes = (
-        iq2r_glm53_gate_bytes(metadata.logical_n)
+        iq2r_glm53_gate_bytes(metadata.logical_n, entries)
         if projection == "gate_up"
         else metadata.data_bytes
     )
@@ -550,6 +571,7 @@ def _validate_projection_shard(
         metadata.logical_k,
         _LEVELS.classes,
         gate=projection == "gate_up",
+        codebook_entries=entries,
     )
     keys = iq2r_compiled_tensor_keys(layer, projection)
     expected_tensors = {
@@ -602,9 +624,10 @@ def _encode_projection(
     device: torch.device | str,
     iterations: int,
     sample_vectors: int,
+    entries: int = _CODEBOOK_ENTRIES,
 ) -> tuple[Tensor, Tensor]:
     """Canonical IQ2R-v2 buffers ``(data, auxiliary)`` of every routed expert."""
-    metadata = _projection_metadata(layout, projection)
+    metadata = _projection_metadata(layout, projection, entries)
     data_rows, aux_rows = [], []
     for expert in range(layout.expert_count):
         # gate/up is the interleaved matrix (gate0, up0, ...) with one codebook;
@@ -630,6 +653,7 @@ def _encode_projection(
             sample_vectors=sample_vectors,
             seed=(0x10A0 + layer * 1024 + expert * 2 + (projection == "down")) * 2,
             chunk_blocks=_CHUNK_BLOCKS,
+            entries=entries,
         )
         gains = iq2r_v2_gains(
             weight,
@@ -637,7 +661,9 @@ def _encode_projection(
             _TARGET_GAIN,
             interleaved=projection == "gate_up",
         )
-        data = iq2r_v2_write_data(enc.indices, enc.negative, enc.levels, _LEVELS)
+        data = iq2r_v2_write_data(
+            enc.indices, enc.negative, enc.levels, _LEVELS, entries
+        )
         aux = iq2r_v2_write_auxiliary(book[None], enc.d, gains)
         del weight, enc
         if tuple(data.shape) != (metadata.data_bytes,):
@@ -669,6 +695,7 @@ def _compile_layer(
     device: torch.device,
     iterations: int,
     sample_vectors: int,
+    entries: int = _CODEBOOK_ENTRIES,
 ) -> None:
     """Encode and pack one layer; write its layer files that do not exist yet."""
 
@@ -682,6 +709,7 @@ def _compile_layer(
             device=device,
             iterations=iterations,
             sample_vectors=sample_vectors,
+            entries=entries,
         )
         for projection in _PROJECTIONS
     ]
@@ -691,7 +719,7 @@ def _compile_layer(
         intermediate_size=layout.intermediate_size,
         levels=_LEVELS,
     )
-    metadata = _encoding_metadata(importance, iterations, sample_vectors)
+    metadata = _encoding_metadata(importance, iterations, sample_vectors, entries)
     for projection, data, auxiliary in zip(_PROJECTIONS, packed[::2], packed[1::2]):
         path = output_dir / _layer_file(layer, projection)
         if path.exists():
@@ -741,6 +769,7 @@ def _write_checkpoint_files(
     config: dict[str, Any],
     weight_map: dict[str, str],
     layout: GLM5Layout,
+    entries: int = _CODEBOOK_ENTRIES,
 ) -> Path:
     """Write the FP8 shards, index, config.json and tokenizer files.
 
@@ -809,8 +838,8 @@ def _write_checkpoint_files(
         # layer keeps the MTP layer's experts and the shared experts on the
         # FP8 path.
         "iq2r_modules": [f"model.layers.{layer}.mlp.experts*" for layer in layers],
-        "iq2r_layout": LAYOUT,
-        "iq2r_format": FORMAT,
+        "iq2r_layout": LAYOUTS[entries],
+        "iq2r_format": iq2r_v2_format_name(_LEVELS, entries),
     }
     config_path = output_dir / "config.json"
     _atomic_write_json(config_path, output_config)
@@ -829,12 +858,14 @@ def compile_glm5_iq2r(
     diagnostic_uniform_importance: bool = False,
     iterations: int = _ITERATIONS,
     sample_vectors: int = _SAMPLE_VECTORS,
+    codebook_entries: int = _CODEBOOK_ENTRIES,
 ) -> Path | None:
     """Compile the selected MoE layers into ``output_dir`` on ``cuda:0``.
 
     Valid layer files already in ``output_dir`` are kept; an invalid one is an
     error. A run over every MoE layer also writes the rest of the checkpoint
     and returns its config path. A run over a subset returns None.
+    ``codebook_entries`` (512 or 1024) selects the codebook size.
     ``diagnostic_uniform_importance``, ``iterations`` and ``sample_vectors``
     exist for tests; production builds keep the defaults.
     """
@@ -863,6 +894,8 @@ def compile_glm5_iq2r(
         raise ValueError(f"{index_path} does not contain a string weight_map object")
     if iterations <= 0 or sample_vectors <= 0:
         raise ValueError("iterations and sample_vectors must be positive")
+    if codebook_entries not in LAYOUTS:
+        raise ValueError(f"codebook_entries must be 512 or 1024, got {codebook_entries}")
 
     importance = load_glm5_importance(
         calibration_cache,
@@ -874,7 +907,9 @@ def compile_glm5_iq2r(
             "the calibration artifact has no routed hit counts, which the "
             "low-token fallback needs; re-run calibrate"
         )
-    encoding = _encoding_metadata(importance, iterations, sample_vectors)
+    encoding = _encoding_metadata(
+        importance, iterations, sample_vectors, codebook_entries
+    )
     moe_layers = list(range(layout.first_moe_layer, layout.layer_count))
     selected_layers = (
         moe_layers if layer_indices is None else sorted(set(layer_indices))
@@ -908,11 +943,14 @@ def compile_glm5_iq2r(
                 device=device,
                 iterations=iterations,
                 sample_vectors=sample_vectors,
+                entries=codebook_entries,
             )
 
     if selected_layers != moe_layers:
         return None
-    return _write_checkpoint_files(model_dir, output_dir, config, weight_map, layout)
+    return _write_checkpoint_files(
+        model_dir, output_dir, config, weight_map, layout, codebook_entries
+    )
 
 
 def _parse_layers(value: str) -> list[int]:
@@ -956,12 +994,20 @@ def main(argv: list[str] | None = None) -> int:
             "files are written"
         ),
     )
+    parser.add_argument(
+        "--codebook-entries",
+        type=int,
+        choices=sorted(LAYOUTS),
+        default=_CODEBOOK_ENTRIES,
+        help="codebook size: 512 (shipped, glm53-packed-v2) or 1024 (glm53-packed-v3)",
+    )
     args = parser.parse_args(argv)
     config_path = compile_glm5_iq2r(
         args.model_dir,
         args.output_dir,
         calibration_cache=args.calibration_cache,
         layer_indices=args.layers,
+        codebook_entries=args.codebook_entries,
     )
     print(json.dumps({"config": config_path and str(config_path)}))
     return 0

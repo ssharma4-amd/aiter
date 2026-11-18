@@ -546,15 +546,19 @@ def _layer_tensors(layout: GLM5Layout, layer: int, projection: str) -> dict:
     }
 
 
-def _file_metadata(layer: int, projection: str) -> dict[str, str]:
+def _file_metadata(layer: int, projection: str, entries: int = 512) -> dict[str, str]:
+    extra = {} if entries == 512 else {"iq2r_codebook_entries": str(entries)}
     return {
         "format": "pt",
-        "iq2r_format": FORMAT,
+        "iq2r_format": FORMAT
+        if entries == 512
+        else "iq2r-1024-fullsign-c4e4q-e8m0d256-native-v2",
         "iq2r_activation_basis": IQ2R_ACTIVATION_BASIS,
         "iq2r_layer": str(layer),
         "iq2r_projection": projection,
+        **extra,
         **_ENCODING,
-        "iq2r_layout": LAYOUT,
+        "iq2r_layout": LAYOUT if entries == 512 else "glm53-packed-v3",
     }
 
 
@@ -656,11 +660,16 @@ def test_cli_options(monkeypatch, tmp_path, capsys):
     ]
     assert main(paths) == 0
     assert main([*paths, "--layers", "3-5,40"]) == 0
+    assert main([*paths, "--codebook-entries", "1024"]) == 0
     assert calls == [
         (
             Path("fp8"),
             Path("out"),
-            {"calibration_cache": Path("calibration.pt"), "layer_indices": None},
+            {
+                "calibration_cache": Path("calibration.pt"),
+                "layer_indices": None,
+                "codebook_entries": 512,
+            },
         ),
         (
             Path("fp8"),
@@ -668,6 +677,16 @@ def test_cli_options(monkeypatch, tmp_path, capsys):
             {
                 "calibration_cache": Path("calibration.pt"),
                 "layer_indices": [3, 4, 5, 40],
+                "codebook_entries": 512,
+            },
+        ),
+        (
+            Path("fp8"),
+            Path("out"),
+            {
+                "calibration_cache": Path("calibration.pt"),
+                "layer_indices": None,
+                "codebook_entries": 1024,
             },
         ),
     ]
@@ -677,11 +696,16 @@ def test_cli_options(monkeypatch, tmp_path, capsys):
         main(paths[:4])
     with pytest.raises(SystemExit):
         main([*paths, "--layers", "5-3"])
-    assert len(calls) == 2
+    with pytest.raises(SystemExit):
+        main([*paths, "--codebook-entries", "768"])
+    assert len(calls) == 3
 
 
 @pytest.mark.skipif(not _has_gfx950(), reason="requires gfx950")
-def test_compile_packs_layers_and_writes_checkpoint(tmp_path, monkeypatch, two_experts):
+@pytest.mark.parametrize("entries", [512, 1024])
+def test_compile_packs_layers_and_writes_checkpoint(
+    tmp_path, monkeypatch, two_experts, entries
+):
     source, output = tmp_path / "source", tmp_path / "out"
     _write_source_model(source)
     generator = torch.Generator(device="cuda").manual_seed(0x5310)
@@ -722,6 +746,7 @@ def test_compile_packs_layers_and_writes_checkpoint(tmp_path, monkeypatch, two_e
         diagnostic_uniform_importance=True,
         iterations=1,
         sample_vectors=4096,
+        codebook_entries=entries,
     )
     encoding = {
         **_ENCODING,
@@ -752,7 +777,7 @@ def test_compile_packs_layers_and_writes_checkpoint(tmp_path, monkeypatch, two_e
             path = output / f"iq2r-layer-{layer:04d}-{suffix}.safetensors"
             with safe_open(path, "pt") as handle:
                 assert handle.metadata() == {
-                    **_file_metadata(layer, projection),
+                    **_file_metadata(layer, projection, entries),
                     **encoding,
                 }
                 assert torch.equal(handle.get_tensor(keys["data"]), values[0].cpu())
@@ -760,6 +785,14 @@ def test_compile_packs_layers_and_writes_checkpoint(tmp_path, monkeypatch, two_e
                     handle.get_tensor(keys["auxiliary"]), values[1].cpu()
                 )
                 assert handle.get_tensor(keys["tile_n"]).tolist() == [128]
+    config = json.loads(config_path.read_text())["quantization_config"]
+    assert config["iq2r_layout"] == (
+        "glm53-packed-v2" if entries == 512 else "glm53-packed-v3"
+    )
+    # A 1,024-entry layer decodes with 10-bit indices.
+    if entries == 1024:
+        data, aux = encoded[3, "down"]
+        assert aux.shape[1] == 1024 * 8 + _HIDDEN * (_INTERMEDIATE // 256) + 8
     # test_checkpoint_keeps_shared_expert_fp8 checks the other files.
 
 
