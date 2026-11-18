@@ -252,7 +252,7 @@ def _decoded_columns(layer, experts: torch.Tensor, columns: torch.Tensor):
     )
 
 
-@pytest.mark.parametrize("kernel", ["single", "ordered", "route9", "prefill"])
+@pytest.mark.parametrize("kernel", ["single", "single2", "ordered", "route9", "prefill"])
 def test_glm53_down_decode_bit_exact(glm53_layer, kernel):
     """Every down kernel decodes the packed weights bit-exactly (vs iq2r_v2_materialize)."""
     from aiter.ops.iq2r import (
@@ -265,9 +265,11 @@ def test_glm53_down_decode_bit_exact(glm53_layer, kernel):
     k = layer.intermediate
     _, _, data, aux = layer.packed
     generator = torch.Generator(device="cuda").manual_seed(0x53D0)
-    if kernel in ("single", "ordered"):
+    if kernel in ("single", "single2", "ordered"):
         if kernel == "ordered" and k != 256:
             pytest.skip("the ordered down kernel is TP8 only")
+        if kernel == "single2" and k != 512:
+            pytest.skip("the single2 down kernel is TP4 only")
         tokens = 64
         routes = tokens * 9
         # Rows 32 at a time per expert; row r reads column 37 r mod K, so
@@ -282,7 +284,7 @@ def test_glm53_down_decode_bit_exact(glm53_layer, kernel):
         output = torch.full((routes, _HIDDEN), float("nan"), dtype=torch.bfloat16, device="cuda")
         iq2r_glm53_down_out(
             activations, scales, data, aux, tasks, count, output,
-            {"ordered": 1, "single": 2}[kernel], 4,
+            {"ordered": 1, "single": 2, "single2": 3}[kernel], 4,
         )  # fmt: skip
         assert torch.equal(output, _decoded_columns(layer, experts, columns))
         return
@@ -331,6 +333,7 @@ _EXPLICIT_CONFIGS = [
     IQ2RGlm53Config("nobarrier", 4, "route9", 4, 1),
     IQ2RGlm53Config("nobarrier", 1, "single", 2, 1),
     IQ2RGlm53Config("nobarrier", 2, "single", 16, 1),
+    IQ2RGlm53Config("nobarrier", 2, "single2", 4, 1),
     IQ2RGlm53Config("nobarrier", 4, "ordered", 8, 1),
     IQ2RGlm53Config("nobarrier", 8, "ordered", 1, 1),
     IQ2RGlm53Config("prefill", 1, "prefill", 0, 2),
@@ -530,7 +533,7 @@ def test_glm53_tuned_config():
     table = pd.read_csv(AITER_CONFIGS.AITER_CONFIG_IQ2R_GLM53_FILE)
     rows = table[(table.gfx == get_gfx_runtime()) & (table.cu_num == get_cu_num())]
     for row in rows.itertuples():
-        config = iq2r_glm53_config(row.token, row.inter_dim)
+        config = iq2r_glm53_config(row.token, row.inter_dim, row.codebook)
         assert config == IQ2RGlm53Config(
             row.gate_kernel,
             row.gate_grid,

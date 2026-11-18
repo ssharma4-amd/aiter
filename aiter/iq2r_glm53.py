@@ -74,7 +74,8 @@ _QUAD_TILE_BYTES = {512: 2304, 1024: 2432}
 _QUAD_SLICE_TILES = 6
 
 GATE_KERNELS = {"nobarrier": 1, "prefill": 2}
-DOWN_KERNELS = {"ordered": 1, "single": 2}
+# "single2": the TP4 single down built for two workgroups per CU.
+DOWN_KERNELS = {"ordered": 1, "single": 2, "single2": 3}
 
 
 # --------------------------------------------------------------------------
@@ -598,6 +599,8 @@ def _config_problem(
         return f"unknown decode down kernel {config.down_kernel!r}"
     if config.down_kernel == "ordered" and intermediate_size != 256:
         return "the ordered down kernel is TP8 (intermediate 256) only"
+    if config.down_kernel == "single2" and intermediate_size != 512:
+        return "the single2 down kernel is TP4 (intermediate 512) only"
     return None if 1 <= config.down_grid <= 16 else "down_grid must be 1..16"
 
 

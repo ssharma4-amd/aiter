@@ -22,6 +22,8 @@ enum Glm53DownKernel : int64_t
 {
     kGlm53DownOrdered = 1,
     kGlm53DownSingle  = 2,
+    // TP4 single built for two workgroups per CU (more VGPRs per wave)
+    kGlm53DownSingle2 = 3,
 };
 
 void iq2r_glm53_m1_route_quant_out(const aiter_tensor_t& input,

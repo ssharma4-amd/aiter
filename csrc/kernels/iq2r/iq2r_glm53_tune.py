@@ -175,7 +175,7 @@ def candidates(tokens: int, intermediate_size: int):
         return
     if tokens <= MAX_DECODE_TOKENS:
         downs = [("route9", 4)] if tokens in (2, 4) else []
-        down_kernels = ("ordered", "single") if tp8 else ("single",)
+        down_kernels = ("ordered", "single") if tp8 else ("single", "single2")
         downs += list(itertools.product(down_kernels, (2, 4, 8)))
         for gate, grid in itertools.product(("nobarrier",), (1, 2, 4)):
             for down, down_grid in downs:

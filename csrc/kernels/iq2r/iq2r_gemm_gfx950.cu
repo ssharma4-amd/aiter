@@ -2990,7 +2990,8 @@ void iq2r_glm53_down_out(const aiter_tensor_t& activations,
     AITER_CHECK(output.dtype() == AITER_DTYPE_bf16 && output.dim() == 2 && output.size(0) == routes &&
                     output.size(1) == kGlm53Hidden,
                 "GLM-5.3 IQ2R down output must be BF16 [routes, 6144]");
-    AITER_CHECK(kernel == kGlm53DownSingle || (kernel == kGlm53DownOrdered && !tp4), "GLM-5.3 IQ2R down kernel id");
+    AITER_CHECK(kernel == kGlm53DownSingle || (kernel == kGlm53DownOrdered && !tp4) || (kernel == kGlm53DownSingle2 && tp4),
+                "GLM-5.3 IQ2R down kernel id");
     AITER_CHECK(grid_multiplier >= 1 && grid_multiplier <= 16, "GLM-5.3 IQ2R down grid multiplier");
     HipDeviceGuard device_guard(data.device_id);
     const dim3 grid(static_cast<int>(grid_multiplier) * static_cast<int>(get_num_cu_func()));
@@ -3005,7 +3006,10 @@ void iq2r_glm53_down_out(const aiter_tensor_t& activations,
         static_cast<int>(data.size(1)), static_cast<int>(auxiliary.size(1))
     // Single: one 16-row atom per pass for decode-sized tasks, three workgroups per CU.
 #define GLM53_DOWN_LAUNCH(E)                                                                            \
-    if(tp4)                                                                                             \
+    if(tp4 && kernel == kGlm53DownSingle2)                                                              \
+        hipLaunchKernelGGL((glm53_down_tp4_kernel<4, 1, 2, 8, 4, 4, 2, C, E>),                          \
+                           grid, dim3(64, 4), 0, getCurrentHIPStream(), GLM53_DOWN_ARGS);               \
+    else if(tp4)                                                                                        \
         hipLaunchKernelGGL((glm53_down_tp4_kernel<4, 1, 2, 8, 4, 4, 3, C, E>),                          \
                            grid, dim3(64, 4), 0, getCurrentHIPStream(), GLM53_DOWN_ARGS);               \
     else if(kernel == kGlm53DownSingle)                                                                 \
