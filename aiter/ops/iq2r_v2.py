@@ -72,14 +72,16 @@ from .iq2r_format import (
     IQ2R_SCALE_BLOCK,
     IQ2R_TILE_N,
     IQ2R_VECTOR_SIZE,
+    IQ2R_TRIPLET_BYTES,
     IQ2R_WIDE_CODEBOOK_ENTRIES,
-    IQ2R_WIDE_EXT_RECORD_BYTES,
-    IQ2R_WIDE_EXT_RECORDS_OFFSET,
+    IQ2R_WIDE_EXT_OFFSET,
+    IQ2R_WIDE_TENTH_BYTE,
+    IQ2R_GROUP_BYTES,
     iq2r_data_bytes,
-    iq2r_group_bytes,
     iq2r_index_bits,
     iq2r_k_tiles,
-    iq2r_triplet_bytes,
+    iq2r_slab_bytes,
+    iq2r_slab_k_tiles,
 )
 
 # The IQ2_XXS positive-magnitude grid (``iq2xxs_grid`` in ggml-common.h of
@@ -554,8 +556,9 @@ def iq2r_v2_learn_codebook(
 #
 # Per 16-row N block and 128-wide K tile: 64 lanes of four 9-bit indices and
 # 32 sign bits, plus a metadata byte per lane and atom whose low nibble holds
-# the indices' ninth bits. With a 1,024-entry codebook, the triplet's extra
-# 16-bit word per lane holds the tenth bits, atom a's in bits 4a..4a+3. Its high nibble holds
+# the indices' ninth bits. With a 1,024-entry codebook, the tenth bits of atoms
+# 0 and 1 fill the atom-two record's fourth metadata byte, and atom 2's a byte
+# per lane after each two-K-tile slab (iq2r_format). Its high nibble holds
 # ``exponent(b) * C + class(s(b))`` in lane group b, s = (0, 2, 1, 3): the
 # lane that supplies block b's MFMA scale keeps b's exponent, and the class of
 # the block a lane decodes codewords for sits in that lane or its neighbour
@@ -566,17 +569,24 @@ _PARTNER = (0, 2, 1, 3)
 
 def _tile_bases(
     n_block: Tensor, k_tile: Tensor, k_tiles: int, entries: int
-) -> tuple[Tensor, Tensor]:
-    """Triplet byte offset and atom of each (N block, K tile)."""
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Triplet byte offset, atom and tenth-bit word offset of each (N block, K tile)."""
 
-    tile = (
-        (n_block // IQ2R_N_BLOCKS_PER_GROUP) * k_tiles + k_tile
-    ) * IQ2R_N_BLOCKS_PER_GROUP + (n_block % IQ2R_N_BLOCKS_PER_GROUP)
-    atom = (tile % IQ2R_N_BLOCKS_PER_GROUP) % IQ2R_ATOMS_PER_TRIPLET
-    base = (tile // IQ2R_N_BLOCKS_PER_GROUP) * iq2r_group_bytes(entries) + (
-        (tile % IQ2R_N_BLOCKS_PER_GROUP) // IQ2R_ATOMS_PER_TRIPLET
-    ) * iq2r_triplet_bytes(entries)
-    return base, atom
+    slab_k_tiles = iq2r_slab_k_tiles(entries)
+    block = n_block % IQ2R_N_BLOCKS_PER_GROUP
+    atom = block % IQ2R_ATOMS_PER_TRIPLET
+    triplet = block // IQ2R_ATOMS_PER_TRIPLET
+    slab = (n_block // IQ2R_N_BLOCKS_PER_GROUP) * (
+        k_tiles // slab_k_tiles
+    ) + k_tile // slab_k_tiles
+    slab_base = slab * iq2r_slab_bytes(entries)
+    base = (
+        slab_base
+        + (k_tile % slab_k_tiles) * IQ2R_GROUP_BYTES
+        + triplet * IQ2R_TRIPLET_BYTES
+    )
+    ext = slab_base + IQ2R_WIDE_EXT_OFFSET + triplet * 64
+    return base, atom, ext
 
 
 def _vector_offsets(
@@ -600,7 +610,7 @@ def _vector_offsets(
     group = 2 * (block % 2) + position // 2
     word = 2 * (block // 2) + position % 2
     lane = group * 16 + rr
-    base, atom = _tile_bases(n_block, k_tile, k_tiles, entries)
+    base, atom, ext_base = _tile_bases(n_block, k_tile, k_tiles, entries)
     record = torch.where(
         atom < 2,
         base + lane * 2 * IQ2R_LANE_RECORD_BYTES + atom * IQ2R_LANE_RECORD_BYTES,
@@ -612,14 +622,17 @@ def _vector_offsets(
         + lane * IQ2R_ATOM_TWO_RECORD_BYTES
         + (IQ2R_ATOM_TWO_METADATA_OFFSET + atom)
     )
-    ext_bit = atom * 4 + word
-    ext = (
+    # atoms 0-1: the atom-two record's fourth metadata byte; atom 2: the slab's
+    # byte of the lane
+    tenth_byte = (
         base
-        + IQ2R_WIDE_EXT_RECORDS_OFFSET
-        + lane * IQ2R_WIDE_EXT_RECORD_BYTES
-        + ext_bit // 8
+        + IQ2R_ATOM_TWO_RECORDS_OFFSET
+        + lane * IQ2R_ATOM_TWO_RECORD_BYTES
+        + IQ2R_WIDE_TENTH_BYTE
     )
-    return record + word, metadata, word, ext, ext_bit % 8
+    ext = torch.where(atom < 2, tenth_byte, ext_base + lane)
+    ext_bit = torch.where(atom < 2, atom * 4, (k_tile % 2) * 4) + word
+    return record + word, metadata, word, ext, ext_bit
 
 
 def _level_offsets(
@@ -633,7 +646,7 @@ def _level_offsets(
     n_block, rr = row // IQ2R_TILE_N, row % IQ2R_TILE_N
     k_tile, b = blk // 4, blk % 4
     lane = b * 16 + rr
-    base, atom = _tile_bases(n_block, k_tile, k_tiles, entries)
+    base, atom, _ = _tile_bases(n_block, k_tile, k_tiles, entries)
     return (
         base
         + IQ2R_ATOM_TWO_RECORDS_OFFSET

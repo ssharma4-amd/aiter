@@ -36,17 +36,21 @@ IQ2R_TRIPLET_BYTES = IQ2R_ATOM_PAIR_RECORDS_BYTES + (
 IQ2R_GROUP_BYTES = IQ2R_TRIPLETS_PER_GROUP * IQ2R_TRIPLET_BYTES
 IQ2R_CODEBOOK_BYTES = IQ2R_CODEBOOK_ENTRIES * IQ2R_VECTOR_SIZE
 
-# A 1,024-entry codebook takes 10-bit indices. Each triplet record then ends
-# with one extra 16-bit word per lane holding the 10th index bits (four per
-# atom, 12 of the 16 bits used), after the atom-two records.
+# A 1,024-entry codebook takes 10-bit indices: each 8-weight index gains a
+# tenth bit, four per atom and lane. Atoms 0 and 1 keep theirs in the atom-two
+# record's spare fourth metadata byte (atom a's codeword j at bit 4a + j).
+# Atom 2's go to a byte per lane after every two K tiles (256 columns, the
+# tensor-parallel slicing unit): records are stored in slabs of two K tiles'
+# six-block groups, then 64 bytes per triplet (slab tile t, codeword j at bit
+# 4t + j). A 512-entry slab is one K tile.
 IQ2R_WIDE_CODEBOOK_ENTRIES = 1024
 IQ2R_CODEBOOK_SIZES = (IQ2R_CODEBOOK_ENTRIES, IQ2R_WIDE_CODEBOOK_ENTRIES)
-IQ2R_WIDE_EXT_RECORD_BYTES = 2
-IQ2R_WIDE_EXT_RECORDS_OFFSET = IQ2R_TRIPLET_BYTES
-IQ2R_WIDE_TRIPLET_BYTES = IQ2R_TRIPLET_BYTES + (
-    IQ2R_LANES_PER_TILE * IQ2R_WIDE_EXT_RECORD_BYTES
+IQ2R_WIDE_SLAB_K_TILES = 2
+IQ2R_WIDE_TENTH_BYTE = IQ2R_ATOM_TWO_METADATA_OFFSET + IQ2R_ATOMS_PER_TRIPLET
+IQ2R_WIDE_EXT_OFFSET = IQ2R_WIDE_SLAB_K_TILES * IQ2R_GROUP_BYTES
+IQ2R_WIDE_SLAB_BYTES = IQ2R_WIDE_EXT_OFFSET + (
+    IQ2R_TRIPLETS_PER_GROUP * IQ2R_LANES_PER_TILE
 )
-IQ2R_WIDE_GROUP_BYTES = IQ2R_TRIPLETS_PER_GROUP * IQ2R_WIDE_TRIPLET_BYTES
 
 
 def _require_int(name: str, value: int, *, positive: bool = False) -> None:
@@ -66,19 +70,21 @@ def iq2r_index_bits(codebook_entries: int) -> int:
     return codebook_entries.bit_length() - 1
 
 
-def iq2r_triplet_bytes(codebook_entries: int = IQ2R_CODEBOOK_ENTRIES) -> int:
-    """Bytes of one triplet record (three 16x128 tiles)."""
+def iq2r_slab_k_tiles(codebook_entries: int = IQ2R_CODEBOOK_ENTRIES) -> int:
+    """K tiles per stored slab of a six-block group: 1 (512 entries) or 2."""
 
     iq2r_index_bits(codebook_entries)
     if codebook_entries == IQ2R_WIDE_CODEBOOK_ENTRIES:
-        return IQ2R_WIDE_TRIPLET_BYTES
-    return IQ2R_TRIPLET_BYTES
+        return IQ2R_WIDE_SLAB_K_TILES
+    return 1
 
 
-def iq2r_group_bytes(codebook_entries: int = IQ2R_CODEBOOK_ENTRIES) -> int:
-    """Bytes of one six-block group per K tile."""
+def iq2r_slab_bytes(codebook_entries: int = IQ2R_CODEBOOK_ENTRIES) -> int:
+    """Bytes of one slab: a six-block group over iq2r_slab_k_tiles K tiles."""
 
-    return IQ2R_TRIPLETS_PER_GROUP * iq2r_triplet_bytes(codebook_entries)
+    if iq2r_slab_k_tiles(codebook_entries) == 1:
+        return IQ2R_GROUP_BYTES
+    return IQ2R_WIDE_SLAB_BYTES
 
 
 def iq2r_k_tiles(k: int) -> int:
@@ -112,11 +118,18 @@ def iq2r_data_bytes(
     n: int, k: int, codebook_entries: int = IQ2R_CODEBOOK_ENTRIES
 ) -> int:
     physical_n_blocks = iq2r_physical_n_blocks(n)
+    slab_k_tiles = iq2r_slab_k_tiles(codebook_entries)
+    k_tiles = iq2r_k_tiles(k)
+    if k_tiles % slab_k_tiles:
+        raise ValueError(
+            f"IQ2R with {codebook_entries} codebook entries requires K divisible by "
+            f"{slab_k_tiles * IQ2R_TILE_K}, got {k}"
+        )
     return (
         physical_n_blocks
         // IQ2R_N_BLOCKS_PER_GROUP
-        * iq2r_k_tiles(k)
-        * iq2r_group_bytes(codebook_entries)
+        * (k_tiles // slab_k_tiles)
+        * iq2r_slab_bytes(codebook_entries)
     )
 
 
@@ -146,8 +159,12 @@ class IQ2RMetadata:
         return iq2r_k_tiles(self.logical_k)
 
     @property
-    def group_bytes(self) -> int:
-        return iq2r_group_bytes(self.codebook_entries)
+    def slab_k_tiles(self) -> int:
+        return iq2r_slab_k_tiles(self.codebook_entries)
+
+    @property
+    def slab_bytes(self) -> int:
+        return iq2r_slab_bytes(self.codebook_entries)
 
     @property
     def data_bytes(self) -> int:
@@ -160,19 +177,16 @@ def iq2r_slice_input_data(
     start: int,
     length: int,
 ) -> Tensor:
-    """Extract an exact contiguous K-tile slice of stacked IQ2R data."""
+    """Extract an exact contiguous K-tile slice of stacked IQ2R data (whole slabs:
+    256-column aligned for a 1,024-entry codebook)."""
 
     _validate_byte_matrix("data", data, metadata.data_bytes)
     _require_int("start", start)
     _require_int("length", length, positive=True)
-    if (
-        start < 0
-        or start % IQ2R_TILE_K
-        or length % IQ2R_TILE_K
-        or start + length > metadata.logical_k
-    ):
+    align = IQ2R_TILE_K * metadata.slab_k_tiles
+    if start < 0 or start % align or length % align or start + length > metadata.logical_k:
         raise ValueError(
-            f"IQ2R input slice must be in range and aligned to {IQ2R_TILE_K} columns"
+            f"IQ2R input slice must be in range and aligned to {align} columns"
         )
     target = IQ2RMetadata(
         logical_n=metadata.logical_n,
@@ -181,13 +195,14 @@ def iq2r_slice_input_data(
     )
     experts = data.shape[0]
     groups = metadata.physical_n_blocks // IQ2R_N_BLOCKS_PER_GROUP
-    source = data.view(experts, groups, metadata.k_tiles, metadata.group_bytes)
-    tile_start = start // IQ2R_TILE_K
+    slabs = metadata.k_tiles // metadata.slab_k_tiles
+    source = data.view(experts, groups, slabs, metadata.slab_bytes)
+    slab_start = start // align
     # ``contiguous()`` may return the original narrow view when its strides are
     # already dense, retaining a non-zero storage offset.  IQ2R consumers treat
     # byte zero as the first packed tile, so force a fresh zero-offset storage.
     return (
-        source[:, :, tile_start : tile_start + target.k_tiles]
+        source[:, :, slab_start : slab_start + length // align]
         .clone(memory_format=torch.contiguous_format)
         .view(experts, target.data_bytes)
     )
@@ -213,11 +228,11 @@ def _validate_byte_matrix(name: str, value: Tensor, expected_bytes: int) -> None
 __all__ = [name for name in globals() if name.startswith("IQ2R_")] + [
     "IQ2RMetadata",
     "iq2r_data_bytes",
-    "iq2r_group_bytes",
     "iq2r_index_bits",
     "iq2r_k_tiles",
     "iq2r_n_blocks",
     "iq2r_physical_n_blocks",
+    "iq2r_slab_bytes",
+    "iq2r_slab_k_tiles",
     "iq2r_slice_input_data",
-    "iq2r_triplet_bytes",
 ]

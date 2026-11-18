@@ -27,20 +27,46 @@ constexpr int kAtomTwoRecordBytes  = 12;
 constexpr int kAtomTwoOffset       = 1024;
 constexpr int kTripletBytes        = 1792;
 constexpr int kGroupBytes          = 3584;
-// A 1,024-entry codebook (10-bit indices) appends one 16-bit word per lane to
-// every triplet and gate/up quad tile: the high four bits of each atom's last
-// index (bits 36-39 of its packed indices), atom a's in bits 4a..4a+3.
-constexpr int kExtRecordsOffset    = 1792;
+// A 1,024-entry codebook (10-bit indices) adds the high four bits of each
+// atom's last index (bits 36-39 of its packed indices): atoms 0 and 1 in the
+// atom-two record's fourth metadata byte (bits 24-31 of third.z), atom 2 in a
+// byte per lane after each slab of two K tiles (slab tile t at bit 4t). See
+// aiter/ops/iq2r_format.py.
+constexpr int kWideSlabBytes       = 7296;
+constexpr int kWideExtOffset       = 7168;
 
-template<int Entries>
-constexpr int iq2r_triplet_bytes()
+// Byte offset of the triplet of ``n_block`` (a multiple of 3) and K tile
+// ``k_tile``, of a matrix with KT K tiles. For 512 entries it is affine in the
+// K tile, equal to triplet_base(physical_tile(n_block,k_tile,KT)).
+template<int KT,int Entries>
+__device__ __forceinline__ int glm53_ws_source_base(int n_block,int k_tile)
 {
     static_assert(Entries==512 || Entries==1024, "IQ2R codebooks have 512 or 1024 entries");
-    return Entries==1024 ? 1920 : kTripletBytes;
+    const uint32_t n=static_cast<uint32_t>(n_block),k=static_cast<uint32_t>(k_tile);
+    if constexpr(Entries==1024)
+        return static_cast<int>(((n/kNBlocksPerGroup)*(KT/2)+k/2)*kWideSlabBytes+(k&1)*kGroupBytes+
+                                ((n%kNBlocksPerGroup)/kAtomsPerTriplet)*kTripletBytes);
+    else
+        return static_cast<int>(((n/kNBlocksPerGroup)*KT+k)*kGroupBytes+
+                                ((n%kNBlocksPerGroup)/kAtomsPerTriplet)*kTripletBytes);
 }
 
-template<int Entries>
-constexpr int iq2r_group_bytes() { return 2*iq2r_triplet_bytes<Entries>(); }
+// Byte offset of the lane's atom-2 tenth-bit byte for the triplet of
+// ``n_block`` and the slab of K tile ``k_tile`` (1,024 entries).
+template<int KT>
+__device__ __forceinline__ int glm53_ext_offset(int n_block,int k_tile,int lane)
+{
+    const uint32_t n=static_cast<uint32_t>(n_block),k=static_cast<uint32_t>(k_tile);
+    return static_cast<int>(((n/kNBlocksPerGroup)*(KT/2)+k/2)*kWideSlabBytes+kWideExtOffset+
+                            ((n%kNBlocksPerGroup)/kAtomsPerTriplet)*64)+lane;
+}
+
+// Atom ``atom``'s tenth-bit nibble of a triplet (third.w: the slab byte,
+// already shifted for the slab's second K tile).
+__device__ __forceinline__ uint32_t glm53_triplet_tenth(const uint4& third,int atom)
+{
+    return atom<2 ? (third.z>>(24+4*atom))&15u : third.w&15u;
+}
 
 __device__ __forceinline__ int64_t physical_tile(int n_block,
                                                   int k_tile,
@@ -51,12 +77,11 @@ __device__ __forceinline__ int64_t physical_tile(int n_block,
            n_block % kNBlocksPerGroup;
 }
 
-template<int Entries>
 __device__ __forceinline__ int64_t triplet_base(int64_t tile)
 {
     const int block_in_group = static_cast<int>(tile % kNBlocksPerGroup);
-    return (tile / kNBlocksPerGroup) * iq2r_group_bytes<Entries>() +
-           (block_in_group / kAtomsPerTriplet) * iq2r_triplet_bytes<Entries>();
+    return (tile / kNBlocksPerGroup) * kGroupBytes +
+           (block_in_group / kAtomsPerTriplet) * kTripletBytes;
 }
 
 __device__ __forceinline__ uint32_t load_u32(const uint8_t* pointer)
@@ -64,7 +89,8 @@ __device__ __forceinline__ uint32_t load_u32(const uint8_t* pointer)
     return *reinterpret_cast<const uint32_t*>(pointer);
 }
 
-// third.w holds the lanes' extra word of a 1,024-entry codebook (else 0).
+// third.w holds the lane's atom-2 tenth-bit byte of a 1,024-entry codebook
+// (else 0); the decode shifts it by 4 for the slab's second K tile.
 struct IQ2RCompressedTriplet
 {
     uint4 paired;
@@ -112,7 +138,6 @@ __device__ __forceinline__ void iq2r_triplet_mfma(
             opus::number<2>{});
 }
 
-template<int Entries>
 __device__ __forceinline__ IQ2RCompressedTriplet
 iq2r_load_compact_triplet(const uint8_t* data, int source_base, int lane)
 {
@@ -124,10 +149,7 @@ iq2r_load_compact_triplet(const uint8_t* data, int source_base, int lane)
     result.third.x = load_u32(third);
     result.third.y = load_u32(third + 4);
     result.third.z = load_u32(third + 8);
-    if constexpr(Entries == 1024)
-        result.third.w = *reinterpret_cast<const uint16_t*>(data + source_base + kExtRecordsOffset + lane * 2);
-    else
-        result.third.w = 0;
+    result.third.w = 0;
     return result;
 }
 
@@ -136,7 +158,7 @@ int64_t expected_data_bytes(int64_t n, int64_t k, int entries)
     const int64_t n_blocks = n / kTileN;
     const int64_t physical_n_blocks = ((n_blocks + 5) / 6) * 6;
     const int64_t k_tiles = (k + kTileK - 1) / kTileK;
-    return (physical_n_blocks / 6) * k_tiles * (entries == 1024 ? 3840 : kGroupBytes);
+    return (physical_n_blocks / 6) * (entries == 1024 ? k_tiles / 2 * kWideSlabBytes : k_tiles * kGroupBytes);
 }
 
 // GLM-5.3 IQ2R-v2 packed MoE kernels.
@@ -148,7 +170,25 @@ constexpr int kQuadBytes=2304;
 template<int Entries>
 constexpr int iq2r_quad_bytes() { return Entries==1024 ? 2432 : kQuadBytes; }
 
-// ext: the lane's extra word of a 1,024-entry codebook (else 0).
+// 1,024 entries: each six-tile K slice of a quad (one decode-gate wave's)
+// stores its six 2304-byte tiles, then a 12-byte tenth-bit word per lane
+// (slice tile t's four atom nibbles in bits 16t..16t+15).
+constexpr int kQuadSliceTiles=6;
+constexpr int kQuadSliceBytes=kQuadSliceTiles*2432;
+constexpr int kQuadSliceExtOffset=kQuadSliceTiles*kQuadBytes;
+
+// Byte offset of quad tile ``kt`` (0..47) of N tile ``n_tile``.
+template<int Entries>
+__device__ __forceinline__ int iq2r_quad_offset(int n_tile,int kt)
+{
+    if constexpr(Entries==1024)
+        return n_tile*48*2432+(kt/kQuadSliceTiles)*kQuadSliceBytes+(kt%kQuadSliceTiles)*kQuadBytes;
+    else
+        return (n_tile*48+kt)*kQuadBytes;
+}
+
+// ext: the lane's tenth-bit nibbles of a 1,024-entry codebook in bits 0-15
+// (else 0), atom a's at bit 4a.
 struct IQ2RCompressedQuad { uint4 first; uint4 second; uint32_t metadata; uint32_t ext; };
 
 using iq2r_scheduled_i32x3 = int __attribute__((ext_vector_type(3)));
@@ -158,10 +198,7 @@ __device__ iq2r_scheduled_i32x3 iq2r_scheduled_load_dwordx3(opus::i32x4_t, int, 
 
 __device__ opus::i32x4_t iq2r_scheduled_load_dwordx4(opus::i32x4_t, int, int, int)
     __asm("llvm.amdgcn.raw.buffer.load.v4i32");
-__device__ unsigned short iq2r_scheduled_buffer_load_u16(opus::i32x4_t, int, int, int)
-    __asm("llvm.amdgcn.raw.buffer.load.i16");
 
-template<int Entries=512>
 __device__ __forceinline__ IQ2RCompressedTriplet iq2r_scheduled_load_compact_uniform(
     const uint8_t* data, int data_bytes, int base, int lane)
 {
@@ -175,10 +212,7 @@ __device__ __forceinline__ IQ2RCompressedTriplet iq2r_scheduled_load_compact_uni
     IQ2RCompressedTriplet out;
     out.paired = __builtin_bit_cast(uint4, iq2r_scheduled_load_dwordx4(rsrc, lane*16, scalar_base, 2));
     const auto third = iq2r_scheduled_load_dwordx3(rsrc, lane*12+kAtomTwoOffset, scalar_base, 2);
-    uint32_t ext = 0;
-    if constexpr(Entries == 1024)
-        ext = iq2r_scheduled_buffer_load_u16(rsrc, lane*2+kExtRecordsOffset, scalar_base, 2);
-    out.third = make_uint4(third[0], third[1], third[2], ext);
+    out.third = make_uint4(third[0], third[1], third[2], 0);
     asm volatile("" ::: "memory");
     return out;
 }
@@ -215,12 +249,39 @@ __device__ __forceinline__ IQ2RCompressedQuad iq2r_scheduled_load_quad(
     out.first=__builtin_bit_cast(uint4,iq2r_scheduled_load_dwordx4(rsrc,lane*16,sb,Policy));
     out.second=__builtin_bit_cast(uint4,iq2r_scheduled_load_dwordx4(rsrc,lane*16+1024,sb,Policy));
     out.metadata=iq2r_scheduled_buffer_load1(rsrc,lane*4+2048,sb,Policy);
-    if constexpr(Entries==1024)
-        out.ext=iq2r_scheduled_buffer_load_u16(rsrc,lane*2+2304,sb,Policy);
-    else
-        out.ext=0;
+    out.ext=0;
     asm volatile("" ::: "memory");
     return out;
+}
+
+using iq2r_u32x3 = uint32_t __attribute__((ext_vector_type(3)));
+
+// 1,024 entries: the lane's tenth-bit words of six-tile K slice ``slice`` of
+// N tile ``n_tile`` (iq2r_quad_ext picks a tile's).
+template<int Policy>
+__device__ __forceinline__ iq2r_u32x3 iq2r_load_quad_ext(const uint8_t* data,int data_bytes,int n_tile,int slice,int lane)
+{
+    const opus::i32x4_t rsrc=iq2r_buffer_rsrc(data,data_bytes);
+    const int sb=__builtin_amdgcn_readfirstlane(n_tile*48*2432+slice*kQuadSliceBytes);
+    const auto words=iq2r_scheduled_load_dwordx3(rsrc,lane*12+kQuadSliceExtOffset,sb,Policy);
+    return {static_cast<uint32_t>(words[0]),static_cast<uint32_t>(words[1]),static_cast<uint32_t>(words[2])};
+}
+
+// 1,024 entries: the lane's tenth-bit dword of quad tiles kt and kt + 1 (kt
+// even) of N tile ``n_tile``: tile kt's nibbles in bits 0-15.
+template<int Policy>
+__device__ __forceinline__ uint32_t iq2r_load_quad_ext_pair(const uint8_t* data,int data_bytes,int n_tile,int kt,int lane)
+{
+    const opus::i32x4_t rsrc=iq2r_buffer_rsrc(data,data_bytes);
+    const int sb=__builtin_amdgcn_readfirstlane(n_tile*48*2432+(kt/kQuadSliceTiles)*kQuadSliceBytes);
+    return iq2r_scheduled_buffer_load1(rsrc,lane*12+kQuadSliceExtOffset+(kt%kQuadSliceTiles)/2*4,sb,Policy);
+}
+
+// Tenth-bit nibbles of slice tile ``position`` (0..5) in bits 0-15.
+__device__ __forceinline__ uint32_t iq2r_quad_ext(const iq2r_u32x3& words,int position)
+{
+    const uint32_t word=position<2?words[0]:position<4?words[1]:words[2];
+    return word>>(16*(position&1));
 }
 
 // IQ2R-v2 (aiter/ops/iq2r_v2.py, iq2r_glm53_pack_v2) with Classes codebook
@@ -470,7 +531,7 @@ __global__ __launch_bounds__(512,1) void glm53_gate_m1_kernel(
 {
 #if defined(__gfx950__)
     constexpr int MAtoms=1;
-    constexpr int K=6144, Rows=16*MAtoms, QuadBytes=iq2r_quad_bytes<Entries>();
+    constexpr int K=6144, Rows=16*MAtoms;
     constexpr int BookWords=iq2r_codebook_words<Classes,Entries>();
     struct Storage {
         alignas(16) uint64_t codebook[BookWords];
@@ -505,8 +566,12 @@ __global__ __launch_bounds__(512,1) void glm53_gate_m1_kernel(
 #pragma unroll
         for(int m=0;m<MAtoms;++m) rows[m]=min(row_begin+m*16+lane_row,row_end-1);
         opus::vector_t<float,4> accumulators[MAtoms][4]={};
-        int base=(n_tile*48+wave*6)*QuadBytes;
+        // Each wave's six K tiles are one quad slice (and, for 1,024 entries,
+        // one tenth-bit load).
+        int base=iq2r_quad_offset<Entries>(n_tile,wave*6);
         IQ2RCompressedQuad pending=iq2r_scheduled_load_quad<Policy,Entries>(data,data_bytes,base,lane);
+        [[maybe_unused]] iq2r_u32x3 ext_words{};
+        if constexpr(Entries==1024)ext_words=iq2r_load_quad_ext<Policy>(data,data_bytes,n_tile,wave,lane);
         iq2r_v2_book_form<512,Entries>(shared.codebook,gate_base,wave*64+lane);
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         __syncthreads();
@@ -524,10 +589,11 @@ __global__ __launch_bounds__(512,1) void glm53_gate_m1_kernel(
                 *reinterpret_cast<uint4*>(a[m].bytes+16)=*reinterpret_cast<const uint4*>(input+ak+64);
                 sa[m]=scales[static_cast<int64_t>(rows[m])*192+kt*4+lane_group]*0x01010101u;
             }
-            const auto compressed=pending;
+            auto compressed=pending;
+            if constexpr(Entries==1024)compressed.ext=iq2r_quad_ext(ext_words,iteration);
             if(iteration<5)
             {
-                base+=QuadBytes;
+                base+=kQuadBytes;
                 pending=iq2r_scheduled_load_quad<Policy,Entries>(data,data_bytes,base,lane);
             }
             glm53_quad_decode_mfma<MAtoms,Classes,Entries>(compressed,shared.codebook,d_words[iteration/2],a,sa,accumulators,MAtoms);
@@ -601,7 +667,7 @@ __global__ __launch_bounds__(64*Waves,2) void glm53_gate_prefill_kernel(
     uint8_t* __restrict__ output_scales,int routes,int data_bytes,int auxiliary_bytes)
 {
 #if defined(__gfx950__)
-    constexpr int Rows=64,MAtoms=4,Threads=Waves*64,QuadBytes=iq2r_quad_bytes<Entries>();
+    constexpr int Rows=64,MAtoms=4,Threads=Waves*64;
     constexpr int BookWords=iq2r_codebook_words<Classes,Entries>();
     struct Storage {
         alignas(16) uint64_t codebook[BookWords];
@@ -676,7 +742,15 @@ __global__ __launch_bounds__(64*Waves,2) void glm53_gate_prefill_kernel(
                 s_buffer.template async_load<4>(shared.scales+slot*Rows*4,source_s+kt*4);
             asm volatile("" ::: "memory");
         };
-        IQ2RCompressedQuad pending=iq2r_scheduled_load_quad<0,Entries>(data,data_bytes,n_tile*48*QuadBytes,lane);
+        IQ2RCompressedQuad pending=iq2r_scheduled_load_quad<0,Entries>(data,data_bytes,iq2r_quad_offset<Entries>(n_tile,0),lane);
+        // 1,024 entries: the tenth-bit dword of the pending tile and the next
+        // (one VGPR: this kernel runs at the 256-VGPR limit).
+        [[maybe_unused]] uint32_t ext_pair=0;
+        if constexpr(Entries==1024)
+        {
+            ext_pair=iq2r_load_quad_ext_pair<0>(data,data_bytes,n_tile,0,lane);
+            pending.ext=ext_pair;
+        }
         // d words load one K256 ahead, with the records.
         uint32_t pending_d=iq2r_v2_bases<Classes,Entries>(aux,n_tile,24,0,lane_row);
         issue_a(0,0);
@@ -708,7 +782,12 @@ __global__ __launch_bounds__(64*Waves,2) void glm53_gate_prefill_kernel(
                 if(kt<47)
                 {
                     issue_a(kt+1,1-slot);
-                    pending=iq2r_scheduled_load_quad<0,Entries>(data,data_bytes,(n_tile*48+kt+1)*QuadBytes,lane);
+                    pending=iq2r_scheduled_load_quad<0,Entries>(data,data_bytes,iq2r_quad_offset<Entries>(n_tile,kt+1),lane);
+                    if constexpr(Entries==1024)
+                    {
+                        if((kt&1)==1)ext_pair=iq2r_load_quad_ext_pair<0>(data,data_bytes,n_tile,kt+1,lane);
+                        pending.ext=(kt&1)==1?ext_pair:ext_pair>>16;
+                    }
                     if((kt&1)==1) pending_d=iq2r_v2_bases<Classes,Entries>(aux,n_tile,24,(kt+1)/2,lane_row);
                 }
                 glm53_quad_decode_mfma<MAtoms,Classes,Entries>(compressed,lane_book,bases,a,sa,partial,active_m);
@@ -852,7 +931,7 @@ __device__ __forceinline__ void glm53_decode_packed_atom(
                                        : compressed.third.y;
     const uint32_t metadata = compressed.third.z;
     const uint32_t index_highs = (metadata >> (Atom * 8)) & 0x0fu;
-    const uint32_t index_ext = (compressed.third.w >> (Atom * 4)) & 0x0fu;
+    const uint32_t index_ext = glm53_triplet_tenth(compressed.third, Atom);
     const IQ2RLevels levels = given_levels ? *given_levels : iq2r_levels<Classes,Entries>(metadata);
     union
     {
@@ -875,15 +954,6 @@ __device__ __forceinline__ void glm53_decode_packed_atom(
     scale_b = given_scales ? (*given_scales>>(Atom*8))&255u : iq2r_scale_b<Classes>(packed_bases, metadata, Atom);
 }
 
-// Packed triplet source offset; with n_block%3==0 it is affine in the K tile,
-// equal to triplet_base(physical_tile(n_block,k_tile,k_tiles)).
-template<int KT,int Entries>
-__device__ __forceinline__ int glm53_ws_source_base(int n_block,int k_tile)
-{
-    const uint32_t n=static_cast<uint32_t>(n_block);
-    return static_cast<int>(((n/kNBlocksPerGroup)*KT+static_cast<uint32_t>(k_tile))*iq2r_group_bytes<Entries>()+
-                            ((n%kNBlocksPerGroup)/kAtomsPerTriplet)*iq2r_triplet_bytes<Entries>());
-}
 
 // TP4 down, K tiles outermost: the three atoms of a triplet share
 // each K tile's activation fragment, metadata swap and scale bytes. Each
@@ -1003,7 +1073,11 @@ __global__ __launch_bounds__(64*Waves,Occupancy) void glm53_down_tp4_kernel(
                 const int nb=n_tile*(Columns/16)+wave*3;
                 pending_bases=iq2r_triplet_bases<Classes,KT,Entries>(aux,nb,lane_row);
 #pragma unroll
-                for(int kt=0;kt<KT;++kt)pending[kt]=iq2r_load_compact_triplet<Entries>(data,glm53_ws_source_base<KT,Entries>(nb,kt),lane);
+                for(int kt=0;kt<KT;++kt)pending[kt]=iq2r_load_compact_triplet(data,glm53_ws_source_base<KT,Entries>(nb,kt),lane);
+                if constexpr(Entries==1024)
+#pragma unroll
+                    for(int kt=0;kt<KT;kt+=2)
+                        pending[kt].third.w=pending[kt+1].third.w=*(data+glm53_ext_offset<KT>(nb,kt,lane));
             }
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
             __syncthreads();
@@ -1020,9 +1094,17 @@ __global__ __launch_bounds__(64*Waves,Occupancy) void glm53_down_tp4_kernel(
                     const int nb=n_block+Waves*3;
                     pending_bases=iq2r_triplet_bases<Classes,KT,Entries>(aux,nb,lane_row);
 #pragma unroll
-                    for(int kt=0;kt<KT;++kt)pending[kt]=iq2r_load_compact_triplet<Entries>(data,glm53_ws_source_base<KT,Entries>(nb,kt),lane);
+                    for(int kt=0;kt<KT;++kt)pending[kt]=iq2r_load_compact_triplet(data,glm53_ws_source_base<KT,Entries>(nb,kt),lane);
+                    if constexpr(Entries==1024)
+#pragma unroll
+                        for(int kt=0;kt<KT;kt+=2)
+                            pending[kt].third.w=pending[kt+1].third.w=*(data+glm53_ext_offset<KT>(nb,kt,lane));
                     asm volatile("" ::: "memory");
                 }
+                // A slab's second K tile reads the high nibble of the tenth-bit byte.
+                if constexpr(Entries==1024)
+#pragma unroll
+                    for(int kt=1;kt<KT;kt+=2)compressed[kt].third.w>>=4;
                 opus::vector_t<float,4> sums[3][MAtoms];
                 glm53_down_tp4_triplet<KT,MAtoms,Classes,Entries>(compressed,shared.codebook,bases,shared.input,shared.scales,active_m,lane_row,lane_group,sums);
 #pragma unroll
@@ -1131,13 +1213,24 @@ __global__ __launch_bounds__(64*Waves,Occupancy) void glm53_down_prefill_tp4_ker
                 const uint64_t bases=iq2r_triplet_bases<Classes,KT,Entries>(aux,n_block,lane_row);
                 opus::vector_t<float,4> sum[MAtoms][3];
                 // Rolled K loop: one compressed K tile live plus a one-ahead
-                // load, keeping VGPRs low enough for more resident waves.
-                IQ2RCompressedTriplet current=iq2r_load_compact_triplet<Entries>(data,glm53_ws_source_base<KT,Entries>(n_block,0),lane);
-#pragma unroll 1
+                // load, keeping VGPRs low enough for more resident waves. At
+                // two workgroups per CU (1,024 entries: the LDS limit) the
+                // loop unrolls instead.
+                constexpr int KUnroll=Occupancy==2?KT:1;
+                IQ2RCompressedTriplet current=iq2r_load_compact_triplet(data,glm53_ws_source_base<KT,Entries>(n_block,0),lane);
+                if constexpr(Entries==1024)current.third.w=*(data+glm53_ext_offset<KT>(n_block,0,lane));
+#pragma unroll KUnroll
                 for(int kt=0;kt<KT;++kt)
                 {
                     IQ2RCompressedTriplet next=current;
-                    if(kt+1<KT)next=iq2r_load_compact_triplet<Entries>(data,glm53_ws_source_base<KT,Entries>(n_block,kt+1),lane);
+                    if(kt+1<KT)
+                    {
+                        next=iq2r_load_compact_triplet(data,glm53_ws_source_base<KT,Entries>(n_block,kt+1),lane);
+                        // A slab's two K tiles share one tenth-bit byte.
+                        if constexpr(Entries==1024)
+                            next.third.w=(kt&1)?*(data+glm53_ext_offset<KT>(n_block,kt+1,lane)):current.third.w;
+                    }
+                    if constexpr(Entries==1024)current.third.w>>=4*(kt&1);
                     opus::i32x8_t w[3];uint32_t sb[3];
                     // The atoms share the K tile's levels and scale bytes. Declared
                     // zeroed and then assigned: initialized directly, ROCm 7.2 adds
@@ -1302,7 +1395,8 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_prefill_tp8_kernel(
                 const int nb=n_tile*(Columns/16)+wave*3;
                 pending_bases=iq2r_triplet_bases<Classes,2,Entries>(aux,nb,lane_row);
 #pragma unroll
-                for(int kt=0;kt<2;++kt)pending[kt]=iq2r_load_compact_triplet<Entries>(data,static_cast<int>(triplet_base<Entries>(physical_tile(nb,kt,2))),lane);
+                for(int kt=0;kt<2;++kt)pending[kt]=iq2r_load_compact_triplet(data,Entries==1024?glm53_ws_source_base<2,Entries>(nb,kt):static_cast<int>(triplet_base(physical_tile(nb,kt,2))),lane);
+                if constexpr(Entries==1024)pending[0].third.w=pending[1].third.w=*(data+glm53_ext_offset<2>(nb,0,lane));
             }
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
             __syncthreads();
@@ -1314,12 +1408,15 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_prefill_tp8_kernel(
         const uint64_t bases=pending_bases;
         IQ2RCompressedTriplet compressed[2];
         compressed[0]=pending[0];compressed[1]=pending[1];
+        // K tile 1 reads the high nibble of the slab's tenth-bit byte.
+        if constexpr(Entries==1024)compressed[1].third.w>>=4;
         if(group+1<Groups)
         {
             const int nb=n_block+Waves*3;
             pending_bases=iq2r_triplet_bases<Classes,2,Entries>(aux,nb,lane_row);
 #pragma unroll
-            for(int kt=0;kt<2;++kt)pending[kt]=iq2r_load_compact_triplet<Entries>(data,static_cast<int>(triplet_base<Entries>(physical_tile(nb,kt,2))),lane);
+            for(int kt=0;kt<2;++kt)pending[kt]=iq2r_load_compact_triplet(data,Entries==1024?glm53_ws_source_base<2,Entries>(nb,kt):static_cast<int>(triplet_base(physical_tile(nb,kt,2))),lane);
+            if constexpr(Entries==1024)pending[0].third.w=pending[1].third.w=*(data+glm53_ext_offset<2>(nb,0,lane));
             asm volatile("" ::: "memory");
         }
             // The atoms share each K tile's levels and scale bytes.
@@ -1700,7 +1797,7 @@ __device__ __forceinline__ void glm53_gather_atom_wide(const IQ2RCompressedTripl
 {
     const uint32_t index_lows=Atom==0?compressed.paired.x:Atom==1?compressed.paired.z:compressed.third.x;
     const uint32_t index_highs=(compressed.third.z>>(Atom*8))&0x0fu;
-    const uint32_t index_ext=(compressed.third.w>>(Atom*4))&0x0fu;
+    const uint32_t index_ext=glm53_triplet_tenth(compressed.third,Atom);
 #pragma unroll
     for(int codeword=0;codeword<4;++codeword)
         raw[codeword]=book[iq2r_atom_index<1024>(index_lows,index_highs,index_ext,codeword)];
@@ -1804,14 +1901,23 @@ __global__ __launch_bounds__(512,1) void glm53_down_route9_wide_kernel(
                 for(int t=0;t<Triplets;++t)
                 {
                     const uint32_t tr=blockIdx.x*Triplets+t;  // first+t*Atoms == 3*tr
-                    compressed[t][ktile]=iq2r_scheduled_load_compact_uniform<Entries>(
-                        data,data_bytes,
-                        static_cast<int>(((tr>>1)*KT+ktile)*iq2r_group_bytes<Entries>()+(tr&1)*iq2r_triplet_bytes<Entries>()),
-                        lane);
+                    compressed[t][ktile]=iq2r_scheduled_load_compact_uniform(
+                        data,data_bytes,glm53_ws_source_base<KT,Entries>(3*tr,ktile),lane);
+                    // A slab's two K tiles share one tenth-bit byte.
+                    if(ktile%2==0)
+                        compressed[t][ktile].third.w=iq2r_buffer_load_u8(
+                            iq2r_buffer_rsrc(data,data_bytes),lane,
+                            __builtin_amdgcn_readfirstlane(glm53_ext_offset<KT>(3*tr,ktile,0)),2);
+                    else
+                        compressed[t][ktile].third.w=compressed[t][ktile-1].third.w;
                 }
 #pragma unroll
             for(int t=0;t<Triplets;++t)bases[t]=iq2r_triplet_bases<Classes,KT,Entries>(aux,first+t*Atoms,lane_row);
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#pragma unroll
+            for(int t=0;t<Triplets;++t)
+#pragma unroll
+                for(int ktile=1;ktile<KT;ktile+=2)compressed[t][ktile].third.w>>=4;
             // after the vector wait: the scalar loads' wait lands here
             asm volatile("" : "+s"(gain));
 #pragma unroll
@@ -2075,7 +2181,8 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_tp8_ordered_kernel(
                 const int nb=n_tile*(Columns/16)+wave*3;
                 pending_bases=iq2r_triplet_bases<Classes,2,Entries>(aux,nb,lane_row);
 #pragma unroll
-                for(int kt=0;kt<2;++kt)pending[kt]=iq2r_load_compact_triplet<Entries>(data,glm53_ws_source_base<2,Entries>(nb,kt),lane);
+                for(int kt=0;kt<2;++kt)pending[kt]=iq2r_load_compact_triplet(data,glm53_ws_source_base<2,Entries>(nb,kt),lane);
+                if constexpr(Entries==1024)pending[0].third.w=pending[1].third.w=*(data+glm53_ext_offset<2>(nb,0,lane));
             }
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
             __syncthreads();
@@ -2087,12 +2194,15 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_tp8_ordered_kernel(
         const uint64_t bases=pending_bases;
         IQ2RCompressedTriplet compressed[2];
         compressed[0]=pending[0];compressed[1]=pending[1];
+        // K tile 1 reads the high nibble of the slab's tenth-bit byte.
+        if constexpr(Entries==1024)compressed[1].third.w>>=4;
         if(group+1<Groups)
         {
             const int nb=n_block+Waves*3;
             pending_bases=iq2r_triplet_bases<Classes,2,Entries>(aux,nb,lane_row);
 #pragma unroll
-            for(int kt=0;kt<2;++kt)pending[kt]=iq2r_load_compact_triplet<Entries>(data,glm53_ws_source_base<2,Entries>(nb,kt),lane);
+            for(int kt=0;kt<2;++kt)pending[kt]=iq2r_load_compact_triplet(data,glm53_ws_source_base<2,Entries>(nb,kt),lane);
+            if constexpr(Entries==1024)pending[0].third.w=pending[1].third.w=*(data+glm53_ext_offset<2>(nb,0,lane));
             asm volatile("" ::: "memory");
         }
             [[maybe_unused]] IQ2RLevels lv[2];[[maybe_unused]] uint32_t sc[2];
@@ -2389,7 +2499,7 @@ __global__ __launch_bounds__(512,4) void glm53_gate_decode_nobarrier_v2_kernel(
     int routes,int data_bytes,int auxiliary_bytes)
 {
 #if defined(__gfx950__)
-    constexpr int K=6144, MAtoms=1, QuadBytes=iq2r_quad_bytes<Entries>();
+    constexpr int K=6144, MAtoms=1;
     constexpr int BookWords=iq2r_codebook_words<Classes,Entries>();
     struct Storage {
         alignas(16) uint64_t codebook[BookWords];
@@ -2431,7 +2541,9 @@ __global__ __launch_bounds__(512,4) void glm53_gate_decode_nobarrier_v2_kernel(
         for(int m=0;m<MAtoms;++m) rows[m]=gather[min(row_begin+m*16+lane_row,row_end-1)]/9;
         opus::vector_t<float,4> accumulators[MAtoms][4]={};
         const int swave=__builtin_amdgcn_readfirstlane(wave);
-        int base=(n_tile*48+swave*6)*QuadBytes;
+        // Each wave's six K tiles are one quad slice (and, for 1,024 entries,
+        // one tenth-bit load).
+        int base=iq2r_quad_offset<Entries>(n_tile,swave*6);
         const opus::i32x4_t act_rsrc=iq2r_buffer_rsrc(activations,routes/9*K);
         const opus::i32x4_t scale_rsrc=iq2r_buffer_rsrc(scales,routes/9*192);
         const opus::i32x4_t d_rsrc=iq2r_buffer_rsrc(aux,auxiliary_bytes);
@@ -2442,6 +2554,12 @@ __global__ __launch_bounds__(512,4) void glm53_gate_decode_nobarrier_v2_kernel(
         const int d_off=BookWords*8+(n_tile*24*16+lane_row)*4;
         uint64_t pending_book[4]={};
         IQ2RCompressedQuad pending=iq2r_scheduled_load_quad<2,Entries>(data,data_bytes,base,lane);
+        [[maybe_unused]] iq2r_u32x3 ext_words{};
+        if constexpr(Entries==1024)
+        {
+            ext_words=iq2r_load_quad_ext<2>(data,data_bytes,n_tile,swave,lane);
+            pending.ext=iq2r_quad_ext(ext_words,0);
+        }
         if(new_expert) {
             // Plain LDS stores: the barrier publishes them, and the item's
             // first quad and activation loads stay in flight across it.
@@ -2465,8 +2583,9 @@ __global__ __launch_bounds__(512,4) void glm53_gate_decode_nobarrier_v2_kernel(
             const uint32_t bases=iq2r_scheduled_buffer_load1(d_rsrc,d_off,(kt/2)*64,0);
             const IQ2RCompressedQuad compressed=pending;
             if(iteration<5) {
-                base+=QuadBytes;
+                base+=kQuadBytes;
                 pending=iq2r_scheduled_load_quad<2,Entries>(data,data_bytes,base,lane);
+                if constexpr(Entries==1024)pending.ext=iq2r_quad_ext(ext_words,iteration+1);
             }
             glm53_cross_k_decode_mfma<MAtoms,Classes,Entries>(compressed,pending,shared.codebook,bases,a,sa,accumulators,active_m,pending_book,iteration==0,iteration<5,levels);
         }
@@ -2905,10 +3024,10 @@ void iq2r_glm53_down_reduce_out(const aiter_tensor_t& activations,
         // 768 columns; TP8: N-wave tiles sharing one cached activation tile.
 #define GLM53_PREFILL_DOWNS(E)                                                                          \
         if(K == 512 && chunks == 1)                                                                     \
-            GLM53_PREFILL_DOWN((glm53_down_prefill_tp4_kernel<4, 4, 8, 4, 4, 1, 3, C, E>), 16,          \
+            GLM53_PREFILL_DOWN((glm53_down_prefill_tp4_kernel<4, 4, 8, 4, 4, 1, (E == 1024 ? 2 : 3), C, E>), 16, \
                                static_cast<__hip_bfloat16*>(route_output.data_ptr()), routes, static_cast<int>(data.size(0))); \
         else if(K == 512)                                                                               \
-            GLM53_PREFILL_DOWN((glm53_down_prefill_tp4_kernel<4, 4, 8, 4, 4, 2, 3, C, E>), 16,          \
+            GLM53_PREFILL_DOWN((glm53_down_prefill_tp4_kernel<4, 4, 8, 4, 4, 2, (E == 1024 ? 2 : 3), C, E>), 16, \
                                static_cast<__hip_bfloat16*>(route_output.data_ptr()), routes, static_cast<int>(data.size(0))); \
         else if(chunks == 1)                                                                            \
             GLM53_PREFILL_DOWN((glm53_down_prefill_tp8_kernel<4, 2, 2, 8, 4, 1, C, E>), 8,              \

@@ -56,18 +56,19 @@ from aiter.ops.iq2r_v2 import (
 from aiter.utility.base_tuner import TunerCommon
 
 CONFIG_ENV = "AITER_CONFIG_IQ2R_GLM53"
-KEYS = ["gfx", "cu_num", "token", "model_dim", "inter_dim", "expert", "topk"]
+KEYS = ["gfx", "cu_num", "token", "model_dim", "inter_dim", "expert", "topk", "codebook"]
 RESULTS = ["gate_kernel", "gate_grid", "down_kernel", "down_grid", "down_chunks", "us"]
 ROTATE_BYTES = 1 << 30  # expert weights read per graph replay: 4x the MALL
 
 
-def synthetic_weights(intermediate_size: int, device: str):
-    """Three encoded random experts tiled over all 256, with their dense weights.
+def synthetic_weights(intermediate_size: int, device: str, entries: int = 512):
+    """Three encoded random experts tiled over all 256, with their dense weights,
+    for a 512- or 1,024-entry codebook.
 
     Returns ``(packed, gate, down, pick)``: expert ``e`` uses ``gate[pick[e]]``.
     """
     levels = IQ2R_V2_LEVELS_C4
-    codebook = iq2r_v2_seed_codebook(device)
+    codebook = iq2r_v2_seed_codebook(device, entries)
 
     def matrix(n: int, k: int, interleaved: bool):
         records, dense = [], []
@@ -79,10 +80,14 @@ def synthetic_weights(intermediate_size: int, device: str):
             gains = iq2r_v2_gains(
                 weight, enc.reconstruction, 0.98, interleaved=interleaved
             )
-            data = iq2r_v2_write_data(enc.indices, enc.negative, enc.levels, levels)
+            data = iq2r_v2_write_data(
+                enc.indices, enc.negative, enc.levels, levels, entries
+            )
             aux = iq2r_v2_write_auxiliary(codebook[None], enc.d, gains)
             records.append((data, aux))
-            dense.append(iq2r_v2_materialize(data, aux, n, k, levels))
+            dense.append(
+                iq2r_v2_materialize(data, aux, n, k, levels, codebook_entries=entries)
+            )
         data, aux = (torch.stack(parts)[pick] for parts in zip(*records))
         return data, aux, dense
 
@@ -180,6 +185,11 @@ def candidates(tokens: int, intermediate_size: int):
             yield IQ2RGlm53Config("prefill", grid, "prefill", 0, chunks)
 
 
+def _label(tokens: int, intermediate_size: int, entries: int) -> str:
+    label = f"M={tokens} I={intermediate_size}"
+    return label if entries == 512 else f"{label} C={entries}"
+
+
 def capture_graph(calls):
     """A CUDA graph that runs ``calls`` in turn.
 
@@ -234,10 +244,10 @@ class IQ2RGlm53Tuner(TunerCommon):
 
     def __init__(self):
         super().__init__("iq2r_glm53_tuned", KEYS, RESULTS, __doc__.splitlines()[0])
-        self._intermediate_size = None
+        self._layer_key = None  # (intermediate, codebook entries) of self._layers
         self._layers = []  # copies of one synthetic packed layer
         self._dense = None  # (gate, down, pick) of the layer
-        self._weight_bytes = {}  # (tokens, intermediate) -> expert bytes per call
+        self._weight_bytes = {}  # (tokens, intermediate, entries) -> expert bytes per call
 
     def _setup_specific_arguments(self):
         pass
@@ -262,29 +272,32 @@ class IQ2RGlm53Tuner(TunerCommon):
             | (self.untunedf.expert != EXPERTS)
             | (self.untunedf.topk != TOPK)
             | ~self.untunedf.inter_dim.isin(glm53.INTERMEDIATE_SIZES)
+            | ~self.untunedf.codebook.isin([512, 1024])
         )
         if unsupported.any():
             raise ValueError(
-                "the GLM-5.3 tuner covers hidden 6144, 256 experts, top-8 and "
-                f"inter_dim {glm53.INTERMEDIATE_SIZES}"
+                "the GLM-5.3 tuner covers hidden 6144, 256 experts, top-8, "
+                f"inter_dim {glm53.INTERMEDIATE_SIZES} and codebooks of 512 or 1024"
             )
 
-    def _layer(self, intermediate_size: int, copies: int = 1):
-        """The first ``copies`` copies of the synthetic layer for one width."""
-        if intermediate_size != self._intermediate_size:
+    def _layer(self, intermediate_size: int, entries: int, copies: int = 1):
+        """The first ``copies`` copies of the synthetic layer for one width and codebook."""
+        if (intermediate_size, entries) != self._layer_key:
             self._layers, self._dense = [], None
             torch.cuda.empty_cache()
             torch.manual_seed(0)
-            packed, gate, down, pick = synthetic_weights(intermediate_size, "cuda")
-            self._intermediate_size = intermediate_size
+            packed, gate, down, pick = synthetic_weights(
+                intermediate_size, "cuda", entries
+            )
+            self._layer_key = (intermediate_size, entries)
             self._layers, self._dense = [packed], (gate, down, pick)
         while len(self._layers) < copies:
             self._layers.append(tuple(t.clone() for t in self._layers[0]))
         return self._layers[:copies]
 
-    def _shape(self, tokens: int, intermediate_size: int):
+    def _shape(self, tokens: int, intermediate_size: int, entries: int = 512):
         """Inputs, dense reference and rotated calls for one shape."""
-        (packed,) = self._layer(intermediate_size)
+        (packed,) = self._layer(intermediate_size, entries)
         hidden = torch.randn((tokens, HIDDEN), dtype=torch.bfloat16, device="cuda")
         routes = [routing(tokens, "cuda")]
         expert_bytes = sum(t.nbytes for t in packed) // EXPERTS
@@ -292,8 +305,8 @@ class IQ2RGlm53Tuner(TunerCommon):
         while sum(read) < ROTATE_BYTES:
             routes.append(routing(tokens, "cuda"))
             read.append(routes[-1][1].unique().numel() * expert_bytes)
-        self._weight_bytes[(tokens, intermediate_size)] = sum(read) / len(read)
-        layers = self._layer(intermediate_size, len(routes))
+        self._weight_bytes[(tokens, intermediate_size, entries)] = sum(read) / len(read)
+        layers = self._layer(intermediate_size, entries, len(routes))
         weights, ids = routes[0]
         return SimpleNamespace(
             hidden=hidden,
@@ -321,9 +334,9 @@ class IQ2RGlm53Tuner(TunerCommon):
     def tune(self, untunedf, tunedf, args):
         results = []
         for key in untunedf[self.keys].itertuples(index=False, name=None):
-            tokens, intermediate_size = int(key[2]), int(key[4])
-            shape = self._shape(tokens, intermediate_size)
-            label = f"M={tokens} I={intermediate_size}"
+            tokens, intermediate_size, entries = int(key[2]), int(key[4]), int(key[7])
+            shape = self._shape(tokens, intermediate_size, entries)
+            label = _label(tokens, intermediate_size, entries)
             # Every candidate must match the dense reference, and match
             # element-wise the first candidate that did (down variants may sum
             # the eight routes in a different order).
@@ -392,10 +405,11 @@ class IQ2RGlm53Tuner(TunerCommon):
         (averaged over the rotation) plus the BF16 input and output."""
         info, us, _ = results
         tokens, intermediate_size = int(info[0][2]), int(info[0][4])
+        entries = int(info[0][7])
         if us <= 0:
             return 0.0, 0.0
         flops = 6 * tokens * TOPK * HIDDEN * intermediate_size
-        nbytes = self._weight_bytes.get((tokens, intermediate_size), 0) + (
+        nbytes = self._weight_bytes.get((tokens, intermediate_size, entries), 0) + (
             tokens * HIDDEN * (inbpe + outbpe)
         )
         return flops / us / 1e6, nbytes / us / 1e6
@@ -411,10 +425,10 @@ class IQ2RGlm53Tuner(TunerCommon):
         tuned = self.update_tunedf(self.get_tuned_gemm_list(file), results[~failed])
         tuned.to_csv(file, index=False)
 
-    def _run_lookup(self, tokens: int, intermediate_size: int, args):
+    def _run_lookup(self, tokens: int, intermediate_size: int, entries: int, args):
         """Check and time the launch choice the CSV lookup makes."""
         try:
-            shape = self._shape(tokens, intermediate_size)
+            shape = self._shape(tokens, intermediate_size, entries)
             poison(shape.output, shape.workspace)
             self._run(shape, None, shape.packed, shape.weights, shape.ids)
             problem = dense_mismatch(shape.output, shape.expected)
@@ -426,10 +440,10 @@ class IQ2RGlm53Tuner(TunerCommon):
     def run_config(self, args):
         results = []
         for key in self.untunedf[self.keys].itertuples(index=False, name=None):
-            tokens, intermediate_size = int(key[2]), int(key[4])
-            label = f"M={tokens} I={intermediate_size}"
-            us, status = self._run_lookup(tokens, intermediate_size, args)
-            config = glm53.iq2r_glm53_config(tokens, intermediate_size)
+            tokens, intermediate_size, entries = int(key[2]), int(key[4]), int(key[7])
+            label = _label(tokens, intermediate_size, entries)
+            us, status = self._run_lookup(tokens, intermediate_size, entries, args)
+            config = glm53.iq2r_glm53_config(tokens, intermediate_size, entries)
             print(f"{label} {self.getKernelName(config)}: {us:.2f} us, {status}")
             results.append({"shape": label, "e2e_us": us, "status": status})
         return results
