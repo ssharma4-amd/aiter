@@ -592,7 +592,16 @@ __global__ __launch_bounds__(512,1) void glm53_gate_m1_kernel(
         // Previous work ends with a barrier protecting the codebook and partials.
         // Copy 0 of the book loads with the scales, gain and first weights, and
         // the other copies are formed below.
-        const auto gate_base=iq2r_v2_book_base_load<512,Entries>(aux,wave*64+lane);
+        IQ2RV2BookBase<512,Entries> gate_base;
+        if constexpr(Entries!=1024)
+            gate_base=iq2r_v2_book_base_load<512,Entries>(aux,wave*64+lane);
+        else
+        {
+            // A buffer load keeps program order with the tile loads below, so
+            // forming the copies waits for copy 0 only.
+            const auto words=iq2r_scheduled_load_dwordx4(iq2r_buffer_rsrc(aux,auxiliary_bytes),(wave*64+lane)*16,0,0);
+            gate_base.units[0]=__builtin_bit_cast(uint4,words);
+        }
         // d words, one per K256.
         uint32_t d_words[3]={};
 #pragma unroll
@@ -610,16 +619,17 @@ __global__ __launch_bounds__(512,1) void glm53_gate_m1_kernel(
             // wave loads its six tiles, their tenth bits and activations at
             // once, one memory latency instead of six, then decodes as the
             // decode gate does (codebook reads one atom ahead).
-            IQ2RCompressedQuad quads[6];
-#pragma unroll
-            for(int it=0;it<6;++it)
-                quads[it]=iq2r_scheduled_load_quad<Policy,Entries>(data,data_bytes,base+it*kQuadBytes,lane);
+            // Loads in the order they are consumed: the tenth bits, then each
+            // tile with its activations, so tile 0 decodes while later tiles
+            // are in flight (the waits are the compiler's, per tile).
             const iq2r_u32x3 ext_words=iq2r_load_quad_ext<Policy>(data,data_bytes,n_tile,wave,lane);
+            IQ2RCompressedQuad quads[6];
             IQ2RActivationFragment a[6];uint32_t sa[6];
             const auto* input=reinterpret_cast<const uint8_t*>(activations+static_cast<int64_t>(rows[0])*K);
 #pragma unroll
             for(int it=0;it<6;++it)
             {
+                quads[it]=iq2r_scheduled_load_quad<Policy,Entries>(data,data_bytes,base+it*kQuadBytes,lane);
                 const int ak=(wave*6+it)*128+lane_group*16;
                 *reinterpret_cast<uint4*>(a[it].bytes)=*reinterpret_cast<const uint4*>(input+ak);
                 *reinterpret_cast<uint4*>(a[it].bytes+16)=*reinterpret_cast<const uint4*>(input+ak+64);
@@ -627,7 +637,6 @@ __global__ __launch_bounds__(512,1) void glm53_gate_m1_kernel(
                 sa[it]=scales[static_cast<int64_t>(rows[0])*192+(wave*6+it)*4+lane_group];
             }
             iq2r_v2_book_form<512,Entries>(shared.codebook,gate_base,wave*64+lane);
-            asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
             __syncthreads();
 #pragma unroll
             for(int it=0;it<6;++it)quads[it].ext=iq2r_quad_ext(ext_words,it);
