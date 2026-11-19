@@ -29,6 +29,12 @@ corpus tokens reach uses its weight's column energy instead.
 ``--codebook-entries 1024`` builds the 1,024-entry variant (10-bit indices,
 layout ``glm53-packed-v3``); the default is the shipped 512 entries.
 
+``--ldlq --hessian-dir DIR`` re-chooses the gate/up codewords and signs by LDLQ
+(``iq2r_v2_ldlq``) after the normal encode, with each layer's Hessians from
+``calibrate --hessian-dir``: ``H = H_all / tr + 1.0 * H_decision / tr``,
+damped by ``1.0 * mean(diag)``; the gains are fitted to the result. Scales,
+format and kernels are unchanged; down is not re-encoded.
+
 Each process encodes on its first visible GPU; select it with
 HIP_VISIBLE_DEVICES. Layer files already in the output directory are checked
 and kept if they were built from the same calibration and recipe; any other
@@ -59,14 +65,20 @@ from aiter.iq2r_glm53 import (
     TOPK,
     iq2r_glm53_gate_bytes,
     iq2r_glm53_pack_v2,
+    iq2r_glm53_unpack_v2,
     iq2r_glm53_v2_aux_bytes,
 )
 from aiter.ops.iq2r_format import IQ2R_ACTIVATION_BASIS, IQ2RMetadata
 from aiter.ops.iq2r_v2 import (
+    IQ2R_V2_LDLQ_DAMP,
     IQ2R_V2_LEVELS_C4,
+    IQ2RV2LdlqFactor,
     iq2r_v2_format_name,
     iq2r_v2_gains,
+    iq2r_v2_ldlq,
+    iq2r_v2_ldlq_factor,
     iq2r_v2_learn_codebook,
+    iq2r_v2_materialize,
     iq2r_v2_write_auxiliary,
     iq2r_v2_write_data,
 )
@@ -251,6 +263,70 @@ def glm5_source_layout(config: dict[str, Any]) -> GLM5Layout:
             f"{mismatched}"
         )
     return layout
+
+
+# LDLQ (--ldlq): weight of the decision bucket and the damping.
+_LDLQ_BETA = 1.0
+_LDLQ_DAMP = IQ2R_V2_LDLQ_DAMP
+_HESSIAN_FORMAT = "iq2r-layer-hessian"
+_HESSIAN_VERSION = 1
+_HESSIAN_MANIFEST = "hessians.json"
+
+
+@dataclass(frozen=True)
+class GLM5Hessians:
+    """Per-MoE-layer input Hessians from ``calibrate --hessian-dir``.
+
+    ``sha256`` identifies the captures (the manifest's file digests).
+    """
+
+    directory: Path
+    manifest: dict[str, Any]
+    sha256: str
+
+    def factor(self, layer: int, device: torch.device | str) -> IQ2RV2LdlqFactor:
+        name = f"hessian-layer-{layer:04d}.pt"
+        payload = torch.load(
+            self.directory / name, map_location="cpu", weights_only=True
+        )
+        digest = hashlib.sha256()
+        for bucket in sorted(self.manifest["buckets"]):
+            digest.update(payload[bucket].numpy().tobytes())
+        if digest.hexdigest() != self.manifest["files"][name]:
+            raise ValueError(f"{name} does not match the digest in {_HESSIAN_MANIFEST}")
+        all_ = payload["all"].to(device=device, dtype=torch.float64)
+        hessian = all_ / all_.trace()
+        if "decision" in payload:
+            decision = payload["decision"].to(device=device, dtype=torch.float64)
+            hessian = hessian + _LDLQ_BETA * decision / decision.trace()
+        return iq2r_v2_ldlq_factor(hessian, _LDLQ_DAMP)
+
+
+def load_glm5_hessians(
+    directory: str | os.PathLike[str], layout: GLM5Layout
+) -> GLM5Hessians:
+    directory = Path(directory)
+    manifest = _read_json(directory / _HESSIAN_MANIFEST)
+    if (manifest.get("format"), manifest.get("version")) != (
+        _HESSIAN_FORMAT,
+        _HESSIAN_VERSION,
+    ):
+        raise ValueError(f"{directory} does not hold {_HESSIAN_FORMAT} captures")
+    if "all" not in manifest.get("buckets", ()):
+        raise ValueError("the Hessian captures have no 'all' bucket")
+    expected = {
+        f"hessian-layer-{layer:04d}.pt"
+        for layer in range(layout.first_moe_layer, layout.layer_count)
+    }
+    if set(manifest.get("files", {})) != expected:
+        raise ValueError(
+            f"the Hessian captures cover {sorted(manifest.get('files', {}))}, "
+            f"expected layers {layout.first_moe_layer}..{layout.layer_count - 1}"
+        )
+    digest = hashlib.sha256(
+        json.dumps(manifest["files"], sort_keys=True).encode()
+    ).hexdigest()
+    return GLM5Hessians(directory, manifest, digest)
 
 
 def _validate_importance(name: str, value: Tensor, shape: tuple[int, ...]) -> None:
@@ -476,14 +552,26 @@ def _encoding_metadata(
     iterations: int,
     sample_vectors: int,
     entries: int = _CODEBOOK_ENTRIES,
+    hessians: GLM5Hessians | None = None,
 ) -> dict[str, str]:
     """What decides the encoded bytes besides the source weights.
 
     Every layer file records it, so a later run keeps only layers built the
-    same way. 512-entry builds keep the shipped keys.
+    same way. 512-entry builds without LDLQ keep the shipped keys.
     """
 
     extra = {} if entries == 512 else {"iq2r_codebook_entries": str(entries)}
+    if hessians is not None:
+        extra["iq2r_ldlq"] = json.dumps(
+            {
+                "projections": ["gate_up"],
+                "beta_decision": _LDLQ_BETA,
+                "damp": _LDLQ_DAMP,
+                "buckets": sorted(hessians.manifest["buckets"]),
+                "hessians_sha256": hessians.sha256,
+            },
+            sort_keys=True,
+        )
     return {
         **extra,
         "iq2r_quality": importance.quality,
@@ -625,8 +713,12 @@ def _encode_projection(
     iterations: int,
     sample_vectors: int,
     entries: int = _CODEBOOK_ENTRIES,
+    ldlq: IQ2RV2LdlqFactor | None = None,
 ) -> tuple[Tensor, Tensor]:
-    """Canonical IQ2R-v2 buffers ``(data, auxiliary)`` of every routed expert."""
+    """Canonical IQ2R-v2 buffers ``(data, auxiliary)`` of every routed expert.
+
+    ``ldlq``: the layer's factor; gate/up codewords are re-chosen with it.
+    """
     metadata = _projection_metadata(layout, projection, entries)
     data_rows, aux_rows = [], []
     for expert in range(layout.expert_count):
@@ -655,6 +747,8 @@ def _encode_projection(
             chunk_blocks=_CHUNK_BLOCKS,
             entries=entries,
         )
+        if ldlq is not None and projection == "gate_up":
+            enc = iq2r_v2_ldlq(weight, enc, book, ldlq, _LEVELS)
         gains = iq2r_v2_gains(
             weight,
             enc.reconstruction,
@@ -665,7 +759,22 @@ def _encode_projection(
             enc.indices, enc.negative, enc.levels, _LEVELS, entries
         )
         aux = iq2r_v2_write_auxiliary(book[None], enc.d, gains)
-        del weight, enc
+        # Every matrix: the records decode to the encoding, bit for bit.
+        decoded = iq2r_v2_materialize(
+            data,
+            aux,
+            metadata.logical_n,
+            metadata.logical_k,
+            _LEVELS,
+            apply_gain=False,
+            codebook_entries=entries,
+        )
+        if not torch.equal(decoded, enc.reconstruction):
+            raise RuntimeError(
+                f"layer {layer} expert {expert} {projection}: records do not "
+                "decode to the encoding"
+            )
+        del weight, enc, decoded
         if tuple(data.shape) != (metadata.data_bytes,):
             raise ValueError(f"layer {layer} expert {expert} {projection}: data bytes")
         data_rows.append(data.cpu())
@@ -696,9 +805,11 @@ def _compile_layer(
     iterations: int,
     sample_vectors: int,
     entries: int = _CODEBOOK_ENTRIES,
+    hessians: GLM5Hessians | None = None,
 ) -> None:
     """Encode and pack one layer; write its layer files that do not exist yet."""
 
+    factor = hessians.factor(layer, device) if hessians is not None else None
     encoded = [
         _encode_projection(
             reader,
@@ -710,16 +821,29 @@ def _compile_layer(
             iterations=iterations,
             sample_vectors=sample_vectors,
             entries=entries,
+            ldlq=factor,
         )
         for projection in _PROJECTIONS
     ]
     # Returns (gate_quad, gate_auxiliary, down_data, down_auxiliary).
+    canonical = [tensor.to(device) for pair in encoded for tensor in pair]
     packed = iq2r_glm53_pack_v2(
-        *(tensor.to(device) for pair in encoded for tensor in pair),
+        *canonical, intermediate_size=layout.intermediate_size, levels=_LEVELS
+    )
+    # The packed layer round-trips: packing its unpacked records gives it back.
+    repacked = iq2r_glm53_pack_v2(
+        *iq2r_glm53_unpack_v2(
+            *packed, intermediate_size=layout.intermediate_size, levels=_LEVELS
+        ),
         intermediate_size=layout.intermediate_size,
         levels=_LEVELS,
     )
-    metadata = _encoding_metadata(importance, iterations, sample_vectors, entries)
+    if not all(torch.equal(a, b) for a, b in zip(repacked, packed)):
+        raise RuntimeError(f"layer {layer}: the packed layer does not round-trip")
+    del canonical, repacked
+    metadata = _encoding_metadata(
+        importance, iterations, sample_vectors, entries, hessians
+    )
     for projection, data, auxiliary in zip(_PROJECTIONS, packed[::2], packed[1::2]):
         path = output_dir / _layer_file(layer, projection)
         if path.exists():
@@ -859,6 +983,7 @@ def compile_glm5_iq2r(
     iterations: int = _ITERATIONS,
     sample_vectors: int = _SAMPLE_VECTORS,
     codebook_entries: int = _CODEBOOK_ENTRIES,
+    ldlq_hessian_dir: str | os.PathLike[str] | None = None,
 ) -> Path | None:
     """Compile the selected MoE layers into ``output_dir`` on ``cuda:0``.
 
@@ -866,6 +991,8 @@ def compile_glm5_iq2r(
     error. A run over every MoE layer also writes the rest of the checkpoint
     and returns its config path. A run over a subset returns None.
     ``codebook_entries`` (512 or 1024) selects the codebook size.
+    ``ldlq_hessian_dir`` (Hessians from ``calibrate --hessian-dir``) turns on
+    LDLQ for gate/up.
     ``diagnostic_uniform_importance``, ``iterations`` and ``sample_vectors``
     exist for tests; production builds keep the defaults.
     """
@@ -895,7 +1022,9 @@ def compile_glm5_iq2r(
     if iterations <= 0 or sample_vectors <= 0:
         raise ValueError("iterations and sample_vectors must be positive")
     if codebook_entries not in LAYOUTS:
-        raise ValueError(f"codebook_entries must be 512 or 1024, got {codebook_entries}")
+        raise ValueError(
+            f"codebook_entries must be 512 or 1024, got {codebook_entries}"
+        )
 
     importance = load_glm5_importance(
         calibration_cache,
@@ -907,8 +1036,13 @@ def compile_glm5_iq2r(
             "the calibration artifact has no routed hit counts, which the "
             "low-token fallback needs; re-run calibrate"
         )
+    hessians = (
+        load_glm5_hessians(ldlq_hessian_dir, layout)
+        if ldlq_hessian_dir is not None
+        else None
+    )
     encoding = _encoding_metadata(
-        importance, iterations, sample_vectors, codebook_entries
+        importance, iterations, sample_vectors, codebook_entries, hessians
     )
     moe_layers = list(range(layout.first_moe_layer, layout.layer_count))
     selected_layers = (
@@ -944,6 +1078,7 @@ def compile_glm5_iq2r(
                 iterations=iterations,
                 sample_vectors=sample_vectors,
                 entries=codebook_entries,
+                hessians=hessians,
             )
 
     if selected_layers != moe_layers:
@@ -1001,13 +1136,27 @@ def main(argv: list[str] | None = None) -> int:
         default=_CODEBOOK_ENTRIES,
         help="codebook size: 512 (shipped, glm53-packed-v2) or 1024 (glm53-packed-v3)",
     )
+    parser.add_argument(
+        "--ldlq",
+        action="store_true",
+        help="re-choose the gate/up codewords by LDLQ (needs --hessian-dir)",
+    )
+    parser.add_argument(
+        "--hessian-dir",
+        type=Path,
+        help="layer Hessians written by aiter.quantization.iq2r.glm5.calibrate --hessian-dir",
+    )
     args = parser.parse_args(argv)
+    if args.ldlq != (args.hessian_dir is not None):
+        parser.error("--ldlq and --hessian-dir go together")
+    extra = {} if not args.ldlq else {"ldlq_hessian_dir": args.hessian_dir}
     config_path = compile_glm5_iq2r(
         args.model_dir,
         args.output_dir,
         calibration_cache=args.calibration_cache,
         layer_indices=args.layers,
         codebook_entries=args.codebook_entries,
+        **extra,
     )
     print(json.dumps({"config": config_path and str(config_path)}))
     return 0
@@ -1018,11 +1167,13 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "GLM5Hessians",
     "GLM5Importance",
     "GLM5Layout",
     "compile_glm5_iq2r",
     "dequantize_block_fp8",
     "glm5_source_layout",
     "interleave_gate_up",
+    "load_glm5_hessians",
     "load_glm5_importance",
 ]

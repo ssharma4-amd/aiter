@@ -9,9 +9,14 @@ import torch
 
 import aiter.quantization.iq2r.glm5.calibrate as calibrate_module
 from aiter.quantization.iq2r.glm5.calibrate import (
+    ChatTokens,
     DiagonalSecondMomentAccumulator,
     TargetSpec,
     capture_glm5_calibration,
+    capture_glm5_hessians,
+    hessian_file,
+    save_hessians,
+    scored_positions,
     glm5_target_specs,
     load_texts,
     main,
@@ -19,7 +24,11 @@ from aiter.quantization.iq2r.glm5.calibrate import (
     save_calibration,
     token_batches,
 )
-from aiter.quantization.iq2r.glm5.compile import GLM5Layout, load_glm5_importance
+from aiter.quantization.iq2r.glm5.compile import (
+    GLM5Layout,
+    load_glm5_hessians,
+    load_glm5_importance,
+)
 
 
 class _CharTokenizer:
@@ -350,6 +359,183 @@ def test_cli_takes_only_the_corpus_paths(monkeypatch, capsys):
     assert calibrate_module.SEQUENCE_LENGTH == 16384
     assert calibrate_module.MAX_TOKENS == 1_000_000
     assert calibrate_module.FORCE_UNOBSERVED_TOKENS == 512
+
+
+class _ChatTokenizer(_CharTokenizer):
+    """Characters stand for the chat template's special tokens."""
+
+    special = {
+        "<|assistant|>": ("@", 50),
+        "<|user|>": ("#", 51),
+        "<|observation|>": ("&", 52),
+        "<|system|>": ("~", 53),
+        "<|endoftext|>": ("$", 1),
+        "</think>": ("%", 54),
+        "<tool_call>": ("^", 55),
+    }
+    unk_token_id = 0
+
+    def __init__(self, overrides=None):
+        self.ids = {name: tid for name, (_, tid) in self.special.items()}
+        self.ids.update(overrides or {})
+        self.chars = {c: tid for c, tid in self.special.values()}
+
+    def encode(self, text, add_special_tokens=True):
+        assert not add_special_tokens
+        return [self.chars.get(c, 2 + ord(c) % 40) for c in text]
+
+    def convert_tokens_to_ids(self, names):
+        return [self.ids.get(name, 0) for name in names]
+
+
+_CHATS = [
+    "~sys#user asks@assistant says$#more?@sure%done^call&obs@ok$",
+    "#question@answer text here$#again@more text$",
+]
+
+
+def test_scored_positions_predict_assistant_text_and_its_end_of_turn():
+    tokens = ChatTokens.from_tokenizer(_ChatTokenizer())
+    ids = _ChatTokenizer().encode("#u@ab$#v@c&o@d$", add_special_tokens=False)
+    # Scored next tokens: <|assistant|> and the text after it up to the next
+    # role (both $), plus the end-of-turn token right after that text (the #
+    # after $, the & after c).
+    expected = [False] * len(ids)
+    for target in (2, 3, 4, 5, 6, 8, 9, 10, 12, 13, 14):
+        expected[target - 1] = True
+    assert scored_positions(ids, tokens).tolist() == expected
+
+
+def test_chat_tokens_need_every_special_token():
+    with pytest.raises(ValueError, match="no single token"):
+        ChatTokens.from_tokenizer(_ChatTokenizer({"</think>": 0}))
+
+
+def _layer_inputs(model, input_ids):
+    """Each MoE layer's input [T, H] and the logits of one run."""
+    records, handles = {}, []
+    for index, layer in enumerate(model.model.layers):
+        if hasattr(layer.mlp, "experts"):
+
+            def hook(module, args, index=index):
+                records[index] = args[0].reshape(-1, args[0].shape[-1]).clone()
+
+            handles.append(layer.mlp.register_forward_pre_hook(hook))
+    with torch.inference_mode():
+        logits = model(input_ids=input_ids, use_cache=False).logits[0]
+    for handle in handles:
+        handle.remove()
+    return records, logits
+
+
+def test_hessian_capture_matches_layer_inputs():
+    model = _tiny_model()
+    tokenizer = _ChatTokenizer()
+    tokens = ChatTokens.from_tokenizer(tokenizer)
+    runs = [
+        (torch.tensor([tokenizer.encode(text, add_special_tokens=False)]),)
+        + _layer_inputs(
+            model, torch.tensor([tokenizer.encode(text, add_special_tokens=False)])
+        )
+        for text in _CHATS
+    ]
+    # Make the decision bucket non-empty: </think> is the most frequent top-1.
+    top1 = torch.cat(
+        [
+            logits[scored_positions(ids[0].tolist(), tokens)].argmax(-1)
+            for ids, _, logits in runs
+        ]
+    )
+    frequent = int(top1.mode().values)
+    tokenizer = _ChatTokenizer({"</think>": frequent})
+    tokens = ChatTokens.from_tokenizer(tokenizer)
+
+    accumulators = {
+        decision: capture_glm5_hessians(
+            model, tokenizer, _CHATS, decision=decision, device="cpu"
+        )
+        for decision in (False, True)
+    }
+    for (bucket, fed), decision in zip(accumulators.values(), (False, True)):
+        assert fed == sum(len(text) for text in _CHATS)
+        means = bucket.means()
+        for layer in range(1, 3):
+            rows = []
+            for ids, inputs, logits in runs:
+                scored = scored_positions(ids[0].tolist(), tokens)
+                keep = scored
+                if decision:
+                    chosen = torch.isin(
+                        logits[scored].argmax(-1), torch.tensor(sorted(tokens.decision))
+                    )
+                    keep = scored.nonzero().flatten()[chosen]
+                rows.append(inputs[layer][keep].float())
+            x = torch.cat(rows)
+            assert bucket.counts[layer] == x.shape[0] > 0
+            torch.testing.assert_close(means[layer], x.T @ x / x.shape[0])
+
+
+def test_hessians_save_and_load_into_the_compiler(tmp_path):
+    model = _tiny_model()
+    tokenizer = _ChatTokenizer()
+    buckets = {
+        "all": capture_glm5_hessians(
+            model, tokenizer, _CHATS, decision=False, device="cpu"
+        )[0],
+        "decision": capture_glm5_hessians(
+            model, tokenizer, _CHATS[:1], decision=False, device="cpu"
+        )[0],
+    }
+    manifest = save_hessians(tmp_path, buckets, {"all_corpus_sha256": "x"})
+    assert manifest["buckets"] == ["all", "decision"]
+    assert sorted(manifest["files"]) == [hessian_file(1), hessian_file(2)]
+    config = model.config
+    layout = GLM5Layout(
+        layer_count=config.num_hidden_layers,
+        first_moe_layer=config.first_k_dense_replace,
+        expert_count=config.num_local_experts,
+        hidden_size=config.hidden_size,
+        intermediate_size=config.moe_intermediate_size,
+        block_n=16,
+        block_k=16,
+    )
+    hessians = load_glm5_hessians(tmp_path, layout)
+    factor = hessians.factor(2, "cpu")
+    all_ = buckets["all"].means()[2].double()
+    decision = buckets["decision"].means()[2].double()
+    h = all_ / all_.trace() + decision / decision.trace()
+    h = h + h.diagonal().mean() * torch.eye(h.shape[0], dtype=torch.float64)
+    u = factor.u.double()
+    torch.testing.assert_close(u.T @ u, torch.linalg.inv(h), rtol=1e-4, atol=1e-4)
+    # A changed file no longer matches its digest.
+    payload = torch.load(tmp_path / hessian_file(2), weights_only=True)
+    payload["all"] = payload["all"] * 2
+    torch.save(payload, tmp_path / hessian_file(2))
+    with pytest.raises(ValueError, match="digest"):
+        hessians.factor(2, "cpu")
+
+
+def test_cli_hessian_options(monkeypatch, capsys):
+    calls = []
+
+    def fake_calibrate(model_dir, text_file, output, **kwargs):
+        calls.append((output, kwargs))
+        return {"hessians": {"files": {}, "buckets": ["all"]}}
+
+    monkeypatch.setattr(calibrate_module, "calibrate_glm5", fake_calibrate)
+    base = ["--model-dir", "m", "--text-file", "c.jsonl"]
+    assert main([*base, "--hessian-dir", "h", "--decision-text-file", "d.jsonl"]) == 0
+    assert calls == [
+        (
+            None,
+            {
+                "fp8_kernel_dir": None,
+                "hessian_dir": "h",
+                "decision_text_file": "d.jsonl",
+            },
+        )
+    ]
+    capsys.readouterr()
 
 
 if __name__ == "__main__":

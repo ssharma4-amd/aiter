@@ -23,6 +23,25 @@ for ``aiter.quantization.iq2r.glm5.compile --calibration-cache``:
     python3 -m aiter.quantization.iq2r.glm5.calibrate --model-dir $FP8 \\
         --text-file corpus.jsonl --output calibration.pt
 
+``--hessian-dir`` also captures, for LDLQ (``compile --ldlq``), each MoE
+layer's input second moment H = sum x x^T / n (x: the MoE input, the gate/up
+input of every expert), in two buckets:
+
+- ``all``: the scored positions of ``--text-file``, i.e. the positions that
+  predict an assistant token or the end-of-turn token right after assistant
+  text (the "stop / hand over" decision);
+- ``decision``: the scored positions of ``--decision-text-file`` (a separate
+  corpus, kept apart from the calibration corpus and from evaluation text)
+  where the FP8 model's top-1 next token is end of turn (``<|endoftext|>``,
+  ``<|user|>``, ``<|observation|>``), ``</think>`` or ``<tool_call>``.
+
+They are written as ``hessian-layer-NNNN.pt`` plus ``hessians.json`` (corpus
+hashes, counts and each file's digest); ``--output`` is then optional:
+
+    python3 -m aiter.quantization.iq2r.glm5.calibrate --model-dir $FP8 \\
+        --text-file corpus.jsonl --decision-text-file decisions.jsonl \\
+        --hessian-dir hessians/
+
 Needs Transformers with GLM MoE DSA support (5.16 or newer) and, for the FP8
 checkpoint, the ``kernels`` package.
 """
@@ -444,6 +463,207 @@ def capture_glm5_calibration(
     }
 
 
+# --------------------------------------------------------------------------
+# Layer Hessians (LDLQ)
+# --------------------------------------------------------------------------
+
+HESSIAN_FORMAT = "iq2r-layer-hessian"
+HESSIAN_VERSION = 1
+HESSIAN_MANIFEST = "hessians.json"
+# GLM chat template roles; generated text runs from <|assistant|> to the next role.
+_ASSISTANT = "<|assistant|>"
+_ROLES = ("<|user|>", "<|observation|>", "<|system|>")
+END_OF_TURN_TOKENS = ("<|endoftext|>", "<|user|>", "<|observation|>")
+DECISION_TOKENS = (*END_OF_TURN_TOKENS, "</think>", "<tool_call>")
+
+
+def hessian_file(layer: int) -> str:
+    return f"hessian-layer-{layer:04d}.pt"
+
+
+@dataclass(frozen=True)
+class ChatTokens:
+    """Token ids of the chat template's roles and the decision tokens."""
+
+    assistant: int
+    roles: frozenset[int]
+    end_of_turn: frozenset[int]
+    decision: frozenset[int]
+
+    @classmethod
+    def from_tokenizer(cls, tokenizer) -> ChatTokens:
+        names = (_ASSISTANT, *_ROLES, *DECISION_TOKENS)
+        ids = dict(zip(names, tokenizer.convert_tokens_to_ids(list(names))))
+        unknown = getattr(tokenizer, "unk_token_id", None)
+        missing = [n for n, i in ids.items() if i is None or i == unknown]
+        if missing:
+            raise ValueError(f"the tokenizer has no single token for {missing}")
+        return cls(
+            ids[_ASSISTANT],
+            frozenset(ids[n] for n in _ROLES),
+            frozenset(ids[n] for n in END_OF_TURN_TOKENS),
+            frozenset(ids[n] for n in DECISION_TOKENS),
+        )
+
+
+def scored_positions(ids: list[int], tokens: ChatTokens) -> Tensor:
+    """Bool [T]: positions whose next token is assistant text or the end of
+    turn right after it, the positions a model is scored on."""
+
+    generated, on = [], False
+    for token in ids:
+        if token == tokens.assistant:
+            on = True
+        elif token in tokens.roles:
+            on = False
+        generated.append(on)
+    target = torch.tensor(generated, dtype=torch.bool)
+    ends = torch.tensor([t in tokens.end_of_turn for t in ids], dtype=torch.bool)
+    target[1:] |= ends[1:] & target[:-1]
+    # Position t predicts token t + 1.
+    return torch.cat([target[1:], torch.zeros(1, dtype=torch.bool)])
+
+
+class LayerHessianAccumulator:
+    """Sum x x^T (FP32, on each layer's device) and the row count per layer."""
+
+    def __init__(self, layers: range):
+        self.layers = layers
+        self.sums: dict[int, Tensor] = {}
+        self.counts = {layer: 0 for layer in layers}
+
+    def observe(self, layer: int, rows: Tensor) -> None:
+        if rows.shape[0] == 0:
+            return
+        x = rows.float()
+        if layer not in self.sums:
+            self.sums[layer] = torch.zeros(
+                x.shape[1], x.shape[1], dtype=torch.float32, device=x.device
+            )
+        self.sums[layer].addmm_(x.T, x)
+        self.counts[layer] += x.shape[0]
+
+    def means(self) -> dict[int, Tensor]:
+        missing = [layer for layer in self.layers if not self.counts[layer]]
+        if missing:
+            raise RuntimeError(f"no positions reached layers {missing}")
+        return {
+            layer: (self.sums[layer] / self.counts[layer]).cpu()
+            for layer in self.layers
+        }
+
+
+def _moe_layers(model) -> range:
+    config = model.config
+    return range(config.first_k_dense_replace, config.num_hidden_layers)
+
+
+def capture_glm5_hessians(
+    model,
+    tokenizer,
+    texts: list[str],
+    *,
+    decision: bool,
+    sequence_length: int = SEQUENCE_LENGTH,
+    max_tokens: int = MAX_TOKENS,
+    device: torch.device | str | None = None,
+) -> tuple[LayerHessianAccumulator, int]:
+    """Accumulate every MoE layer's input Hessian over the scored positions of
+    ``texts`` (``decision``: only those whose FP8 top-1 next token is a decision
+    token). Returns the accumulator and the corpus tokens fed."""
+
+    device = torch.device(device) if device is not None else model.device
+    tokens = ChatTokens.from_tokenizer(tokenizer)
+    decision_ids = torch.tensor(sorted(tokens.decision))
+    layers = _moe_layers(model)
+    accumulator = LayerHessianAccumulator(layers)
+    fed = 0
+    with torch.inference_mode():
+        for input_ids in token_batches(tokenizer, texts, sequence_length, max_tokens):
+            scored = scored_positions(input_ids[0].tolist(), tokens)
+            fed += input_ids.numel()
+            if not scored.any():
+                continue
+            captured: dict[int, Tensor] = {}
+            handles = []
+            for layer in layers:
+
+                def hook(module, args, layer=layer):
+                    x = args[0].reshape(-1, args[0].shape[-1])
+                    rows = x[scored.to(x.device)]
+                    if decision:
+                        captured[layer] = rows
+                    else:
+                        accumulator.observe(layer, rows)
+
+                handles.append(
+                    model.model.layers[layer].mlp.register_forward_pre_hook(hook)
+                )
+            try:
+                if decision:
+                    logits = model(
+                        input_ids=input_ids.to(device), use_cache=False
+                    ).logits
+                    top1 = logits[0][scored.to(logits.device)].argmax(-1).cpu()
+                    chosen = torch.isin(top1, decision_ids)
+                else:
+                    model.model(input_ids=input_ids.to(device), use_cache=False)
+            finally:
+                for handle in handles:
+                    handle.remove()
+            if decision:
+                for layer, rows in captured.items():
+                    accumulator.observe(layer, rows[chosen.to(rows.device)])
+            print(
+                f"hessian {'decision' if decision else 'all'}: {fed} tokens, "
+                f"{accumulator.counts[layers.start]} positions",
+                flush=True,
+            )
+    return accumulator, fed
+
+
+def save_hessians(
+    output_dir: str | os.PathLike[str],
+    buckets: dict[str, LayerHessianAccumulator],
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    """Write one file per layer and the manifest (atomically, manifest last)."""
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    means = {name: bucket.means() for name, bucket in buckets.items()}
+    layers = next(iter(buckets.values())).layers
+    files = {}
+    for layer in layers:
+        payload = {
+            "format": HESSIAN_FORMAT,
+            "version": HESSIAN_VERSION,
+            "layer": layer,
+            **{name: means[name][layer].contiguous() for name in buckets},
+            **{f"n_{name}": bucket.counts[layer] for name, bucket in buckets.items()},
+        }
+        digest = hashlib.sha256()
+        for name in sorted(buckets):
+            digest.update(payload[name].numpy().tobytes())
+        save_calibration(payload, output_dir / hessian_file(layer))
+        files[hessian_file(layer)] = digest.hexdigest()
+    manifest = {
+        "format": HESSIAN_FORMAT,
+        "version": HESSIAN_VERSION,
+        "layers": [layers.start, layers.stop - 1],
+        "buckets": sorted(buckets),
+        "counts": {
+            name: bucket.counts[layers.start] for name, bucket in buckets.items()
+        },
+        "files": files,
+        **metadata,
+    }
+    temporary = output_dir / f".{HESSIAN_MANIFEST}.tmp"
+    temporary.write_text(json.dumps(manifest, indent=1, sort_keys=True))
+    os.replace(temporary, output_dir / HESSIAN_MANIFEST)
+    return manifest
+
+
 def save_calibration(payload: dict[str, Any], path: str | os.PathLike[str]) -> None:
     """Write the artifact atomically so an interrupted capture leaves no partial file."""
 
@@ -479,11 +699,19 @@ def config_fingerprint(config) -> str:
 def calibrate_glm5(
     model_dir: str | os.PathLike[str],
     text_file: str | os.PathLike[str],
-    output: str | os.PathLike[str],
+    output: str | os.PathLike[str] | None,
     *,
     fp8_kernel_dir: str | os.PathLike[str] | None = None,
+    hessian_dir: str | os.PathLike[str] | None = None,
+    decision_text_file: str | os.PathLike[str] | None = None,
 ) -> dict[str, Any]:
-    """Load the checkpoint, capture the corpus statistics and write the artifact."""
+    """Load the checkpoint, capture the corpus statistics and write the artifact
+    (``output``) and/or the layer Hessians (``hessian_dir``)."""
+
+    if output is None and hessian_dir is None:
+        raise ValueError("nothing to write: give an output and/or a hessian dir")
+    if decision_text_file is not None and hessian_dir is None:
+        raise ValueError("the decision corpus is for the layer Hessians (hessian dir)")
 
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
@@ -520,18 +748,34 @@ def calibrate_glm5(
         torch_dtype="auto",
         low_cpu_mem_usage=True,
     ).eval()
-    payload = capture_glm5_calibration(model, tokenizer, texts, device=_INPUT_DEVICE)
-    payload["metadata"].update(
-        {
-            "model_path": str(Path(model_dir).resolve()),
-            "model_revision": getattr(config, "_commit_hash", None),
-            "model_type": config.model_type,
-            "architectures": list(getattr(config, "architectures", None) or ()),
-            "model_config_sha256": config_fingerprint(config),
-            "device_map": _DEVICE_MAP,
-        }
-    )
-    save_calibration(payload, output)
+    model_metadata = {
+        "model_path": str(Path(model_dir).resolve()),
+        "model_revision": getattr(config, "_commit_hash", None),
+        "model_type": config.model_type,
+        "architectures": list(getattr(config, "architectures", None) or ()),
+        "model_config_sha256": config_fingerprint(config),
+        "device_map": _DEVICE_MAP,
+    }
+    payload: dict[str, Any] = {}
+    if output is not None:
+        payload = capture_glm5_calibration(
+            model, tokenizer, texts, device=_INPUT_DEVICE
+        )
+        payload["metadata"].update(model_metadata)
+        save_calibration(payload, output)
+    if hessian_dir is not None:
+        buckets = {}
+        corpora = {"all": (texts, False)}
+        if decision_text_file is not None:
+            corpora["decision"] = (load_texts(decision_text_file), True)
+        hessian_metadata = {**model_metadata, "sequence_length": SEQUENCE_LENGTH}
+        for name, (bucket_texts, decision) in corpora.items():
+            buckets[name], fed = capture_glm5_hessians(
+                model, tokenizer, bucket_texts, decision=decision, device=_INPUT_DEVICE
+            )
+            hessian_metadata[f"{name}_corpus_sha256"] = corpus_digest(bucket_texts)
+            hessian_metadata[f"{name}_token_count"] = fed
+        payload["hessians"] = save_hessians(hessian_dir, buckets, hessian_metadata)
     return payload
 
 
@@ -547,8 +791,17 @@ def main(argv: list[str] | None = None) -> int:
         required=True,
         help="UTF-8 corpus: one text per line, or JSONL with a text/prompt/content field",
     )
+    parser.add_argument("--output", help="calibration artifact to write (.pt)")
     parser.add_argument(
-        "--output", required=True, help="calibration artifact to write (.pt)"
+        "--hessian-dir",
+        help="also write the per-MoE-layer input Hessians for LDLQ to this directory",
+    )
+    parser.add_argument(
+        "--decision-text-file",
+        help=(
+            "decision corpus for the Hessians' decision bucket (same format as "
+            "--text-file; keep it apart from the calibration and evaluation text)"
+        ),
     )
     parser.add_argument(
         "--fp8-kernel-dir",
@@ -559,14 +812,27 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     args = parser.parse_args(argv)
+    if args.output is None and args.hessian_dir is None:
+        parser.error("give --output and/or --hessian-dir")
+    extra = {}
+    if args.hessian_dir is not None:
+        extra = {
+            "hessian_dir": args.hessian_dir,
+            "decision_text_file": args.decision_text_file,
+        }
     payload = calibrate_glm5(
         args.model_dir,
         args.text_file,
         args.output,
         fp8_kernel_dir=args.fp8_kernel_dir,
+        **extra,
     )
     summary = {key: value for key, value in payload.items() if key != "targets"}
-    summary["targets"] = len(payload["targets"])
+    summary["targets"] = len(payload.get("targets", {}))
+    if "hessians" in summary:
+        summary["hessians"] = {
+            k: v for k, v in summary["hessians"].items() if k != "files"
+        }
     print(json.dumps(summary, sort_keys=True, indent=2, default=str))
     return 0
 
