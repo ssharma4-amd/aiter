@@ -461,5 +461,24 @@ in the same session; output tokens/s (mean TPOT, mean TTFT):
   that waits about 6 s the first time a 2,048-token prefill batch forms. It is
   intermittent, IQ2R-only (present before the fusion too) and leaves no compiled
   artifact; not resolved.
-- TP8 serving was not rerun (GPUs 0-3 were not available); the kernels are tested
-  and timed at TP8 (fused shared expert +2.4 to +6 µs per call at M <= 64).
+**Serving, TP8 (GPUs 0-7)**, same setup, MXFP4 measured the same day; the shared
+items run on their own workgroups when all of a launch's workgroups are resident
+(two per CU), and the shared rows are retuned for that:
+
+| Concurrency | MXFP4 | v3 fused, tuned | v3 separate shared | v3 fused / MXFP4 | v3 separate / MXFP4 |
+|---|---|---|---|---|---|
+| 1 | 87 (11.4 ms, 0.11 s) | 91 (10.8 ms, 0.11 s) | 79 (12.6 ms, 0.11 s) | 1.05 | 0.90 |
+| 2 | 158 (11.6 ms, 1.10 s) | 168 (11.0 ms, 0.94 s) | 146 (12.8 ms, 0.95 s) | 1.06 | 0.93 |
+| 4 | 331 (11.2 ms, 0.89 s) | 331 (11.3 ms, 0.81 s) | 289 (13.0 ms, 0.88 s) | 1.00 | 0.87 |
+| 8 | 604 (12.2 ms, 1.13 s) | 591 (12.4 ms, 1.14 s) | 530 (14.0 ms, 1.16 s) | 0.98 | 0.88 |
+| 16 | 1190 (13.2 ms, 0.30 s) | 1153 (13.5 ms, 0.43 s) | 1012 (15.2 ms, 0.65 s) | 0.97 | 0.85 |
+| 32 | 2055 (15.2 ms, 0.44 s) | 2037 (15.2 ms, 0.50 s) | 1832 (17.0 ms, 0.49 s) | 0.99 | 0.89 |
+| 64 | 3205 (19.3 ms, 0.66 s) | 3198 (19.1 ms, 0.96 s) | 2954 (20.9 ms, 0.75 s) | 1.00 | 0.92 |
+| 128 | 5227 (23.4 ms, 1.08 s) | 5031 (24.2 ms, 1.30 s) | 4743 (25.7 ms, 1.31 s) | 0.96 | 0.91 |
+| 256 | 7910 (30.4 ms, 2.00 s) | 7595 (31.3 ms, 2.44 s) | 7285 (32.8 ms, 2.41 s) | 0.96 | 0.92 |
+
+- TPOT at or below MXFP4's at c=1-2 and c=32-64, within 0.3 ms at c=4-16, 0.8-0.9 ms
+  behind at c=128-256 (prefill chunks above 256 tokens use the separate shared MLP).
+- MoE call with the fused shared expert, TP8 tuned rows (synthetic): M1 20.5 µs
+  (+2.4 over routed only), M2 22.3 (+2.7), M4 25.7 (+2.7), M8 40.0 (+2.3), M16 55.2
+  (+0.2), M32 78.5 (+3.3).
