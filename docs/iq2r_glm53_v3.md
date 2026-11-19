@@ -370,3 +370,96 @@ single2 down (TP4 M8-16), and consumption-order loads in the M1 gate.
 **Open options** (not built): route9 with four routes per workgroup (four full 32 KB
 books, cross-workgroup top-8 sum) for M1-4; the redline-style split-K decode down
 with a separate top-k reduction.
+
+## Shared expert fused into the MoE launches
+
+**Why.** Serving ablations at TP4 (one part of the MoE block switched off per run,
+`ATOM_MONO_ENABLE=0`) showed that the gap to MXFP4 was not the routed kernels:
+
+| Mean TPOT (ms) | c=1 | c=64 |
+|---|---|---|
+| MXFP4 | 11.31 | 25.31 |
+| MXFP4, MoE block removed | 7.54 | 12.00 |
+| v2 | 12.49 | 26.85 |
+| v2, MoE block removed | 7.55 | 12.07 |
+| v2, routed experts only | 10.45 | 19.78 |
+| v2, FP8 shared expert only | 11.03 | 16.82 |
+
+The routed IQ2R block alone (2.90 ms per step at c=1, 7.71 ms at c=64) is cheaper
+than MXFP4's whole MoE block (3.77 / 13.31 ms). The FP8 shared expert, a separate
+six-kernel MLP on a second stream, cost 3.48 ms on its own at c=1 (46 µs per layer)
+and the second stream hid only 1.4 ms of it. Serving it as PTPC FP8 (12.30 ms) or
+MXFP4 (12.43 ms) instead changed nothing: the cost is the separate launches, not the
+format. v1 avoided it by quantizing the shared expert to 2 bits as expert 256 inside
+the IQ2R kernels, which costs accuracy (AIME 49 vs 54, SWE 3 vs 19-26 in the redline
+study).
+
+**Design.** The shared expert stays 8-bit and runs as route slot 8 of every token
+(weight 1) inside the gate and down launches, for batches of up to
+`FUSED_SHARED_TOKENS` (256) tokens:
+
+- Weights: MXFP8 (E4M3 bytes, one E8M0 scale per 32 inputs), repacked at load from
+  the checkpoint's block FP8 (`iq2r_glm53_pack_shared`) in MFMA operand order, so a
+  lane loads 32 bytes and one scale byte per 16 x 128 tile; nothing to decode.
+  9.4 MB per layer per TP4 rank (about 0.7 GB per GPU for 75 layers; the FP8 copy
+  stays loaded for prefill).
+- Gate: extra work items in the M1 and decode gate launches, one per 16 x MA
+  tokens x 16 gate/up rows over the whole K (eight K768 slices, one per wave; about
+  the bytes of a routed item). They write SiLU(gate) * up in BF16 to the workspace
+  (`shared_act`). MA = 1, 2 or 4 by batch size, so weights are re-read once per 16,
+  32 or 64 tokens.
+- Down: route9 (M1-4) spreads the shared expert's column blocks x K tiles over its
+  eight waves after their routes and adds the result in its top-8 sum; the decode
+  downs (M2-256) run extra items writing the shared route rows, which the route
+  reduction adds with weight 1. Both quantize the BF16 activation to MXFP8 while
+  building the MFMA operand (block maxima exchanged between lane groups), with the
+  rounding of the routed path.
+- Routing: the decode sort places the shared routes after the routed ones in token
+  order; they get no tasks.
+- No workgroup waits on another. A split-K first version (partials plus an arrival
+  counter) was 3-5x slower: an agent-scope `__threadfence()` on gfx950 compiles to
+  `buffer_wbl2 sc1` + `buffer_inv sc1`, a writeback and invalidate of the XCD's L2.
+- Larger batches use the prefill kernels and the separate shared MLP, as before.
+- ATOM: `DeepseekV2MoE.process_weights_after_loading` dequantizes the shared expert
+  and attaches it to `Iq2rMoEMethod`; the MoE dispatch op takes the fused path for up
+  to 256 tokens. `ATOM_IQ2R_FUSE_SHARED=0` keeps the separate MLP.
+- Tuning: the tuned CSV gained a `shared` key; rows with `shared=1` are tuned with
+  the shared expert in the launch (decode kernels only) and are looked up first.
+
+**Cost in the MoE call** (TP4, 1,024 entries, tuner graph replay, tuned rows): M1
+24.1 µs (+2.3 over routed only), M4 41.1 (+4.2), M8 60.0 (+0.9), M16 92.1 (+2.3),
+M32 140.5 (+6), M64 195.4 (+15), M256 247.0 (+23). The separate MLP cost about
+27 µs per layer net at c=1 and about 93 µs at c=64.
+
+**Correctness.** `test_glm53_moe_fused_shared_expert` (M = 1..1024, TP4/TP8, 512 and
+1,024 entries): relative RMSE <= 0.021, cosine >= 0.99978 against the dense
+reference with the shared expert, and repeated runs give identical output.
+`op_tests/test_iq2r_glm53.py`: 266 passed. ATOM `tests/test_iq2r_moe_method.py`:
+29 passed. Serving sanity prompts answer correctly.
+
+**Serving, TP4 (GPUs 4-7)**, standard kernels, one server at a time, MXFP4 measured
+in the same session; output tokens/s (mean TPOT, mean TTFT):
+
+| Concurrency | MXFP4 | v3 fused, tuned | v2 fused | v3 separate shared | v3 fused / MXFP4 | v3 separate / MXFP4 |
+|---|---|---|---|---|---|---|
+| 1 | 85 (11.7 ms, 0.10 s) | 91 (10.9 ms, 0.10 s) | 92 (10.8 ms, 0.10 s) | 79 (12.6 ms, 0.11 s) | 1.07 | 0.93 |
+| 2 | 180 (11.0 ms, 0.20 s) | 167 (11.2 ms, 0.78 s) | 169 (11.1 ms, 0.82 s) | 149 (12.7 ms, 0.79 s) | 0.93 | 0.83 |
+| 4 | 315 (11.8 ms, 0.88 s) | 313 (12.1 ms, 0.71 s) | 321 (11.8 ms, 0.70 s) | 279 (13.7 ms, 0.74 s) | 0.99 | 0.88 |
+| 8 | 524 (13.3 ms, 2.05 s) | 539 (13.8 ms, 1.08 s) | 515 (14.4 ms, 1.13 s) | 491 (15.2 ms, 1.10 s) | 1.03 | 0.94 |
+| 16 | 964 (15.8 ms, 0.78 s) | 961 (15.8 ms, 0.85 s) | 936 (16.3 ms, 0.83 s) | 890 (17.2 ms, 0.85 s) | 1.00 | 0.92 |
+| 32 | 1589 (19.4 ms, 0.74 s) | 1558 (19.7 ms, 0.91 s) | 1589 (19.3 ms, 0.87 s) | 1465 (21.0 ms, 0.91 s) | 0.98 | 0.92 |
+| 64 | 2492 (24.8 ms, 0.94 s) | 2456 (24.8 ms, 1.26 s) | 2488 (24.6 ms, 1.14 s) | 2305 (26.6 ms, 1.17 s) | 0.99 | 0.92 |
+| 128 | 3838 (31.8 ms, 1.64 s) | 3707 (32.5 ms, 2.08 s) | 3807 (31.7 ms, 2.03 s) | 3550 (34.0 ms, 2.08 s) | 0.97 | 0.93 |
+| 256 | 5708 (41.3 ms, 3.63 s) | 5450 (43.3 ms, 3.80 s) | 5534 (42.4 ms, 3.94 s) | 5265 (44.9 ms, 3.80 s) | 0.95 | 0.92 |
+
+(v2 fused used the untuned shared rows. "v3 separate shared" is the phase-3 run.)
+
+- v3 TPOT is at or below MXFP4's up to c=64 except c=4 (+0.3 ms); c=128-256 trail
+  by 0.7-2.0 ms, where decode batches carry prefill chunks of more than 256 tokens
+  (separate shared MLP) and M=256 decode adds 23 µs per layer.
+- c=2: median TTFT equals MXFP4's (193 vs 180 ms); the mean carries one request
+  that waits about 6 s the first time a 2,048-token prefill batch forms. It is
+  intermittent, IQ2R-only (present before the fusion too) and leaves no compiled
+  artifact; not resolved.
+- TP8 serving was not rerun (GPUs 0-3 were not available); the kernels are tested
+  and timed at TP8 (fused shared expert +2.4 to +6 µs per call at M <= 64).

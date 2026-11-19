@@ -20,14 +20,19 @@ import torch
 
 import aiter
 from aiter.iq2r_glm53 import (
+    FUSED_SHARED_TOKENS,
     MAX_CHUNK_TOKENS,
+    MAX_DECODE_TOKENS,
     IQ2RGlm53Config,
     IQ2RGlm53Workspace,
     _config_problem,
     _default_config,
+    _mxfp8_quantize,
     _tuned_table,
     iq2r_glm53_config,
+    iq2r_glm53_dequantize_shared,
     iq2r_glm53_moe_out,
+    iq2r_glm53_pack_shared,
     iq2r_glm53_pack_v2,
 )
 from aiter.jit.core import AITER_CONFIGS
@@ -252,7 +257,9 @@ def _decoded_columns(layer, experts: torch.Tensor, columns: torch.Tensor):
     )
 
 
-@pytest.mark.parametrize("kernel", ["single", "single2", "ordered", "route9", "prefill"])
+@pytest.mark.parametrize(
+    "kernel", ["single", "single2", "ordered", "route9", "prefill"]
+)
 def test_glm53_down_decode_bit_exact(glm53_layer, kernel):
     """Every down kernel decodes the packed weights bit-exactly (vs iq2r_v2_materialize)."""
     from aiter.ops.iq2r import (
@@ -277,14 +284,19 @@ def test_glm53_down_decode_bit_exact(glm53_layer, kernel):
         columns = (torch.arange(routes, device="cuda") * 37) % k
         experts = (torch.arange(routes, device="cuda") // 32) % 3
         activations, scales = _one_hot_rows(routes, k, columns)
-        tasks = torch.zeros((routes // 32 + _EXPERTS, 3), dtype=torch.int32, device="cuda")
+        tasks = torch.zeros(
+            (routes // 32 + _EXPERTS, 3), dtype=torch.int32, device="cuda"
+        )
         for task in range(routes // 32):
             tasks[task] = torch.tensor([task * 32, 32, task % 3], dtype=torch.int32)
         count = torch.tensor([routes // 32], dtype=torch.int32, device="cuda")
-        output = torch.full((routes, _HIDDEN), float("nan"), dtype=torch.bfloat16, device="cuda")
+        output = torch.full(
+            (routes, _HIDDEN), float("nan"), dtype=torch.bfloat16, device="cuda"
+        )
+        none = torch.empty(0, dtype=torch.uint8, device="cuda")
         iq2r_glm53_down_out(
             activations, scales, data, aux, tasks, count, output,
-            {"ordered": 1, "single": 2, "single2": 3}[kernel], 4,
+            {"ordered": 1, "single": 2, "single2": 3}[kernel], 4, none, none, none, none,
         )  # fmt: skip
         assert torch.equal(output, _decoded_columns(layer, experts, columns))
         return
@@ -297,20 +309,36 @@ def test_glm53_down_decode_bit_exact(glm53_layer, kernel):
             columns = torch.randint(0, k, (routes,), generator=generator, device="cuda")
             route_experts = (torch.arange(routes, device="cuda") // 64) % 3
             if kernel == "route9":
-                route_experts = torch.randint(0, 3, (routes,), generator=generator, device="cuda")
+                route_experts = torch.randint(
+                    0, 3, (routes,), generator=generator, device="cuda"
+                )
             activations, scales = _one_hot_rows(routes, k, columns)
-            chosen = torch.randint(0, _TOPK, (tokens,), generator=generator, device="cuda")
-            weights = torch.nn.functional.one_hot(chosen.long(), _TOPK).float().contiguous()
+            chosen = torch.randint(
+                0, _TOPK, (tokens,), generator=generator, device="cuda"
+            )
+            weights = (
+                torch.nn.functional.one_hot(chosen.long(), _TOPK).float().contiguous()
+            )
             scatter = torch.arange(routes, dtype=torch.int32, device="cuda")
             picked = torch.arange(tokens, device="cuda") * 9 + chosen
-            output = torch.full((tokens, _HIDDEN), float("nan"), dtype=torch.bfloat16, device="cuda")
+            output = torch.full(
+                (tokens, _HIDDEN), float("nan"), dtype=torch.bfloat16, device="cuda"
+            )
             if kernel == "route9":
-                ids = route_experts.reshape(tokens, 9)[:, :_TOPK].to(torch.int32).contiguous()
-                iq2r_glm53_down_route9_out(
-                    activations, scales, data, aux, ids, scatter, weights, output
+                ids = (
+                    route_experts.reshape(tokens, 9)[:, :_TOPK]
+                    .to(torch.int32)
+                    .contiguous()
                 )
+                none = torch.empty(0, dtype=torch.uint8, device="cuda")
+                iq2r_glm53_down_route9_out(
+                    activations, scales, data, aux, ids, scatter, weights, output,
+                    none, none, none,
+                )  # fmt: skip
             else:
-                tasks = torch.zeros((routes // 64 + 1 + _EXPERTS, 3), dtype=torch.int32, device="cuda")
+                tasks = torch.zeros(
+                    (routes // 64 + 1 + _EXPERTS, 3), dtype=torch.int32, device="cuda"
+                )
                 n_tasks = (routes + 63) // 64
                 for task in range(n_tasks):
                     begin = task * 64
@@ -318,7 +346,9 @@ def test_glm53_down_decode_bit_exact(glm53_layer, kernel):
                         [begin, min(64, routes - begin), task % 3], dtype=torch.int32
                     )
                 count = torch.tensor([n_tasks], dtype=torch.int32, device="cuda")
-                route_output = torch.empty((routes, _HIDDEN), dtype=torch.bfloat16, device="cuda")
+                route_output = torch.empty(
+                    (routes, _HIDDEN), dtype=torch.bfloat16, device="cuda"
+                )
                 iq2r_glm53_down_reduce_out(
                     activations, scales, data, aux, tasks, count, route_output,
                     scatter, weights, output, 1 + trial % 2,
@@ -393,6 +423,75 @@ def test_glm53_moe_chunks_long_prefill(glm53_layer):
     torch.testing.assert_close(chunked, halves, rtol=0, atol=0)
     relative_rmse, _ = _relative_metrics(chunked, whole)
     assert relative_rmse < 1e-6
+
+
+@functools.lru_cache(maxsize=2)
+def _shared_expert(intermediate: int):
+    """Random shared expert, its packed MXFP8 form and its exact FP32 weights."""
+    generator = torch.Generator(device="cuda").manual_seed(0x53F0 + intermediate)
+    gate, up = (
+        torch.randn((intermediate, _HIDDEN), generator=generator, device="cuda") * 0.02
+        for _ in range(2)
+    )
+    down = (
+        torch.randn((_HIDDEN, intermediate), generator=generator, device="cuda") * 0.02
+    )
+    exact = [
+        iq2r_glm53_dequantize_shared(*_mxfp8_quantize(w)) for w in (gate, up, down)
+    ]
+    return iq2r_glm53_pack_shared(gate, up, down), exact
+
+
+def _reference_shared(exact, hidden):
+    """MXFP8 activations, SiLU(gate) * up in BF16, BF16 output (weight 1)."""
+    gate, up, down = exact
+    a1 = _mxfp8(hidden)
+    act = (torch.nn.functional.silu(a1 @ gate.T) * (a1 @ up.T)).to(torch.bfloat16)
+    return (_mxfp8(act) @ down.T).to(torch.bfloat16)
+
+
+@pytest.mark.parametrize("tokens", [1, 2, 3, 4, 5, 8, 16, 33, 64, 100, 256, 1000, 1024])
+def test_glm53_moe_fused_shared_expert(glm53_layer, tokens):
+    """The MXFP8 shared expert as route slot 8: decode paths, deterministic."""
+    layer = glm53_layer
+    shared, exact = _shared_expert(layer.intermediate)
+    hidden, topk_weights, topk_ids = _routing(tokens, 0x5370 + tokens)
+    expected = (
+        _reference_moe(layer, hidden, topk_weights, topk_ids).float()
+        + _reference_shared(exact, hidden).float()
+    ).to(torch.bfloat16)
+    workspace = IQ2RGlm53Workspace.allocate(tokens, layer.intermediate, device="cuda")
+    actual, again = torch.empty_like(hidden), torch.empty_like(hidden)
+    for out in (actual, again):
+        iq2r_glm53_moe_out(
+            hidden, *layer.packed, topk_weights, topk_ids, out, workspace, shared=shared
+        )
+    _check_moe(actual, expected)
+    assert torch.equal(actual, again)
+
+
+def test_glm53_moe_fused_shared_expert_limits(glm53_layer):
+    layer = glm53_layer
+    shared, _ = _shared_expert(layer.intermediate)
+    hidden, topk_weights, topk_ids = _routing(1025, 0x53F8)
+    workspace = IQ2RGlm53Workspace.allocate(1025, layer.intermediate, device="cuda")
+    output = torch.empty_like(hidden)
+    with pytest.raises(ValueError, match="up to 1024 tokens"):
+        iq2r_glm53_moe_out(
+            hidden,
+            *layer.packed,
+            topk_weights,
+            topk_ids,
+            output,
+            workspace,
+            shared=shared,
+        )
+    prefill = IQ2RGlm53Config("prefill", 2, "prefill", 0, 1)
+    with pytest.raises(ValueError, match="decode kernels only"):
+        iq2r_glm53_moe_out(
+            hidden[:512], *layer.packed, topk_weights[:512], topk_ids[:512],
+            output[:512], workspace, prefill, shared=shared,
+        )  # fmt: skip
 
 
 @pytest.mark.parametrize("tokens", [1, 3, 4, 64, 1024])
@@ -533,7 +632,9 @@ def test_glm53_tuned_config():
     table = pd.read_csv(AITER_CONFIGS.AITER_CONFIG_IQ2R_GLM53_FILE)
     rows = table[(table.gfx == get_gfx_runtime()) & (table.cu_num == get_cu_num())]
     for row in rows.itertuples():
-        config = iq2r_glm53_config(row.token, row.inter_dim, row.codebook)
+        config = iq2r_glm53_config(
+            row.token, row.inter_dim, row.codebook, bool(row.shared)
+        )
         assert config == IQ2RGlm53Config(
             row.gate_kernel,
             row.gate_grid,
@@ -550,6 +651,11 @@ def test_glm53_tuned_config():
         for tokens in range(1, MAX_CHUNK_TOKENS + 1):
             for config in (lookup(tokens), _default_config(tokens)):
                 assert _config_problem(config, tokens, intermediate) is None
+        # With the fused shared expert: decode kernels only.
+        for tokens in range(1, MAX_DECODE_TOKENS + 1):
+            config = lookup(tokens, codebook_entries=1024, shared=True)
+            assert config.gate_kernel != "prefill" or tokens > FUSED_SHARED_TOKENS
+            assert _config_problem(config, tokens, intermediate) is None
 
 
 def test_glm53_tuned_table_checks(tmp_path):

@@ -16,7 +16,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("tasks"),
           py::arg("task_count"),
           py::arg("output"),
-          py::arg("scales"));
+          py::arg("scales"),
+          py::arg("shared"));
     m.def("iq2r_glm53_sort_quant_out",
           &aiter::iq2r_glm53_sort_quant_out,
           py::arg("input"),
@@ -28,7 +29,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("output"),
           py::arg("scales"),
           py::arg("gate_tasks"),
-          py::arg("gate_task_count"));
+          py::arg("gate_task_count"),
+          py::arg("shared"));
     m.def("iq2r_glm53_prefill_sort_quant_out",
           &aiter::iq2r_glm53_prefill_sort_quant_out,
           py::arg("input"),
@@ -55,7 +57,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("tasks"),
           py::arg("task_count"),
           py::arg("output"),
-          py::arg("output_scales"));
+          py::arg("output_scales"),
+          py::arg("shared_gate"),
+          py::arg("shared_gate_scales"),
+          py::arg("shared_act"));
     m.def("iq2r_glm53_gate_out",
           &aiter::iq2r_glm53_gate_out,
           py::arg("activations"),
@@ -68,7 +73,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("output"),
           py::arg("output_scales"),
           py::arg("kernel"),
-          py::arg("grid_multiplier"));
+          py::arg("grid_multiplier"),
+          py::arg("shared_gate"),
+          py::arg("shared_gate_scales"),
+          py::arg("shared_act"));
     m.def("iq2r_glm53_down_out",
           &aiter::iq2r_glm53_down_out,
           py::arg("activations"),
@@ -79,7 +87,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("task_count"),
           py::arg("output"),
           py::arg("kernel"),
-          py::arg("grid_multiplier"));
+          py::arg("grid_multiplier"),
+          py::arg("scatter"),
+          py::arg("shared_down"),
+          py::arg("shared_down_scales"),
+          py::arg("shared_act"));
     m.def("iq2r_glm53_down_route9_out",
           &aiter::iq2r_glm53_down_route9_out,
           py::arg("activations"),
@@ -89,7 +101,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("expert_ids"),
           py::arg("scatter"),
           py::arg("route_weights"),
-          py::arg("output"));
+          py::arg("output"),
+          py::arg("shared_down"),
+          py::arg("shared_down_scales"),
+          py::arg("shared_act"));
     m.def("iq2r_glm53_down_reduce_out",
           &aiter::iq2r_glm53_down_reduce_out,
           py::arg("activations"),

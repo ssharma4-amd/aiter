@@ -22,8 +22,9 @@ constexpr int kTaskColumns = 3;
 constexpr int kQuantGroup  = 32;
 
 // GLM-5.3 IQ2R-v2 packed MoE routing: 256 routed experts, top-8 ids and
-// weights ([tokens, 8]); the shared expert stays FP8 outside the MoE. Routes
-// keep nine slots per token (route token * 9 + k); slot 8 is empty.
+// weights ([tokens, 8]). Routes keep nine slots per token (route token * 9 +
+// k); slot 8 is the shared expert when it is fused (weight 1), else empty.
+// Sorted, the shared routes follow the routed ones in token order.
 constexpr int kGlm53Experts    = 256;
 constexpr int kGlm53TopK       = 8;
 constexpr int kGlm53RouteSlots = 9;
@@ -204,7 +205,7 @@ __global__ __launch_bounds__(256) void glm53_quant_kernel(
 // and its row copied to every route; the empty slot 8 gets no task.
 __global__ __launch_bounds__(256) void glm53_m1_route_quant_kernel(
     const opus::bf16_t* input,const int32_t* ids,int32_t* scatter,int32_t* tasks,
-    int32_t* count,opus::fp8_t* output,uint8_t* scales)
+    int32_t* count,opus::fp8_t* output,uint8_t* scales,int shared)
 {
 #if defined(__gfx950__)
     const int t=threadIdx.x;
@@ -218,7 +219,7 @@ __global__ __launch_bounds__(256) void glm53_m1_route_quant_kernel(
         if(t==0)count[0]=kGlm53TopK;
     }
     else if(t<kGlm53RouteSlots)
-        scatter[t]=-1;
+        scatter[t]=shared?t:-1;
     if(t>=kGlm53Groups)return;
     glm53_fp8_group quantized;
     const uint8_t scale=glm53_quant32(input+t*kQuantGroup,quantized);
@@ -245,7 +246,8 @@ __device__ __forceinline__ void glm53_sort_routes(
     int task_capacity,
     int32_t* __restrict__ gate_tasks,
     int32_t* __restrict__ gate_count,
-    int gate_capacity)
+    int gate_capacity,
+    int shared)
 {
     constexpr int task_rows = 32;
     __shared__ int counts[kGlm53Experts + 1];
@@ -270,16 +272,26 @@ __device__ __forceinline__ void glm53_sort_routes(
     const int count_prefix = glm53_block_scan(counts[expert], wave_totals);
     offsets[expert]        = count_prefix - counts[expert];
     cursors[expert]        = offsets[expert];
+    // The shared routes (counted with the invalid ones) take the first
+    // tokens rows after the routed ones; they get no tasks.
+    const int shared_routes = shared ? routes / kGlm53RouteSlots : 0;
     if(expert == kGlm53Experts - 1)
     {
         offsets[kGlm53Experts] = count_prefix;
-        cursors[kGlm53Experts] = count_prefix;
+        cursors[kGlm53Experts] = count_prefix + shared_routes;
     }
     __syncthreads();
 
     for(int route = expert; route < routes; route += kThreads)
     {
-        const int id                 = glm53_route_id(expert_ids, route);
+        const int id = glm53_route_id(expert_ids, route);
+        if(shared && route % kGlm53RouteSlots == kGlm53TopK)
+        {
+            const int sorted_route       = offsets[kGlm53Experts] + route / kGlm53RouteSlots;
+            gather_indices[sorted_route] = route;
+            scatter_indices[route]       = sorted_route;
+            continue;
+        }
         const int sorted_route       = atomicAdd(cursors + (id >= 0 ? id : kGlm53Experts), 1);
         gather_indices[sorted_route] = route;
         scatter_indices[route]       = id >= 0 ? sorted_route : -1;
@@ -329,12 +341,13 @@ __device__ __forceinline__ void glm53_sort_routes(
 __global__ __launch_bounds__(256) void glm53_sort_quant_kernel(
     const opus::bf16_t* input,const int32_t* ids,
     int32_t* gather,int32_t* scatter,int32_t* tasks,int32_t* count,
-    opus::fp8_t* output,uint8_t* scales,int tokens,int stride,int capacity,int32_t* gate_tasks,int32_t* gate_count,int gate_capacity)
+    opus::fp8_t* output,uint8_t* scales,int tokens,int stride,int capacity,int32_t* gate_tasks,int32_t* gate_count,int gate_capacity,
+    int shared)
 {
 #if defined(__gfx950__)
     if(blockIdx.x==0)
         glm53_sort_routes(ids,gather,scatter,tasks,count,
-            tokens*kGlm53RouteSlots,capacity,gate_tasks,gate_count,gate_capacity);
+            tokens*kGlm53RouteSlots,capacity,gate_tasks,gate_count,gate_capacity,shared);
     else
         glm53_quant_group(input,output,scales,tokens,stride,
             (static_cast<int>(blockIdx.x)-1)*256+static_cast<int>(threadIdx.x));
@@ -354,8 +367,9 @@ __global__ __launch_bounds__(64) void glm53_route_reduce_kernel(
     const int token=blockIdx.x/Tiles,tile=blockIdx.x%Tiles,lane=threadIdx.x;
     if(token>=tokens)return;
     const int column=tile*Columns+lane*Items;
-    const int r=lane<kGlm53TopK?scatter[token*kGlm53RouteSlots+lane]:-1;
-    const float w=lane<kGlm53TopK?route_weights[token*kGlm53TopK+lane]:0.0f;
+    const int r=lane<kGlm53RouteSlots?scatter[token*kGlm53RouteSlots+lane]:-1;
+    // Slot 8 (the shared expert, when fused) has weight 1.
+    const float w=lane<kGlm53TopK?route_weights[token*kGlm53TopK+lane]:1.0f;
     int rows[9];float weights[9];
 #pragma unroll
     for(int i=0;i<9;++i){rows[i]=__shfl(r,i);weights[i]=__shfl(w,i);}
@@ -456,7 +470,8 @@ void iq2r_glm53_m1_route_quant_out(const aiter_tensor_t& input,
                                    aiter_tensor_t& tasks,
                                    aiter_tensor_t& task_count,
                                    aiter_tensor_t& output,
-                                   aiter_tensor_t& scales)
+                                   aiter_tensor_t& scales,
+                                   int64_t shared)
 {
     iq2r_check_gfx950();
     const int device = input.device_id;
@@ -483,7 +498,8 @@ void iq2r_glm53_m1_route_quant_out(const aiter_tensor_t& input,
                        static_cast<int32_t*>(tasks.data_ptr()),
                        static_cast<int32_t*>(task_count.data_ptr()),
                        static_cast<opus::fp8_t*>(output.data_ptr()),
-                       static_cast<uint8_t*>(scales.data_ptr()));
+                       static_cast<uint8_t*>(scales.data_ptr()),
+                       static_cast<int>(shared != 0));
     HIP_CALL_LAUNCH(hipGetLastError());
 }
 
@@ -499,7 +515,8 @@ void iq2r_glm53_sort_quant_out(const aiter_tensor_t& input,
                                aiter_tensor_t& output,
                                aiter_tensor_t& scales,
                                aiter_tensor_t& gate_tasks,
-                               aiter_tensor_t& gate_task_count)
+                               aiter_tensor_t& gate_task_count,
+                               int64_t shared)
 {
     iq2r_check_gfx950();
     const int device = input.device_id;
@@ -531,7 +548,8 @@ void iq2r_glm53_sort_quant_out(const aiter_tensor_t& input,
                        static_cast<int>(tasks.size(0)),
                        static_cast<int32_t*>(gate_tasks.data_ptr()),
                        static_cast<int32_t*>(gate_task_count.data_ptr()),
-                       static_cast<int>(gate_tasks.size(0)));
+                       static_cast<int>(gate_tasks.size(0)),
+                       static_cast<int>(shared != 0));
     HIP_CALL_LAUNCH(hipGetLastError());
 }
 

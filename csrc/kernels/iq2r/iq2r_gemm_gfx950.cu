@@ -553,6 +553,169 @@ __device__ __forceinline__ void glm53_cross_k_decode_mfma(
     opus::vector_t<float,4> (&accumulators)[MAtoms][4],int active_m,
     uint64_t (&pending)[4],bool first_k,bool next_k,IQ2RLevels& carried);
 
+// Shared expert fused into the MoE launches as route slot 8 of every token
+// (weight 1), in MXFP8: the bytes and E8M0 scales of each 16 x 128 tile are
+// stored in MFMA operand order (iq2r_glm53_pack_shared in aiter/iq2r_glm53.py),
+// so a lane loads its 32 bytes and one scale byte per tile and no decode runs.
+// The gate writes SiLU(gate) * up in BF16 to ``act`` [tokens][I]; the down
+// stage quantizes it to MXFP8 as it builds its operands. No workgroup waits on
+// another. ``gate``/``down`` null: that stage has no shared expert.
+struct Glm53SharedArgs
+{
+    const uint8_t* gate;         // [I/32][48][4 atoms][64][32]
+    const uint8_t* gate_scales;  // [I/32][48][64][4 atoms]
+    const uint8_t* down;         // [384][K/128][64][32]
+    const uint8_t* down_scales;  // [384][K/128][64]
+    const int32_t* scatter;      // route slot -> sorted route row
+    __hip_bfloat16* act;         // [tokens][I]
+    int tokens;
+};
+
+// Tokens per shared item, 16 * MA: larger batches put more tokens on each
+// weight read (the gate and down weights are re-read once per item row).
+__device__ __forceinline__ int glm53_shared_ma(int tokens)
+{
+    return tokens<=32 ? 1 : tokens<=128 ? 2 : 4;
+}
+
+// Gate items: 16 * MA tokens x one 16-row atom (8 outputs) of the interleaved
+// gate/up rows, over the whole K (one K768 slice per wave).
+template<int NT>
+__device__ __forceinline__ int glm53_shared_gate_items(const Glm53SharedArgs& sh)
+{
+    const int rows=16*glm53_shared_ma(sh.tokens);
+    return sh.gate!=nullptr ? (sh.tokens+rows-1)/rows*NT*4 : 0;
+}
+
+// One shared gate item in a 512-thread workgroup; ``lds`` holds 2048 * MA
+// floats. ``Step`` K tiles of loads are in flight per wave (6: all of the
+// slice; MA 4 runs one at a time). ``activations`` rows are tokens.
+template<int NT,int Step,int MA>
+__device__ void glm53_shared_gate_item_ma(const Glm53SharedArgs& sh,const opus::fp8_t* activations,const uint8_t* scales,
+                                          int item,float* lds)
+{
+    static_assert(6%Step==0);
+    const int lane=threadIdx.x,wave=__builtin_amdgcn_readfirstlane(threadIdx.y);
+    const int lane_row=lane%16,lane_group=lane/16;
+    const int row_block=item/(NT*4),n_atom=item%(NT*4),n_tile=n_atom/4,atom=n_atom%4;
+    const int kt0=wave*6;
+    const uint8_t* input[MA];const uint8_t* input_scales[MA];
+#pragma unroll
+    for(int m=0;m<MA;++m)
+    {
+        const int token=min(row_block*16*MA+m*16+lane_row,sh.tokens-1);
+        input[m]=reinterpret_cast<const uint8_t*>(activations)+static_cast<int64_t>(token)*6144+lane_group*16;
+        input_scales[m]=scales+static_cast<int64_t>(token)*192+lane_group;
+    }
+    const uint8_t* weights=sh.gate+(static_cast<int64_t>(n_tile*48+kt0)*4+atom)*2048+lane*32;
+    const uint8_t* weight_scales=sh.gate_scales+static_cast<int64_t>(n_tile*48+kt0)*256+lane*4+atom;
+    auto mma=opus::mfma<opus::fp8_t,opus::fp8_t,opus::fp32_t,16,16,128>{};
+    opus::vector_t<float,4> acc[MA]={};
+#pragma unroll
+    for(int first=0;first<6;first+=Step)
+    {
+        IQ2RActivationFragment a[MA][Step],b[Step];
+        uint32_t sa[MA][Step],sb[Step];
+#pragma unroll
+        for(int j=0;j<Step;++j)
+        {
+            const int i=first+j,k=(kt0+i)*128;
+            *reinterpret_cast<uint4*>(b[j].bytes)=*reinterpret_cast<const uint4*>(weights+i*8192);
+            *reinterpret_cast<uint4*>(b[j].bytes+16)=*reinterpret_cast<const uint4*>(weights+i*8192+16);
+            sb[j]=weight_scales[i*256];
+#pragma unroll
+            for(int m=0;m<MA;++m)
+            {
+                *reinterpret_cast<uint4*>(a[m][j].bytes)=*reinterpret_cast<const uint4*>(input[m]+k);
+                *reinterpret_cast<uint4*>(a[m][j].bytes+16)=*reinterpret_cast<const uint4*>(input[m]+k+64);
+                sa[m][j]=input_scales[m][(kt0+i)*4];
+            }
+        }
+#pragma unroll
+        for(int j=0;j<Step;++j)
+#pragma unroll
+            for(int m=0;m<MA;++m)
+                acc[m]=mma(a[m][j].words,b[j].words,acc[m],sa[m][j],sb[j],opus::number<0>{},opus::number<0>{});
+    }
+#pragma unroll
+    for(int m=0;m<MA;++m)
+#pragma unroll
+        for(int c=0;c<4;++c) lds[((m*8+wave)*4+c)*64+lane]=acc[m][c];
+    __syncthreads();
+    if(wave<4)
+    {
+        // Wave c < 4 owns accumulator element c: token 4 * lane group + c of
+        // each 16-token atom m, row lane_row of the gate/up atom (gate for even rows).
+#pragma unroll
+        for(int m=0;m<MA;++m)
+        {
+            float value=0.0f;
+#pragma unroll
+            for(int source=0;source<8;++source) value+=lds[((m*8+source)*4+wave)*64+lane];
+            value=__bfloat162float(__float2bfloat16(value));
+            const float up=__shfl_xor(value,1);
+            const int t=row_block*16*MA+m*16+lane_group*4+wave;
+            if(lane_row%2==0 && t<sh.tokens)
+            {
+                const float swish=value/(1.0f+__expf(-value));
+                sh.act[static_cast<int64_t>(t)*(NT*32)+n_tile*32+atom*8+lane_row/2]=__float2bfloat16(swish*(up+0.0f));
+            }
+        }
+    }
+    __syncthreads();
+}
+
+template<int NT,int Step>
+__device__ __forceinline__ void glm53_shared_gate_item(const Glm53SharedArgs& sh,const opus::fp8_t* activations,
+                                                       const uint8_t* scales,int item,float* lds)
+{
+    const int ma=glm53_shared_ma(sh.tokens);
+    if(ma==1) glm53_shared_gate_item_ma<NT,Step,1>(sh,activations,scales,item,lds);
+    else if(ma==2) glm53_shared_gate_item_ma<NT,Step,2>(sh,activations,scales,item,lds);
+    else glm53_shared_gate_item_ma<NT,1,4>(sh,activations,scales,item,lds);
+}
+
+// MXFP8 MFMA operand of 128 inputs of a BF16 row (``tile`` points at input 0
+// of the K tile), quantized as the routed activations are (E8M0 per 32 inputs):
+// the lane holds inputs 16g..16g+15 and 64+16g..64+16g+15 (g: lane group),
+// whose blocks are g / 2 and 2 + g / 2, and returns the scale of block g. Every
+// lane must call it; the block maxima are exchanged between lane groups.
+__device__ __forceinline__ uint32_t glm53_shared_fragment(const __hip_bfloat16* tile,int lane,IQ2RActivationFragment& a)
+{
+    const int lane_group=lane/16;
+    using half_row=opus::vector_t<opus::bf16_t,16>;
+    const half_row lo=*reinterpret_cast<const half_row*>(tile+lane_group*16);
+    const half_row hi=*reinterpret_cast<const half_row*>(tile+64+lane_group*16);
+    float lo_max=aiter::kAmaxFloor,hi_max=aiter::kAmaxFloor;
+#pragma unroll
+    for(int i=0;i<16;++i)
+    {
+        lo_max=fmaxf(lo_max,fabsf(static_cast<float>(lo[i])));
+        hi_max=fmaxf(hi_max,fabsf(static_cast<float>(hi[i])));
+    }
+    lo_max=fmaxf(lo_max,__shfl_xor(lo_max,16));
+    hi_max=fmaxf(hi_max,__shfl_xor(hi_max,16));
+    // Block g's maximum: group 0 own lo, group 1 group 2's lo, group 2
+    // group 0's hi, group 3 own hi.
+    const int source=lane_group==1?lane+16:lane_group==2?lane-32:lane;
+    const float lo_other=__shfl(lo_max,source),hi_other=__shfl(hi_max,source);
+    const float own_max=lane_group<2?lo_other:hi_other;
+    const auto lo_scale=fp_f32_to_e8m0_block_scale<kDefaultMxScaleRoundMode,MxDtype::FP8_E4M3>(lo_max);
+    const auto hi_scale=fp_f32_to_e8m0_block_scale<kDefaultMxScaleRoundMode,MxDtype::FP8_E4M3>(hi_max);
+    const float lo_inverse=1.0f/lo_scale.dq_scale,hi_inverse=1.0f/hi_scale.dq_scale;
+#pragma unroll
+    for(int word=0;word<4;++word)
+    {
+        int bits=__builtin_amdgcn_cvt_pk_fp8_f32(static_cast<float>(lo[word*4])*lo_inverse,static_cast<float>(lo[word*4+1])*lo_inverse,0,0);
+        bits=__builtin_amdgcn_cvt_pk_fp8_f32(static_cast<float>(lo[word*4+2])*lo_inverse,static_cast<float>(lo[word*4+3])*lo_inverse,bits,1);
+        a.words[word]=bits;
+        bits=__builtin_amdgcn_cvt_pk_fp8_f32(static_cast<float>(hi[word*4])*hi_inverse,static_cast<float>(hi[word*4+1])*hi_inverse,0,0);
+        bits=__builtin_amdgcn_cvt_pk_fp8_f32(static_cast<float>(hi[word*4+2])*hi_inverse,static_cast<float>(hi[word*4+3])*hi_inverse,bits,1);
+        a.words[4+word]=bits;
+    }
+    return fp_f32_to_e8m0_block_scale<kDefaultMxScaleRoundMode,MxDtype::FP8_E4M3>(own_max).byte;
+}
+
 template<int NT,int Classes,int Entries>
 __global__ __launch_bounds__(512,1) void glm53_gate_m1_kernel(
     const opus::fp8_t* __restrict__ activations,
@@ -563,7 +726,7 @@ __global__ __launch_bounds__(512,1) void glm53_gate_m1_kernel(
     const int32_t* __restrict__ task_count,
     opus::fp8_t* __restrict__ output,
     uint8_t* __restrict__ output_scales,
-    int routes,int data_bytes,int auxiliary_bytes)
+    int routes,int data_bytes,int auxiliary_bytes,Glm53SharedArgs sh)
 {
 #if defined(__gfx950__)
     constexpr int MAtoms=1;
@@ -578,11 +741,18 @@ __global__ __launch_bounds__(512,1) void glm53_gate_m1_kernel(
     const int lane=threadIdx.x,wave=threadIdx.y;
     const int lane_row=lane%16,lane_group=lane/16;
     const int num_tasks=task_count[0];
-    const int total=num_tasks*NT;
+    // Shared expert items first (activation row 0 is the token's).
+    const int shared_items=glm53_shared_gate_items<NT>(sh);
+    const int total=shared_items+num_tasks*NT;
     for(int work=blockIdx.x;work<total;work+=gridDim.x)
     {
-        const int task=work%num_tasks;
-        const int n_tile=work/num_tasks;
+        if(work<shared_items)
+        {
+            glm53_shared_gate_item_ma<NT,6,1>(sh,activations,scales,work,reinterpret_cast<float*>(shared.partial));
+            continue;
+        }
+        const int task=(work-shared_items)%num_tasks;
+        const int n_tile=(work-shared_items)/num_tasks;
         const int row_begin=tasks[task*3];
         const int row_end=min(row_begin+Rows,tasks[task*3]+tasks[task*3+1]);
         const int expert=tasks[task*3+2];
@@ -742,7 +912,7 @@ __global__ __launch_bounds__(64*Waves,2) void glm53_gate_prefill_kernel(
     const uint8_t* __restrict__ all_data,const uint8_t* __restrict__ all_auxiliary,
     const int32_t* __restrict__ tasks,const int32_t* __restrict__ task_count,
     const int32_t* __restrict__ gather,opus::fp8_t* __restrict__ output,
-    uint8_t* __restrict__ output_scales,int routes,int data_bytes,int auxiliary_bytes)
+    uint8_t* __restrict__ output_scales,int routes,int data_bytes,int auxiliary_bytes,Glm53SharedArgs)
 {
 #if defined(__gfx950__)
     constexpr int Rows=64,MAtoms=4,Threads=Waves*64;
@@ -1072,6 +1242,76 @@ __device__ __forceinline__ void glm53_down_tp4_triplet(
     }
 }
 
+// Shared expert down items of the decode down kernels: 16 * MA shared routes
+// x 128 columns, two 16-column blocks per wave (four waves), written to the
+// routes' rows of ``output`` (route slot 8 rows follow the routed rows in
+// token order).
+__device__ __forceinline__ int glm53_shared_down_items(const Glm53SharedArgs& sh)
+{
+    const int rows=16*glm53_shared_ma(sh.tokens);
+    return sh.down!=nullptr ? (sh.tokens+rows-1)/rows*48 : 0;
+}
+
+template<int KT,int MA>
+__device__ void glm53_shared_down_item_ma(const Glm53SharedArgs& sh,__hip_bfloat16* output,int rows,int item)
+{
+    constexpr int K=KT*128;
+    const int lane=threadIdx.x,wave=__builtin_amdgcn_readfirstlane(threadIdx.y);
+    const int lane_row=lane%16,lane_group=lane/16;
+    const int row_block=item/48,column_tile=item%48;
+    const int first=__builtin_amdgcn_readfirstlane(sh.scatter[8]);
+    opus::gmem<opus::bf16_t> out_buffer(output,static_cast<unsigned int>(rows*6144*sizeof(__hip_bfloat16)));
+    auto mma=opus::mfma<opus::fp8_t,opus::fp8_t,opus::fp32_t,16,16,128>{};
+    int token[MA];
+#pragma unroll
+    for(int m=0;m<MA;++m) token[m]=min(row_block*16*MA+m*16+lane_row,sh.tokens-1);
+    opus::vector_t<float,4> acc[2][MA]={};
+#pragma unroll
+    for(int kt=0;kt<KT;++kt)
+    {
+        IQ2RActivationFragment w[2];uint32_t sw[2];
+#pragma unroll
+        for(int i=0;i<2;++i)
+        {
+            const int64_t tile=static_cast<int64_t>(column_tile*8+wave*2+i)*KT+kt;
+            *reinterpret_cast<uint4*>(w[i].bytes)=*reinterpret_cast<const uint4*>(sh.down+(tile*64+lane)*32);
+            *reinterpret_cast<uint4*>(w[i].bytes+16)=*reinterpret_cast<const uint4*>(sh.down+(tile*64+lane)*32+16);
+            sw[i]=sh.down_scales[tile*64+lane];
+        }
+#pragma unroll
+        for(int m=0;m<MA;++m)
+        {
+            IQ2RActivationFragment a;
+            const uint32_t sa=glm53_shared_fragment(sh.act+static_cast<int64_t>(token[m])*K+kt*128,lane,a);
+#pragma unroll
+            for(int i=0;i<2;++i)
+                acc[i][m]=mma(w[i].words,a.words,acc[i][m],sw[i],sa,opus::number<0>{},opus::number<0>{});
+        }
+    }
+#pragma unroll
+    for(int i=0;i<2;++i)
+#pragma unroll
+        for(int m=0;m<MA;++m)
+        {
+            // Lane: route row of token lane_row of atom m, columns 4 * lane group + 0..3 of the block.
+            const int block=column_tile*8+wave*2+i;
+            const int t=row_block*16*MA+m*16+lane_row;
+            opus::vector_t<opus::bf16_t,4> packed;
+#pragma unroll
+            for(int c=0;c<4;++c)packed[c]=__builtin_bit_cast(opus::bf16_t,__float2bfloat16(acc[i][m][c]));
+            out_buffer.template store<4>(packed,glm53_row_offset(t<sh.tokens,(first+token[m])*6144+block*16+lane_group*4));
+        }
+}
+
+template<int KT>
+__device__ __forceinline__ void glm53_shared_down_item(const Glm53SharedArgs& sh,__hip_bfloat16* output,int rows,int item)
+{
+    const int ma=glm53_shared_ma(sh.tokens);
+    if(ma==1) glm53_shared_down_item_ma<KT,1>(sh,output,rows,item);
+    else if(ma==2) glm53_shared_down_item_ma<KT,2>(sh,output,rows,item);
+    else glm53_shared_down_item_ma<KT,4>(sh,output,rows,item);
+}
+
 template<int Waves,int MAtoms,int Groups,int XCD,int TaskGroup,int KT,int Occupancy,int Classes,int Entries>
 __global__ __launch_bounds__(64*Waves,Occupancy) void glm53_down_tp4_kernel(
     const opus::fp8_t* __restrict__ activations,
@@ -1081,7 +1321,7 @@ __global__ __launch_bounds__(64*Waves,Occupancy) void glm53_down_tp4_kernel(
     const int32_t* __restrict__ tasks,
     const int32_t* __restrict__ task_count,
     __hip_bfloat16* __restrict__ output,
-    int M,int expert_count,int data_bytes,int auxiliary_bytes)
+    int M,int expert_count,int data_bytes,int auxiliary_bytes,Glm53SharedArgs sh)
 {
 #if defined(__gfx950__)
     constexpr int K=KT*128,Rows=16*MAtoms,Columns=48*Waves*Groups,Threads=64*Waves;
@@ -1099,6 +1339,8 @@ __global__ __launch_bounds__(64*Waves,Occupancy) void glm53_down_tp4_kernel(
     opus::gmem<uint8_t> a_buffer(activations,static_cast<unsigned int>(M*K));
     opus::gmem<opus::bf16_t> out_buffer(output,static_cast<unsigned int>(M*6144*sizeof(__hip_bfloat16)));
     opus::gmem<uint8_t> scale_buffer(activation_scales,static_cast<unsigned int>(M*(K/32)));
+    for(int item=blockIdx.x;item<glm53_shared_down_items(sh);item+=gridDim.x)
+        glm53_shared_down_item<KT>(sh,output,M,item);
     int previous_expert=-1;
     for(int work=blockIdx.x;work<nt*(6144/Columns);work+=gridDim.x)
     {
@@ -1687,6 +1929,43 @@ __global__ __launch_bounds__(128) void glm53_reduce_chunk_kernel(
 #endif
 }
 
+// Route9 with the shared expert: its Triplets * 3 column blocks x KT tiles
+// are spread over the eight waves after their routes, one MFMA per unit;
+// ``units`` [Units * 16 + 16] floats receives each unit's 16 columns (lane
+// groups 1-3 write the spare slot). glm53_route9_shared_value sums a column's
+// units in K-tile order.
+template<int KT,int Triplets>
+__device__ __forceinline__ void glm53_route9_shared_units(const Glm53SharedArgs& sh,int token,int first_block,int wave,
+                                                          int lane,float* units)
+{
+    constexpr int K=KT*128,Units=Triplets*3*KT;
+    const int lane_row=lane%16,lane_group=lane/16;
+    auto mma=opus::mfma<opus::fp8_t,opus::fp8_t,opus::fp32_t,16,16,128>{};
+#pragma unroll
+    for(int u=wave;u<Units;u+=8)
+    {
+        const int atom=u/KT,kt=u%KT;
+        const int64_t tile=static_cast<int64_t>(first_block+atom)*KT+kt;
+        const uint8_t* weights=sh.down+(tile*64+lane)*32;
+        IQ2RActivationFragment a,w;
+        *reinterpret_cast<uint4*>(w.bytes)=*reinterpret_cast<const uint4*>(weights);
+        *reinterpret_cast<uint4*>(w.bytes+16)=*reinterpret_cast<const uint4*>(weights+16);
+        const uint32_t sa=glm53_shared_fragment(sh.act+static_cast<int64_t>(token)*K+kt*128,lane,a);
+        const opus::vector_t<float,4> d=mma(a.words,w.words,opus::vector_t<float,4>{},sa,
+                                            sh.down_scales[tile*64+lane],opus::number<0>{},opus::number<0>{});
+        units[lane_group==0?u*16+lane_row:Units*16]=d[0];
+    }
+}
+
+template<int KT>
+__device__ __forceinline__ float glm53_route9_shared_value(const float* units,int atom,int lane_row)
+{
+    float value=units[atom*KT*16+lane_row];
+#pragma unroll
+    for(int kt=1;kt<KT;++kt)value+=units[(atom*KT+kt)*16+lane_row];
+    return __bfloat162float(__float2bfloat16(value));
+}
+
 // Down for M<=4: one CTA per (Triplets x 48-column blocks, token) and one
 // wave per route (eight waves, two per SIMD). Each route needs its own 16 KB of codebook
 // copies, so a wave loads only its expert's 4 KB book and forms the copies in
@@ -1702,7 +1981,7 @@ __global__ __launch_bounds__(512,1) void glm53_down_route9_v2_kernel(
     const int32_t* __restrict__ scatter,
     const float* __restrict__ route_weights,
     __hip_bfloat16* __restrict__ output,
-    int data_bytes, int auxiliary_bytes)
+    int data_bytes, int auxiliary_bytes, Glm53SharedArgs sh)
 {
 #if defined(__gfx950__)
     constexpr int Routes=8,Atoms=3,N=6144,K=KT*128,Columns=Triplets*Atoms*16;
@@ -1714,6 +1993,8 @@ __global__ __launch_bounds__(512,1) void glm53_down_route9_v2_kernel(
         alignas(16) __hip_bfloat16 routes[Routes][Columns+8];
         // Each route's activation row, staged by a global -> LDS DMA.
         alignas(16) uint8_t act[Routes][K];
+        // Shared expert units (glm53_route9_shared_units).
+        float shared_units[Triplets*3*KT*16+16];
     };
     __shared__ Storage shared;
     const int lane=threadIdx.x;
@@ -1859,6 +2140,8 @@ __global__ __launch_bounds__(512,1) void glm53_down_route9_v2_kernel(
         for(int column=lane_row;column<Columns;column+=16)
             shared.routes[route][column]=__float2bfloat16(0.0f);
     }
+    if(sh.down!=nullptr)
+        glm53_route9_shared_units<KT,Triplets>(sh,token,first,route,lane,shared.shared_units);
     __syncthreads();
     if(route==0 && lane_group<Triplets)
     {
@@ -1870,6 +2153,7 @@ __global__ __launch_bounds__(512,1) void glm53_down_route9_v2_kernel(
 #pragma unroll
             for(int r=0;r<8;++r)
                 combined=fmaf(__bfloat162float(shared.routes[r][column]),weights[r],combined);
+            if(sh.down!=nullptr)combined+=glm53_route9_shared_value<KT>(shared.shared_units,lane_group*Atoms+atom,lane_row);
             output[static_cast<int64_t>(token)*N+first*16+column]=__float2bfloat16(combined);
         }
     }
@@ -1922,7 +2206,7 @@ __global__ __launch_bounds__(512,1) void glm53_down_route9_wide_kernel(
     const int32_t* __restrict__ scatter,
     const float* __restrict__ route_weights,
     __hip_bfloat16* __restrict__ output,
-    int data_bytes, int auxiliary_bytes)
+    int data_bytes, int auxiliary_bytes, Glm53SharedArgs sh)
 {
 #if defined(__gfx950__)
     static_assert(Classes==4,"c4e4q delta tables");
@@ -1938,6 +2222,8 @@ __global__ __launch_bounds__(512,1) void glm53_down_route9_wide_kernel(
         alignas(16) __hip_bfloat16 routes[Routes][Columns+8];
         // Each route's activation row, staged by a global -> LDS DMA.
         alignas(16) uint8_t act[Routes][K];
+        // Shared expert units (glm53_route9_shared_units).
+        float shared_units[Triplets*3*KT*16+16];
     };
     __shared__ Storage shared;
     const int lane=threadIdx.x;
@@ -2082,6 +2368,8 @@ __global__ __launch_bounds__(512,1) void glm53_down_route9_wide_kernel(
         for(int column=lane_row;column<Columns;column+=16)
             shared.routes[route][column]=__float2bfloat16(0.0f);
     }
+    if(sh.down!=nullptr)
+        glm53_route9_shared_units<KT,Triplets>(sh,token,first,route,lane,shared.shared_units);
     __syncthreads();
     if(route==0 && lane_group<Triplets)
     {
@@ -2093,6 +2381,7 @@ __global__ __launch_bounds__(512,1) void glm53_down_route9_wide_kernel(
 #pragma unroll
             for(int r=0;r<8;++r)
                 combined=fmaf(__bfloat162float(shared.routes[r][column]),weights[r],combined);
+            if(sh.down!=nullptr)combined+=glm53_route9_shared_value<KT>(shared.shared_units,lane_group*Atoms+atom,lane_row);
             output[static_cast<int64_t>(token)*N+first*16+column]=__float2bfloat16(combined);
         }
     }
@@ -2178,7 +2467,7 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_tp8_ordered_kernel(
     const int32_t* __restrict__ tasks,
     const int32_t* __restrict__ task_count,
     __hip_bfloat16* __restrict__ output,
-    int M,int expert_count,int data_bytes,int auxiliary_bytes)
+    int M,int expert_count,int data_bytes,int auxiliary_bytes,Glm53SharedArgs sh)
 {
 #if defined(__gfx950__)
     constexpr int Rows=16*MAtoms,Columns=48*Waves*Groups,Threads=64*Waves;
@@ -2204,6 +2493,8 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_tp8_ordered_kernel(
     // Descriptor bounds are bytes; typed offsets below are BF16 elements.
     opus::gmem<opus::bf16_t> out_buffer(output,static_cast<unsigned int>(M*6144*sizeof(__hip_bfloat16)));
     opus::gmem<uint8_t> scale_buffer(activation_scales,static_cast<unsigned int>(M*8));
+    for(int item=blockIdx.x;item<glm53_shared_down_items(sh);item+=gridDim.x)
+        glm53_shared_down_item<2>(sh,output,M,item);
     int previous_expert=-1;
     for(int work=blockIdx.x;work<nt*(6144/Columns);work+=gridDim.x)
     {
@@ -2604,7 +2895,7 @@ __global__ __launch_bounds__(512,4) void glm53_gate_decode_nobarrier_v2_kernel(
     const int32_t* __restrict__ gather,
     opus::fp8_t* __restrict__ output,
     uint8_t* __restrict__ output_scales,
-    int routes,int data_bytes,int auxiliary_bytes)
+    int routes,int data_bytes,int auxiliary_bytes,Glm53SharedArgs sh)
 {
 #if defined(__gfx950__)
     constexpr int K=6144, MAtoms=1;
@@ -2616,6 +2907,9 @@ __global__ __launch_bounds__(512,4) void glm53_gate_decode_nobarrier_v2_kernel(
     __shared__ Storage shared;
     const int lane=threadIdx.x,wave=threadIdx.y;
     const int lane_row=lane%16,lane_group=lane/16;
+    // Shared expert items first, strided over the workgroups.
+    for(int item=blockIdx.x;item<glm53_shared_gate_items<NT>(sh);item+=gridDim.x)
+        glm53_shared_gate_item<NT,2>(sh,activations,scales,item,&shared.partial[0][0][0][0]);
     const int num_tasks=task_count[0];
     const int total=num_tasks*NT;
     int current_expert=-1;
@@ -2860,6 +3154,54 @@ void glm53_check_tasks(const aiter_tensor_t& tasks, const aiter_tensor_t& task_c
                 "GLM-5.3 IQ2R task count must be int32 [1]");
 }
 
+// Shared expert operands (iq2r_glm53_pack_shared) and its BF16 activation
+// [tokens, I]; an empty ``gate`` (or ``down``) leaves that stage without it.
+Glm53SharedArgs glm53_shared_args(const aiter_tensor_t& gate,
+                                  const aiter_tensor_t& gate_scales,
+                                  const aiter_tensor_t& down,
+                                  const aiter_tensor_t& down_scales,
+                                  const aiter_tensor_t& scatter,
+                                  const aiter_tensor_t& act,
+                                  int intermediate,
+                                  int tokens)
+{
+    Glm53SharedArgs sh{};
+    sh.tokens = tokens;
+    const bool has_gate = gate.numel() > 0, has_down = down.numel() > 0;
+    if(!has_gate && !has_down)
+        return sh;
+    AITER_CHECK(tokens <= 1024, "GLM-5.3 IQ2R fused shared expert covers up to 1024 tokens");
+    AITER_CHECK(act.dtype() == AITER_DTYPE_bf16 && act.is_contiguous() &&
+                    static_cast<int64_t>(act.numel()) >= int64_t(tokens) * intermediate,
+                "GLM-5.3 IQ2R shared activation must be contiguous BF16 [tokens, I]");
+    sh.act = static_cast<__hip_bfloat16*>(act.data_ptr());
+    if(has_gate)
+    {
+        AITER_CHECK(gate.dtype() == AITER_DTYPE_u8 &&
+                        static_cast<int64_t>(gate.numel()) == int64_t(2) * intermediate * kGlm53Hidden &&
+                        gate_scales.dtype() == AITER_DTYPE_u8 &&
+                        static_cast<int64_t>(gate_scales.numel()) == int64_t(2) * intermediate * kGlm53Hidden / 32,
+                    "GLM-5.3 IQ2R shared gate/up must be MXFP8 bytes [2I * 6144] and scales [2I * 192]");
+        sh.gate        = static_cast<const uint8_t*>(gate.data_ptr());
+        sh.gate_scales = static_cast<const uint8_t*>(gate_scales.data_ptr());
+    }
+    if(has_down)
+    {
+        AITER_CHECK(scatter.dtype() == AITER_DTYPE_i32 &&
+                        static_cast<int64_t>(scatter.numel()) == int64_t(tokens) * kGlm53RouteSlots,
+                    "GLM-5.3 IQ2R shared expert needs the int32 route scatter [tokens * 9]");
+        AITER_CHECK(down.dtype() == AITER_DTYPE_u8 &&
+                        static_cast<int64_t>(down.numel()) == int64_t(intermediate) * kGlm53Hidden &&
+                        down_scales.dtype() == AITER_DTYPE_u8 &&
+                        static_cast<int64_t>(down_scales.numel()) == int64_t(intermediate) * kGlm53Hidden / 32,
+                    "GLM-5.3 IQ2R shared down must be MXFP8 bytes [6144 * I] and scales [6144 * I / 32]");
+        sh.scatter     = static_cast<const int32_t*>(scatter.data_ptr());
+        sh.down        = static_cast<const uint8_t*>(down.data_ptr());
+        sh.down_scales = static_cast<const uint8_t*>(down_scales.data_ptr());
+    }
+    return sh;
+}
+
 // Down K (256 or 512) and codebook size (512 or 1024) of a packed down stack.
 struct Glm53DownShape { int intermediate; int entries; };
 
@@ -2892,13 +3234,19 @@ void iq2r_glm53_gate_m1_out(const aiter_tensor_t& activations,
                             const aiter_tensor_t& tasks,
                             const aiter_tensor_t& task_count,
                             aiter_tensor_t& output,
-                            aiter_tensor_t& output_scales)
+                            aiter_tensor_t& output_scales,
+                            const aiter_tensor_t& shared_gate,
+                            const aiter_tensor_t& shared_gate_scales,
+                            aiter_tensor_t& shared_act)
 {
     const auto [tp4, entries] = glm53_gate_shape(data, auxiliary);
     glm53_check_device({&activations, &scales, &auxiliary, &tasks, &task_count, &output, &output_scales}, data);
     const int routes = kGlm53RouteSlots;
     glm53_check_gate_io(activations, scales, output, output_scales, routes, routes, tp4 ? 512 : 256);
     glm53_check_tasks(tasks, task_count, routes);
+    const aiter_tensor_t none{};
+    const Glm53SharedArgs sh =
+        glm53_shared_args(shared_gate, shared_gate_scales, none, none, none, shared_act, tp4 ? 512 : 256, 1);
     HipDeviceGuard device_guard(data.device_id);
     const auto kernel = entries == 1024 ? (tp4 ? glm53_gate_m1_kernel<16, C, 1024> : glm53_gate_m1_kernel<8, C, 1024>)
                                         : (tp4 ? glm53_gate_m1_kernel<16, C, 512> : glm53_gate_m1_kernel<8, C, 512>);
@@ -2917,7 +3265,8 @@ void iq2r_glm53_gate_m1_out(const aiter_tensor_t& activations,
                        static_cast<uint8_t*>(output_scales.data_ptr()),
                        routes,
                        static_cast<int>(data.size(1)),
-                       static_cast<int>(auxiliary.size(1)));
+                       static_cast<int>(auxiliary.size(1)),
+                       sh);
     HIP_CALL_LAUNCH(hipGetLastError());
 }
 
@@ -2931,7 +3280,10 @@ void iq2r_glm53_gate_out(const aiter_tensor_t& activations,
                          aiter_tensor_t& output,
                          aiter_tensor_t& output_scales,
                          int64_t kernel,
-                         int64_t grid_multiplier)
+                         int64_t grid_multiplier,
+                         const aiter_tensor_t& shared_gate,
+                         const aiter_tensor_t& shared_gate_scales,
+                         aiter_tensor_t& shared_act)
 {
     const auto [tp4, entries] = glm53_gate_shape(data, auxiliary);
     glm53_check_device(
@@ -2948,6 +3300,10 @@ void iq2r_glm53_gate_out(const aiter_tensor_t& activations,
                 "GLM-5.3 IQ2R gate token range: decode 2..1024, prefill 2..4096");
     const int rows = prefill ? 64 : 16;
     glm53_check_tasks(tasks, task_count, (routes + rows - 1) / rows + std::min(routes, kGlm53Experts));
+    const aiter_tensor_t none{};
+    const Glm53SharedArgs sh =
+        glm53_shared_args(shared_gate, shared_gate_scales, none, none, none, shared_act, tp4 ? 512 : 256, tokens);
+    AITER_CHECK(!prefill || sh.gate == nullptr, "GLM-5.3 IQ2R shared expert runs with the decode gate only");
     HipDeviceGuard device_guard(data.device_id);
     const auto launch =
         entries == 1024
@@ -2975,7 +3331,8 @@ void iq2r_glm53_gate_out(const aiter_tensor_t& activations,
                        static_cast<uint8_t*>(output_scales.data_ptr()),
                        routes,
                        static_cast<int>(data.size(1)),
-                       static_cast<int>(auxiliary.size(1)));
+                       static_cast<int>(auxiliary.size(1)),
+                       sh);
     HIP_CALL_LAUNCH(hipGetLastError());
 }
 
@@ -2987,7 +3344,11 @@ void iq2r_glm53_down_out(const aiter_tensor_t& activations,
                          const aiter_tensor_t& task_count,
                          aiter_tensor_t& output,
                          int64_t kernel,
-                         int64_t grid_multiplier)
+                         int64_t grid_multiplier,
+                         const aiter_tensor_t& scatter,
+                         const aiter_tensor_t& shared_down,
+                         const aiter_tensor_t& shared_down_scales,
+                         const aiter_tensor_t& shared_act)
 {
     const auto [K, entries] = glm53_down_shape(activations, scales, data, auxiliary);
     const bool tp4 = K == 512;
@@ -3002,6 +3363,9 @@ void iq2r_glm53_down_out(const aiter_tensor_t& activations,
     AITER_CHECK(kernel == kGlm53DownSingle || (kernel == kGlm53DownOrdered && !tp4) || (kernel == kGlm53DownSingle2 && tp4),
                 "GLM-5.3 IQ2R down kernel id");
     AITER_CHECK(grid_multiplier >= 1 && grid_multiplier <= 16, "GLM-5.3 IQ2R down grid multiplier");
+    const aiter_tensor_t none{};
+    const Glm53SharedArgs sh =
+        glm53_shared_args(none, none, shared_down, shared_down_scales, scatter, shared_act, K, routes / kGlm53RouteSlots);
     HipDeviceGuard device_guard(data.device_id);
     const dim3 grid(static_cast<int>(grid_multiplier) * static_cast<int>(get_num_cu_func()));
 #define GLM53_DOWN_ARGS                                                                     \
@@ -3012,7 +3376,7 @@ void iq2r_glm53_down_out(const aiter_tensor_t& activations,
         static_cast<const int32_t*>(tasks.data_ptr()),                                      \
         static_cast<const int32_t*>(task_count.data_ptr()),                                 \
         static_cast<__hip_bfloat16*>(output.data_ptr()), routes, static_cast<int>(data.size(0)),             \
-        static_cast<int>(data.size(1)), static_cast<int>(auxiliary.size(1))
+        static_cast<int>(data.size(1)), static_cast<int>(auxiliary.size(1)), sh
     // Single: one 16-row atom per pass for decode-sized tasks, three workgroups per CU.
 #define GLM53_DOWN_LAUNCH(E)                                                                            \
     if(tp4 && kernel == kGlm53DownSingle2)                                                              \
@@ -3047,7 +3411,10 @@ void iq2r_glm53_down_route9_out(const aiter_tensor_t& activations,
                                 const aiter_tensor_t& expert_ids,
                                 const aiter_tensor_t& scatter,
                                 const aiter_tensor_t& route_weights,
-                                aiter_tensor_t& output)
+                                aiter_tensor_t& output,
+                                const aiter_tensor_t& shared_down,
+                                const aiter_tensor_t& shared_down_scales,
+                                const aiter_tensor_t& shared_act)
 {
     const auto [K, entries] = glm53_down_shape(activations, scales, data, auxiliary);
     glm53_check_device({&activations, &scales, &auxiliary, &expert_ids, &scatter, &route_weights, &output}, data);
@@ -3055,13 +3422,16 @@ void iq2r_glm53_down_route9_out(const aiter_tensor_t& activations,
     const int tokens = routes / kGlm53RouteSlots;
     AITER_CHECK(tokens == 1 || tokens == 2 || tokens == 4, "GLM-5.3 IQ2R route9 down covers M1, M2 and M4");
     AITER_CHECK(expert_ids.dtype() == AITER_DTYPE_i32 && expert_ids.numel() == tokens * kGlm53TopK &&
-                    scatter.dtype() == AITER_DTYPE_i32 && scatter.numel() == routes,
+                    scatter.dtype() == AITER_DTYPE_i32 && static_cast<int64_t>(scatter.numel()) == routes,
                 "GLM-5.3 IQ2R route9 expert ids must be int32 [tokens, 8], scatter int32 [tokens * 9]");
     AITER_CHECK(route_weights.dtype() == AITER_DTYPE_fp32 && route_weights.numel() == tokens * kGlm53TopK,
                 "GLM-5.3 IQ2R route9 weights must be float32 [tokens, 8]");
     AITER_CHECK(output.dtype() == AITER_DTYPE_bf16 && output.dim() == 2 && output.size(0) == tokens &&
                     output.size(1) == kGlm53Hidden,
                 "GLM-5.3 IQ2R route9 output must be BF16 [tokens, 6144]");
+    const aiter_tensor_t none{};
+    const Glm53SharedArgs sh =
+        glm53_shared_args(none, none, shared_down, shared_down_scales, scatter, shared_act, K, tokens);
     HipDeviceGuard device_guard(data.device_id);
     // Two triplets per CTA at M4: half the CTAs, and half the per-route codebook formation.
     const int triplets = tokens >= 4 ? 2 : 1;
@@ -3085,7 +3455,8 @@ void iq2r_glm53_down_route9_out(const aiter_tensor_t& activations,
                        static_cast<const float*>(route_weights.data_ptr()),
                        static_cast<__hip_bfloat16*>(output.data_ptr()),
                        static_cast<int>(data.size(1)),
-                       static_cast<int>(auxiliary.size(1)));
+                       static_cast<int>(auxiliary.size(1)),
+                       sh);
     HIP_CALL_LAUNCH(hipGetLastError());
 }
 
@@ -3112,7 +3483,7 @@ void iq2r_glm53_down_reduce_out(const aiter_tensor_t& activations,
     AITER_CHECK(route_output.dtype() == AITER_DTYPE_bf16 && route_output.dim() == 2 &&
                     route_output.size(0) == routes && route_output.size(1) == kGlm53Hidden,
                 "GLM-5.3 IQ2R prefill route output must be BF16 [routes, 6144]");
-    AITER_CHECK(scatter.dtype() == AITER_DTYPE_i32 && scatter.numel() == routes &&
+    AITER_CHECK(scatter.dtype() == AITER_DTYPE_i32 && static_cast<int64_t>(scatter.numel()) == routes &&
                     route_weights.dtype() == AITER_DTYPE_fp32 && route_weights.numel() == tokens * kGlm53TopK,
                 "GLM-5.3 IQ2R prefill scatter and weights [tokens, 8]");
     AITER_CHECK(output.dtype() == AITER_DTYPE_bf16 && output.dim() == 2 && output.size(0) == tokens &&

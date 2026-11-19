@@ -23,6 +23,7 @@ def iq2r_glm53_m1_route_quant_out(
     task_count: Tensor,
     output: Tensor,
     scales: Tensor,
+    shared: int,
 ) -> None: ...
 
 
@@ -38,6 +39,7 @@ def iq2r_glm53_sort_quant_out(
     scales: Tensor,
     gate_tasks: Tensor,
     gate_task_count: Tensor,
+    shared: int,
 ) -> None: ...
 
 
@@ -76,6 +78,9 @@ def iq2r_glm53_gate_m1_out(
     task_count: Tensor,
     output: Tensor,
     output_scales: Tensor,
+    shared_gate: Tensor,
+    shared_gate_scales: Tensor,
+    shared_act: Tensor,
 ) -> None: ...
 
 
@@ -92,6 +97,9 @@ def iq2r_glm53_gate_out(
     output_scales: Tensor,
     kernel: int,
     grid_multiplier: int,
+    shared_gate: Tensor,
+    shared_gate_scales: Tensor,
+    shared_act: Tensor,
 ) -> None: ...
 
 
@@ -106,6 +114,10 @@ def iq2r_glm53_down_out(
     output: Tensor,
     kernel: int,
     grid_multiplier: int,
+    scatter: Tensor,
+    shared_down: Tensor,
+    shared_down_scales: Tensor,
+    shared_act: Tensor,
 ) -> None: ...
 
 
@@ -119,6 +131,9 @@ def iq2r_glm53_down_route9_out(
     scatter: Tensor,
     route_weights: Tensor,
     output: Tensor,
+    shared_down: Tensor,
+    shared_down_scales: Tensor,
+    shared_act: Tensor,
 ) -> None: ...
 
 

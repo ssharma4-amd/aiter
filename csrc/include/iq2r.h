@@ -11,7 +11,9 @@ namespace aiter {
 void iq2r_check_gfx950();
 
 // GLM-5.3 IQ2R-v2 packed MoE (6144 hidden, 256 routed experts, top-8). TP4
-// and TP8 are selected by the packed weight shapes.
+// and TP8 are selected by the packed weight shapes. The decode paths (M <= 1024)
+// can run the MXFP8 shared expert as route slot 8; empty shared tensors leave
+// it out.
 enum Glm53GateKernel : int64_t
 {
     kGlm53GateDecodeNoBarrier  = 1,
@@ -32,7 +34,8 @@ void iq2r_glm53_m1_route_quant_out(const aiter_tensor_t& input,
                                    aiter_tensor_t& tasks,
                                    aiter_tensor_t& task_count,
                                    aiter_tensor_t& output,
-                                   aiter_tensor_t& scales);
+                                   aiter_tensor_t& scales,
+                                   int64_t shared);
 
 void iq2r_glm53_sort_quant_out(const aiter_tensor_t& input,
                                const aiter_tensor_t& topk_ids,
@@ -43,7 +46,8 @@ void iq2r_glm53_sort_quant_out(const aiter_tensor_t& input,
                                aiter_tensor_t& output,
                                aiter_tensor_t& scales,
                                aiter_tensor_t& gate_tasks,
-                               aiter_tensor_t& gate_task_count);
+                               aiter_tensor_t& gate_task_count,
+                               int64_t shared);
 
 void iq2r_glm53_prefill_sort_quant_out(const aiter_tensor_t& input,
                                        const aiter_tensor_t& topk_ids,
@@ -67,7 +71,10 @@ void iq2r_glm53_gate_m1_out(const aiter_tensor_t& activations,
                             const aiter_tensor_t& tasks,
                             const aiter_tensor_t& task_count,
                             aiter_tensor_t& output,
-                            aiter_tensor_t& output_scales);
+                            aiter_tensor_t& output_scales,
+                            const aiter_tensor_t& shared_gate,
+                            const aiter_tensor_t& shared_gate_scales,
+                            aiter_tensor_t& shared_act);
 
 void iq2r_glm53_gate_out(const aiter_tensor_t& activations,
                          const aiter_tensor_t& scales,
@@ -79,7 +86,10 @@ void iq2r_glm53_gate_out(const aiter_tensor_t& activations,
                          aiter_tensor_t& output,
                          aiter_tensor_t& output_scales,
                          int64_t kernel,
-                         int64_t grid_multiplier);
+                         int64_t grid_multiplier,
+                         const aiter_tensor_t& shared_gate,
+                         const aiter_tensor_t& shared_gate_scales,
+                         aiter_tensor_t& shared_act);
 
 void iq2r_glm53_down_out(const aiter_tensor_t& activations,
                          const aiter_tensor_t& scales,
@@ -89,7 +99,11 @@ void iq2r_glm53_down_out(const aiter_tensor_t& activations,
                          const aiter_tensor_t& task_count,
                          aiter_tensor_t& output,
                          int64_t kernel,
-                         int64_t grid_multiplier);
+                         int64_t grid_multiplier,
+                         const aiter_tensor_t& scatter,
+                         const aiter_tensor_t& shared_down,
+                         const aiter_tensor_t& shared_down_scales,
+                         const aiter_tensor_t& shared_act);
 
 void iq2r_glm53_down_route9_out(const aiter_tensor_t& activations,
                                 const aiter_tensor_t& scales,
@@ -98,7 +112,10 @@ void iq2r_glm53_down_route9_out(const aiter_tensor_t& activations,
                                 const aiter_tensor_t& expert_ids,
                                 const aiter_tensor_t& scatter,
                                 const aiter_tensor_t& route_weights,
-                                aiter_tensor_t& output);
+                                aiter_tensor_t& output,
+                                const aiter_tensor_t& shared_down,
+                                const aiter_tensor_t& shared_down_scales,
+                                const aiter_tensor_t& shared_act);
 
 void iq2r_glm53_down_reduce_out(const aiter_tensor_t& activations,
                                 const aiter_tensor_t& scales,
