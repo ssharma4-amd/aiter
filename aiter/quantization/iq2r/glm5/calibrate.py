@@ -712,13 +712,42 @@ def _dequantized_fp8_linear(
     if scale.numel() == 1:
         dense = weight.float() * scale
     else:
+        # Scale blocks are block_size (128 x 128); the last block of a
+        # dimension that is not a multiple of it is partial.
+        block_rows, block_columns = tuple(block_size) if block_size else (128, 128)
         rows, columns = weight.shape[-2:]
-        block_rows = -(-rows // scale.shape[-2])
-        block_columns = -(-columns // scale.shape[-1])
         grid = scale.repeat_interleave(block_rows, -2)[..., :rows, :]
         grid = grid.repeat_interleave(block_columns, -1)[..., :columns]
         dense = weight.float() * grid
     return F.linear(input, dense.to(input.dtype), bias)
+
+
+def _dequantized_fp8_experts_forward(module, hidden_states, top_k_index, top_k_weights):
+    """Routed FP8 experts as a per-expert loop over ``module.linear`` (which
+    then runs ``_dequantized_fp8_linear``), for every experts implementation."""
+    final = torch.zeros_like(hidden_states, dtype=torch.float32)
+    with torch.no_grad():
+        mask = F.one_hot(top_k_index, num_classes=module.num_experts + 1).permute(
+            2, 1, 0
+        )
+        hit = torch.greater(mask.sum(dim=(-1, -2)), 0).nonzero(as_tuple=False).view(-1)
+    for expert_tensor in hit:
+        expert = int(expert_tensor)
+        if expert == module.num_experts:
+            continue
+        slot, token = torch.where(mask[expert])
+        gate_up = module.linear(
+            hidden_states[token],
+            module.gate_up_proj[expert],
+            module.gate_up_proj_scale_inv[expert],
+        )
+        down = module.linear(
+            module._apply_gate(gate_up),
+            module.down_proj[expert],
+            module.down_proj_scale_inv[expert],
+        )
+        final.index_add_(0, token, (down * top_k_weights[token, slot, None]).float())
+    return final.to(hidden_states.dtype)
 
 
 def _use_dequantized_fp8_if_needed() -> bool:
@@ -733,6 +762,10 @@ def _use_dequantized_fp8_if_needed() -> bool:
         return False
     except ImportError:
         finegrained_fp8.fp8_linear = _dequantized_fp8_linear
+        # MoE layers dispatch through the experts-implementation registry.
+        mapping = finegrained_fp8.FP8ExpertsInterface._global_mapping
+        for name in list(mapping):
+            mapping[name] = _dequantized_fp8_experts_forward
         print(
             "finegrained-fp8 kernel unavailable: FP8 matmuls dequantize to BF16",
             flush=True,
