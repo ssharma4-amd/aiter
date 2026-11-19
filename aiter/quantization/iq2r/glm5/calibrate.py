@@ -36,8 +36,9 @@ input of every expert), in two buckets:
   ``<|user|>``, ``<|observation|>``), ``</think>`` or ``<tool_call>``. JSONL
   rows with a ``kind`` field (e.g. ``iq2r_v2_decision_corpus_v1.jsonl``: SWE
   agent, math reasoning, terminal agent, chat) give one Hessian per kind; the
-  bucket is their mean after each is normalized by its trace, so every kind
-  weighs the same whatever its position count.
+  bucket is their mean after each is normalized by its trace, weighted by the
+  kind's share of the corpus tokens (decision corpus v1.1's recipe), so a
+  kind weighs by its text, not by its position count.
 
 They are written as ``hessian-layer-NNNN.pt`` plus ``hessians.json`` (corpus
 hashes, counts and each file's digest); ``--output`` is then optional:
@@ -578,12 +579,17 @@ class LayerHessianAccumulator:
 
 
 class MergedHessians:
-    """Per-layer mean of several buckets' Hessians, each normalized by its
-    trace (the counts add up); saves like a LayerHessianAccumulator."""
+    """Per-layer weighted mean of several buckets' Hessians, each normalized by
+    its trace (the counts add up); saves like a LayerHessianAccumulator.
+    ``weights`` (default equal) are normalized to sum to 1."""
 
-    def __init__(self, parts: list[LayerHessianAccumulator]):
+    def __init__(
+        self, parts: list[LayerHessianAccumulator], weights: list[float] | None = None
+    ):
         self.layers = parts[0].layers
         self.parts = parts
+        weights = weights or [1.0] * len(parts)
+        self.weights = [w / sum(weights) for w in weights]
         self.counts = {
             layer: sum(part.counts[layer] for part in parts) for layer in self.layers
         }
@@ -593,11 +599,11 @@ class MergedHessians:
         merged = {}
         for layer in self.layers:
             total = None
-            for m in means:
+            for m, weight in zip(means, self.weights):
                 h = m[layer].double()
-                h = h / h.trace()
+                h = weight * h / h.trace()
                 total = h if total is None else total + h
-            merged[layer] = (total / len(means)).float()
+            merged[layer] = total.float()
         return merged
 
 
@@ -911,7 +917,10 @@ def calibrate_glm5(
                     "token_count": fed,
                     "corpus_sha256": corpus_digest(kind_texts),
                 }
-            buckets["decision"] = parts[0] if len(parts) == 1 else MergedHessians(parts)
+            tokens = [k["token_count"] for k in kinds.values()]
+            buckets["decision"] = (
+                parts[0] if len(parts) == 1 else MergedHessians(parts, tokens)
+            )
             hessian_metadata["decision_corpus_sha256"] = corpus_digest(
                 load_texts(decision_text_file)
             )
@@ -919,8 +928,12 @@ def calibrate_glm5(
                 k["token_count"] for k in kinds.values()
             )
             if len(parts) > 1:
+                for kind, count in zip(kinds.values(), tokens):
+                    kind["weight"] = count / sum(tokens)
                 hessian_metadata["decision_kinds"] = kinds
-                hessian_metadata["decision_merge"] = "mean of trace-normalized kinds"
+                hessian_metadata["decision_merge"] = (
+                    "token-share weighted mean of trace-normalized kinds"
+                )
         payload["hessians"] = save_hessians(hessian_dir, buckets, hessian_metadata)
     return payload
 

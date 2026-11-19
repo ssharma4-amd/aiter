@@ -564,7 +564,7 @@ def test_decision_corpus_groups_by_kind(tmp_path):
     assert load_texts_by_kind(plain) == {"": ["x", "y"]}
 
 
-def test_merged_hessians_average_trace_normalized_kinds():
+def test_merged_hessians_weight_trace_normalized_kinds():
     generator = torch.Generator().manual_seed(1)
     parts = []
     for rows, scale in ((50, 1.0), (7, 30.0)):
@@ -572,13 +572,14 @@ def test_merged_hessians_average_trace_normalized_kinds():
         for layer in part.layers:
             part.observe(layer, scale * torch.randn((rows, 16), generator=generator))
         parts.append(part)
-    merged = MergedHessians(parts)
-    assert merged.counts == {1: 57, 2: 57}
-    for layer, h in merged.means().items():
-        a, b = (p.means()[layer].double() for p in parts)
-        expected = (a / a.trace() + b / b.trace()) / 2
-        torch.testing.assert_close(h.double(), expected, rtol=1e-6, atol=1e-7)
-        assert abs(float(h.double().trace()) - 1.0) < 1e-5
+    for weights, (wa, wb) in ((None, (0.5, 0.5)), ([300.0, 100.0], (0.75, 0.25))):
+        merged = MergedHessians(parts, weights)
+        assert merged.counts == {1: 57, 2: 57}
+        for layer, h in merged.means().items():
+            a, b = (p.means()[layer].double() for p in parts)
+            expected = wa * a / a.trace() + wb * b / b.trace()
+            torch.testing.assert_close(h.double(), expected, rtol=1e-6, atol=1e-7)
+            assert abs(float(h.double().trace()) - 1.0) < 1e-5
 
 
 if __name__ == "__main__":
