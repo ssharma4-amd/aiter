@@ -92,6 +92,25 @@ Mixing works end to end for the sources in the mix, and costs nothing on the oth
 | `terminal_agent` | 155 | 707 | FP8 terminus-2 on LiteCoder-RL, Aider-Polyglot and SWE-bench Verified non-Lite (Harbor) |
 | `chat_code_multilingual` | 120 | 91 | corpus v2's chat / code / multilingual rows, with the end-of-turn token after complete replies |
 
+Shares of the mix. Only the last column decides what LDLQ sees:
+
+| Kind | Tokens | % of tokens | Decision positions | % of decisions | Weight in the bucket |
+|---|---|---|---|---|---|
+| `swe_agent` | 620K | 29.1% | 4,972 | 73.6% | 25% |
+| `math_reasoning` | 655K | 30.7% | 983 | 14.6% | 25% |
+| `terminal_agent` | 747K | 35.0% | 707 | 10.5% | 25% |
+| `chat_code_multilingual` | 111K | 5.2% | 91 | 1.3% | 25% |
+| total | 2.13M | | 6,753 | | |
+
+- Each kind's `H_decision` is divided by its own trace before averaging, so each kind weighs 25% whatever its
+  number of positions.
+- Pooling the positions instead would make SWE about three quarters of the bucket. That is effectively what the
+  single-source v3 bucket did.
+- The equal weights are a choice. Weighting by expected traffic is an alternative; re-run the acceptance check if
+  they change.
+- The chat kind rests on only 91 positions, which makes it the noisiest quarter. A larger generated multi-turn chat
+  and function-calling set is the main follow-up.
+
 Recipe:
 - one `H_decision` per kind (decision positions as above), each divided by its trace, averaged with equal weights;
 - `H = H_all/tr(H_all) + 1.0 * mean_k(H_decision,k / tr)`.
