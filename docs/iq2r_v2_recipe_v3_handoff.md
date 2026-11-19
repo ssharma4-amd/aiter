@@ -68,6 +68,44 @@ own workload. Setup:
 - terminus-2 never emits `<tool_call>`; its decisions are end of turn and `</think>` only.
 
 Study write-up: `research/glm53-2bit-quantization/08_targeted_error_reduction/DECISION_CORPUS_SOURCE_STUDY.md`.
+
+**Whole-model check (2026-11-19).** v3 was re-encoded with an SWE + math mixed bucket, keeping v3's books and scales
+and redoing only the gate/up LDLQ picks. Teacher-forced against FP8 on held-out text:
+- **AIME traces:** P(end of turn after the final answer) moves from 1/5.5 of FP8's (dlogP -1.71, 13 top-1 flips) to
+  FP8's level (-0.03, 0 flips); 90% interval of the change +1.13 to +2.27.
+- **SWE text:** KL and stop / tool-call probabilities are unchanged.
+
+Mixing works end to end for the sources in the mix, and costs nothing on the others.
+
+**The decision corpus (v1, 2026-11-19)** is `corpus/iq2r_v2_decision_corpus_v1.jsonl` in the private repository
+`ssharma4-amd/glm53-iq2r-v2-private`, next to calibration corpus v2:
+- sha256 `775778c8aba84c46c0ea55e4f1aa997e54f935bbae4bb17d61673c626fa8d0b2`;
+- per-kind counts in `iq2r_v2_decision_corpus_v1_report.json`;
+- scripts in `corpus/decision_v1_build/`.
+- 431 windows, 2.13M tokens.
+- No SWE-bench Lite, Terminal-Bench, AIME or GPQA text, and no Terminal-Bench-family dataset used for generation.
+
+| Kind | Windows | Decision positions | Text |
+|---|---|---|---|
+| `swe_agent` | 76 | 4,972 | mini-swe-agent trajectories, SWE-bench Verified non-Lite |
+| `math_reasoning` | 80 | 983 | FP8 reasoning traces, MATH-500 level 4-5 |
+| `terminal_agent` | 155 | 707 | FP8 terminus-2 on LiteCoder-RL, Aider-Polyglot and SWE-bench Verified non-Lite (Harbor) |
+| `chat_code_multilingual` | 120 | 91 | corpus v2's chat / code / multilingual rows, with the end-of-turn token after complete replies |
+
+Recipe:
+- one `H_decision` per kind (decision positions as above), each divided by its trace, averaged with equal weights;
+- `H = H_all/tr(H_all) + 1.0 * mean_k(H_decision,k / tr)`.
+
+Acceptance check (`decision_v1_build/srccheck.py --full`). Held-out error at each kind's decision positions, as a ratio
+to no LDLQ:
+
+| Fit | SWE | math | terminal | chat |
+|---|---|---|---|---|
+| `H_all` only | 0.63 | 0.70 | 0.63 | 0.57 |
+| own-kind bucket | 0.31 | 0.12 | 0.26 | 0.49 |
+| **equal mix of the 4 kinds** | **0.35** | **0.16** | **0.29** | **0.47** |
+
+The full-model re-encode with this 4-kind bucket and its eval have not been run yet.
 Tools: `EXP/targeted-error-20261111/tools/hdec_by_source.py` (capture), `tools/srccheck.py` (cross-check).
 
 ## Measurements
@@ -183,9 +221,9 @@ The changes:
   - the MFMA stream and scale handling (E8M0 `d`, level exponent, class -> copy) are unchanged.
 - **Calibrate:**
   - the layer-level `H_all` (LDLQ handoff, step 1);
-  - a `H_decision` capture over a decision corpus that mixes the served workloads (see "The decision corpus must
-    cover every workload"), one capture per source, each normalized by its trace and then averaged (~11 GB at fp32 per
-    source for 75 layers).
+  - a `H_decision` capture over the decision corpus `iq2r_v2_decision_corpus_v1.jsonl`, one capture per `kind`
+    (see "The decision corpus must cover every workload"), each normalized by its trace and then averaged (~11 GB at
+    fp32 per kind for 75 layers). The reference capture is `decision_v1_build/hdec_by_source.py`.
   - Keep that corpus separate from the calibration corpus and away from evaluation text.
 - **Compile:**
   - learn the 1,024 book;

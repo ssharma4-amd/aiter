@@ -323,7 +323,9 @@ Recipe v3 (2026-11-17, study format, decode-to-FP8; not yet in this code; see
 [iq2r_v2_recipe_v3_handoff.md](iq2r_v2_recipe_v3_handoff.md)): a 1,024-entry learned codebook (10-bit index,
 +0.125 b/w, scales unchanged) + LDLQ on gate/up with a decision bucket from a separate 4,972-position decision corpus
 (beta 1). AIME-60 55, 56 at 14.5K / 15.7K median tokens (MXFP4 54, 58). Finer per-32 or per-8 scales gave less per bit
-than the larger codebook. Terminal-Bench 2.0 results so far are on a 3-task stress subset only; see the handoff.
+than the larger codebook. Terminal-Bench 2.0 results so far are on a 3-task stress subset only; see the handoff. The decision bucket is built from a separate
+decision corpus that mixes SWE-agent, math, terminal-agent and chat text (`iq2r_v2_decision_corpus_v1.jsonl`, private
+corpus repository), because a bucket built from one workload barely protects the others.
 
 `op_tests/test_iq2r_glm53_v2.py` checks the IQ2R-v2 MoE against a dense
 reference at both TP widths, checks that TP slicing commutes with packing,
