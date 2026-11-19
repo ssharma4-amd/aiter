@@ -12,6 +12,7 @@ from aiter.quantization.iq2r.glm5.calibrate import (
     ChatTokens,
     DiagonalSecondMomentAccumulator,
     TargetSpec,
+    _dequantized_fp8_linear,
     capture_glm5_calibration,
     capture_glm5_hessians,
     hessian_file,
@@ -536,6 +537,18 @@ def test_cli_hessian_options(monkeypatch, capsys):
         )
     ]
     capsys.readouterr()
+
+
+def test_dequantized_fp8_linear_uses_128_blocks_with_partial_edges():
+    """576 x 200 has partial last blocks; each scale covers 128 x 128 weights."""
+    generator = torch.Generator().manual_seed(0)
+    weight = torch.randn((576, 200), generator=generator).to(torch.float8_e4m3fn)
+    scale = torch.rand((5, 2), generator=generator) + 0.5
+    x = torch.randn((3, 200), generator=generator).to(torch.bfloat16)
+    grid = scale.repeat_interleave(128, 0)[:576].repeat_interleave(128, 1)[:, :200]
+    expected = torch.nn.functional.linear(x, (weight.float() * grid).to(torch.bfloat16))
+    assert torch.equal(_dequantized_fp8_linear(x, weight, scale, (128, 128)), expected)
+    assert torch.equal(_dequantized_fp8_linear(x, weight, scale), expected)
 
 
 if __name__ == "__main__":
