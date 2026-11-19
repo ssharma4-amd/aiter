@@ -11,6 +11,8 @@ import aiter.quantization.iq2r.glm5.calibrate as calibrate_module
 from aiter.quantization.iq2r.glm5.calibrate import (
     ChatTokens,
     DiagonalSecondMomentAccumulator,
+    LayerHessianAccumulator,
+    MergedHessians,
     TargetSpec,
     _dequantized_fp8_linear,
     capture_glm5_calibration,
@@ -20,6 +22,7 @@ from aiter.quantization.iq2r.glm5.calibrate import (
     scored_positions,
     glm5_target_specs,
     load_texts,
+    load_texts_by_kind,
     main,
     routed_target,
     save_calibration,
@@ -549,6 +552,33 @@ def test_dequantized_fp8_linear_uses_128_blocks_with_partial_edges():
     expected = torch.nn.functional.linear(x, (weight.float() * grid).to(torch.bfloat16))
     assert torch.equal(_dequantized_fp8_linear(x, weight, scale, (128, 128)), expected)
     assert torch.equal(_dequantized_fp8_linear(x, weight, scale), expected)
+
+
+def test_decision_corpus_groups_by_kind(tmp_path):
+    path = tmp_path / "decisions.jsonl"
+    rows = [("swe", "a"), ("math", "b"), ("swe", "c")]
+    path.write_text("".join(json.dumps({"kind": k, "text": t}) + "\n" for k, t in rows))
+    assert load_texts_by_kind(path) == {"swe": ["a", "c"], "math": ["b"]}
+    plain = tmp_path / "plain.txt"
+    plain.write_text("x\ny\n")
+    assert load_texts_by_kind(plain) == {"": ["x", "y"]}
+
+
+def test_merged_hessians_average_trace_normalized_kinds():
+    generator = torch.Generator().manual_seed(1)
+    parts = []
+    for rows, scale in ((50, 1.0), (7, 30.0)):
+        part = LayerHessianAccumulator(range(1, 3))
+        for layer in part.layers:
+            part.observe(layer, scale * torch.randn((rows, 16), generator=generator))
+        parts.append(part)
+    merged = MergedHessians(parts)
+    assert merged.counts == {1: 57, 2: 57}
+    for layer, h in merged.means().items():
+        a, b = (p.means()[layer].double() for p in parts)
+        expected = (a / a.trace() + b / b.trace()) / 2
+        torch.testing.assert_close(h.double(), expected, rtol=1e-6, atol=1e-7)
+        assert abs(float(h.double().trace()) - 1.0) < 1e-5
 
 
 if __name__ == "__main__":

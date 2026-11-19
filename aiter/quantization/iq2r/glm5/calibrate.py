@@ -33,7 +33,11 @@ input of every expert), in two buckets:
 - ``decision``: the scored positions of ``--decision-text-file`` (a separate
   corpus, kept apart from the calibration corpus and from evaluation text)
   where the FP8 model's top-1 next token is end of turn (``<|endoftext|>``,
-  ``<|user|>``, ``<|observation|>``), ``</think>`` or ``<tool_call>``.
+  ``<|user|>``, ``<|observation|>``), ``</think>`` or ``<tool_call>``. JSONL
+  rows with a ``kind`` field (e.g. ``iq2r_v2_decision_corpus_v1.jsonl``: SWE
+  agent, math reasoning, terminal agent, chat) give one Hessian per kind; the
+  bucket is their mean after each is normalized by its trace, so every kind
+  weighs the same whatever its position count.
 
 They are written as ``hessian-layer-NNNN.pt`` plus ``hessians.json`` (corpus
 hashes, counts and each file's digest); ``--output`` is then optional:
@@ -350,6 +354,24 @@ def load_texts(path: str | os.PathLike[str]) -> list[str]:
     return texts
 
 
+def load_texts_by_kind(path: str | os.PathLike[str]) -> dict[str, list[str]]:
+    """``load_texts`` grouped by the JSONL rows' ``kind`` field, in first-seen
+    order; a corpus without kinds is one group named ""."""
+
+    texts = load_texts(path)
+    kinds = []
+    for raw_line in Path(path).read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if line:
+            kinds.append(
+                str(json.loads(line).get("kind", "")) if line.startswith("{") else ""
+            )
+    groups: dict[str, list[str]] = {}
+    for kind, text in zip(kinds, texts):
+        groups.setdefault(kind, []).append(text)
+    return groups
+
+
 def corpus_digest(texts: list[str]) -> str:
     digest = hashlib.sha256()
     for text in texts:
@@ -553,6 +575,30 @@ class LayerHessianAccumulator:
             layer: (self.sums[layer] / self.counts[layer]).cpu()
             for layer in self.layers
         }
+
+
+class MergedHessians:
+    """Per-layer mean of several buckets' Hessians, each normalized by its
+    trace (the counts add up); saves like a LayerHessianAccumulator."""
+
+    def __init__(self, parts: list[LayerHessianAccumulator]):
+        self.layers = parts[0].layers
+        self.parts = parts
+        self.counts = {
+            layer: sum(part.counts[layer] for part in parts) for layer in self.layers
+        }
+
+    def means(self) -> dict[int, Tensor]:
+        means = [part.means() for part in self.parts]
+        merged = {}
+        for layer in self.layers:
+            total = None
+            for m in means:
+                h = m[layer].double()
+                h = h / h.trace()
+                total = h if total is None else total + h
+            merged[layer] = (total / len(means)).float()
+        return merged
 
 
 def _moe_layers(model) -> range:
@@ -845,8 +891,6 @@ def calibrate_glm5(
     if hessian_dir is not None:
         buckets = {}
         corpora = {"all": (texts, False)}
-        if decision_text_file is not None:
-            corpora["decision"] = (load_texts(decision_text_file), True)
         hessian_metadata = {**model_metadata, "sequence_length": SEQUENCE_LENGTH}
         for name, (bucket_texts, decision) in corpora.items():
             buckets[name], fed = capture_glm5_hessians(
@@ -854,6 +898,29 @@ def calibrate_glm5(
             )
             hessian_metadata[f"{name}_corpus_sha256"] = corpus_digest(bucket_texts)
             hessian_metadata[f"{name}_token_count"] = fed
+        if decision_text_file is not None:
+            groups = load_texts_by_kind(decision_text_file)
+            kinds, parts = {}, []
+            for kind, kind_texts in groups.items():
+                part, fed = capture_glm5_hessians(
+                    model, tokenizer, kind_texts, decision=True, device=_INPUT_DEVICE
+                )
+                parts.append(part)
+                kinds[kind] = {
+                    "positions": part.counts[part.layers.start],
+                    "token_count": fed,
+                    "corpus_sha256": corpus_digest(kind_texts),
+                }
+            buckets["decision"] = parts[0] if len(parts) == 1 else MergedHessians(parts)
+            hessian_metadata["decision_corpus_sha256"] = corpus_digest(
+                load_texts(decision_text_file)
+            )
+            hessian_metadata["decision_token_count"] = sum(
+                k["token_count"] for k in kinds.values()
+            )
+            if len(parts) > 1:
+                hessian_metadata["decision_kinds"] = kinds
+                hessian_metadata["decision_merge"] = "mean of trace-normalized kinds"
         payload["hessians"] = save_hessians(hessian_dir, buckets, hessian_metadata)
     return payload
 
