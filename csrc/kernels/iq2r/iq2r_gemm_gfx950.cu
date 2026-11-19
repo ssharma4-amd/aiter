@@ -569,7 +569,27 @@ struct Glm53SharedArgs
     const int32_t* scatter;      // route slot -> sorted route row
     __hip_bfloat16* act;         // [tokens][I]
     int tokens;
+    // Decode gate and down launches: blocks from routed_blocks on run only
+    // shared items, the ones below only routed items (0: every block runs
+    // both, shared items first). The launchers add the shared workgroups only
+    // when all of the launch's workgroups are resident at once.
+    int routed_blocks;
 };
+
+// Routed workgroups of a launch (see Glm53SharedArgs::routed_blocks).
+__device__ __forceinline__ int glm53_routed_grid(const Glm53SharedArgs& sh)
+{
+    return sh.routed_blocks>0 ? sh.routed_blocks : static_cast<int>(gridDim.x);
+}
+
+// First shared item of this workgroup and the stride between its items.
+__device__ __forceinline__ int2 glm53_shared_span(const Glm53SharedArgs& sh)
+{
+    if(sh.routed_blocks>0)
+        return make_int2(static_cast<int>(blockIdx.x)-sh.routed_blocks,
+                         static_cast<int>(gridDim.x)-sh.routed_blocks);
+    return make_int2(static_cast<int>(blockIdx.x),static_cast<int>(gridDim.x));
+}
 
 // Tokens per shared item, 16 * MA: larger batches put more tokens on each
 // weight read (the gate and down weights are re-read once per item row).
@@ -1339,10 +1359,14 @@ __global__ __launch_bounds__(64*Waves,Occupancy) void glm53_down_tp4_kernel(
     opus::gmem<uint8_t> a_buffer(activations,static_cast<unsigned int>(M*K));
     opus::gmem<opus::bf16_t> out_buffer(output,static_cast<unsigned int>(M*6144*sizeof(__hip_bfloat16)));
     opus::gmem<uint8_t> scale_buffer(activation_scales,static_cast<unsigned int>(M*(K/32)));
-    for(int item=blockIdx.x;item<glm53_shared_down_items(sh);item+=gridDim.x)
-        glm53_shared_down_item<KT>(sh,output,M,item);
+    {
+        const int2 span=glm53_shared_span(sh);
+        for(int item=span.x;item>=0 && item<glm53_shared_down_items(sh);item+=span.y)
+            glm53_shared_down_item<KT>(sh,output,M,item);
+        if(static_cast<int>(blockIdx.x)>=glm53_routed_grid(sh))return;
+    }
     int previous_expert=-1;
-    for(int work=blockIdx.x;work<nt*(6144/Columns);work+=gridDim.x)
+    for(int work=blockIdx.x;work<nt*(6144/Columns);work+=glm53_routed_grid(sh))
     {
         int index=work;
         if constexpr(XCD>0)
@@ -1957,6 +1981,67 @@ __device__ __forceinline__ void glm53_route9_shared_units(const Glm53SharedArgs&
     }
 }
 
+// 1,024-entry route9: each wave stages its shared units' weight tiles (2 KB
+// each) and the shared activation row in its own LDS slots with global -> LDS
+// DMA at the start, so the shared units after the routes read only LDS. A
+// wave reads only what it staged: its vmcnt wait suffices, no barrier.
+template<int KT,int Triplets>
+struct Glm53Route9SharedStage
+{
+    static constexpr int Units=Triplets*3*KT,PerWave=(Units+7)/8;
+    alignas(16) uint8_t weights[8][PerWave][2048];
+    alignas(16) __hip_bfloat16 act[8][KT*128];
+};
+
+template<int KT,int Triplets>
+__device__ __forceinline__ void glm53_route9_shared_prefetch(const Glm53SharedArgs& sh,int token,int first_block,int wave,
+                                                             int lane,Glm53Route9SharedStage<KT,Triplets>& stage)
+{
+    using Stage=Glm53Route9SharedStage<KT,Triplets>;
+    constexpr int K=KT*128;
+    opus::gmem<uint8_t> act(reinterpret_cast<const uint8_t*>(sh.act)+static_cast<int64_t>(token)*K*2,
+                            static_cast<unsigned int>(K*2));
+    if(lane<K*2/16)
+        act.template async_load<16>(reinterpret_cast<uint8_t*>(stage.act[wave]),lane*16,0,opus::number<0>{},opus::number<0>{});
+#pragma unroll
+    for(int i=0;i<Stage::PerWave;++i)
+    {
+        const int u=wave+8*i;
+        if(u>=Stage::Units)break;
+        const int atom=u/KT,kt=u%KT;
+        const int64_t tile=static_cast<int64_t>(first_block+atom)*KT+kt;
+        opus::gmem<uint8_t> w(sh.down+tile*2048,2048u);
+        w.template async_load<16>(stage.weights[wave][i],lane*16,0,opus::number<0>{},opus::number<0>{});
+        w.template async_load<16>(stage.weights[wave][i]+1024,lane*16,1024,opus::number<0>{},opus::number<0>{});
+    }
+    asm volatile("" ::: "memory");
+}
+
+template<int KT,int Triplets>
+__device__ __forceinline__ void glm53_route9_shared_staged(const Glm53SharedArgs& sh,int first_block,int wave,int lane,
+                                                           const Glm53Route9SharedStage<KT,Triplets>& stage,float* units)
+{
+    using Stage=Glm53Route9SharedStage<KT,Triplets>;
+    const int lane_row=lane%16,lane_group=lane/16;
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    auto mma=opus::mfma<opus::fp8_t,opus::fp8_t,opus::fp32_t,16,16,128>{};
+#pragma unroll
+    for(int i=0;i<Stage::PerWave;++i)
+    {
+        const int u=wave+8*i;
+        if(u>=Stage::Units)break;
+        const int atom=u/KT,kt=u%KT;
+        const int64_t tile=static_cast<int64_t>(first_block+atom)*KT+kt;
+        IQ2RActivationFragment a,w;
+        *reinterpret_cast<uint4*>(w.bytes)=*reinterpret_cast<const uint4*>(stage.weights[wave][i]+lane*32);
+        *reinterpret_cast<uint4*>(w.bytes+16)=*reinterpret_cast<const uint4*>(stage.weights[wave][i]+lane*32+16);
+        const uint32_t sa=glm53_shared_fragment(stage.act[wave]+kt*128,lane,a);
+        const opus::vector_t<float,4> d=mma(a.words,w.words,opus::vector_t<float,4>{},sa,
+                                            sh.down_scales[tile*64+lane],opus::number<0>{},opus::number<0>{});
+        units[lane_group==0?u*16+lane_row:Stage::Units*16]=d[0];
+    }
+}
+
 template<int KT>
 __device__ __forceinline__ float glm53_route9_shared_value(const float* units,int atom,int lane_row)
 {
@@ -2222,8 +2307,9 @@ __global__ __launch_bounds__(512,1) void glm53_down_route9_wide_kernel(
         alignas(16) __hip_bfloat16 routes[Routes][Columns+8];
         // Each route's activation row, staged by a global -> LDS DMA.
         alignas(16) uint8_t act[Routes][K];
-        // Shared expert units (glm53_route9_shared_units).
+        // Shared expert units and their staged operands.
         float shared_units[Triplets*3*KT*16+16];
+        Glm53Route9SharedStage<KT,Triplets> shared_stage;
     };
     __shared__ Storage shared;
     const int lane=threadIdx.x;
@@ -2242,6 +2328,8 @@ __global__ __launch_bounds__(512,1) void glm53_down_route9_wide_kernel(
     const bool valid=(expert>=0)&(expert<256)&(row>=0)&(row<rows);
     const uint8_t* data=all_data+static_cast<int64_t>(expert)*data_bytes;
     const uint8_t* aux=all_auxiliary+static_cast<int64_t>(expert)*auxiliary_bytes;
+    if(sh.down!=nullptr)
+        glm53_route9_shared_prefetch<KT,Triplets>(sh,token,first,route,lane,shared.shared_stage);
     if(valid)
     {
         // Copy 0 of the route's book, before any weight load: eight 1 KB DMAs.
@@ -2369,7 +2457,7 @@ __global__ __launch_bounds__(512,1) void glm53_down_route9_wide_kernel(
             shared.routes[route][column]=__float2bfloat16(0.0f);
     }
     if(sh.down!=nullptr)
-        glm53_route9_shared_units<KT,Triplets>(sh,token,first,route,lane,shared.shared_units);
+        glm53_route9_shared_staged<KT,Triplets>(sh,first,route,lane,shared.shared_stage,shared.shared_units);
     __syncthreads();
     if(route==0 && lane_group<Triplets)
     {
@@ -2493,10 +2581,14 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_tp8_ordered_kernel(
     // Descriptor bounds are bytes; typed offsets below are BF16 elements.
     opus::gmem<opus::bf16_t> out_buffer(output,static_cast<unsigned int>(M*6144*sizeof(__hip_bfloat16)));
     opus::gmem<uint8_t> scale_buffer(activation_scales,static_cast<unsigned int>(M*8));
-    for(int item=blockIdx.x;item<glm53_shared_down_items(sh);item+=gridDim.x)
-        glm53_shared_down_item<2>(sh,output,M,item);
+    {
+        const int2 span=glm53_shared_span(sh);
+        for(int item=span.x;item>=0 && item<glm53_shared_down_items(sh);item+=span.y)
+            glm53_shared_down_item<2>(sh,output,M,item);
+        if(static_cast<int>(blockIdx.x)>=glm53_routed_grid(sh))return;
+    }
     int previous_expert=-1;
-    for(int work=blockIdx.x;work<nt*(6144/Columns);work+=gridDim.x)
+    for(int work=blockIdx.x;work<nt*(6144/Columns);work+=glm53_routed_grid(sh))
     {
         int index=work;
         if constexpr(XCD>0)
@@ -2908,12 +3000,16 @@ __global__ __launch_bounds__(512,4) void glm53_gate_decode_nobarrier_v2_kernel(
     const int lane=threadIdx.x,wave=threadIdx.y;
     const int lane_row=lane%16,lane_group=lane/16;
     // Shared expert items first, strided over the workgroups.
-    for(int item=blockIdx.x;item<glm53_shared_gate_items<NT>(sh);item+=gridDim.x)
-        glm53_shared_gate_item<NT,2>(sh,activations,scales,item,&shared.partial[0][0][0][0]);
+    {
+        const int2 span=glm53_shared_span(sh);
+        for(int item=span.x;item>=0 && item<glm53_shared_gate_items<NT>(sh);item+=span.y)
+            glm53_shared_gate_item<NT,2>(sh,activations,scales,item,&shared.partial[0][0][0][0]);
+        if(static_cast<int>(blockIdx.x)>=glm53_routed_grid(sh))return;
+    }
     const int num_tasks=task_count[0];
     const int total=num_tasks*NT;
     int current_expert=-1;
-    const int xcd=blockIdx.x%8,rank=blockIdx.x/8,ranks=(gridDim.x-xcd+7)/8;
+    const int xcd=blockIdx.x%8,rank=blockIdx.x/8,ranks=(glm53_routed_grid(sh)-xcd+7)/8;
     const int per=(total+7)/8,tall=total%8==0?8:total%8;
     const int first=xcd<tall?xcd*per:tall*per+(xcd-tall)*(per-1);
     const int length=xcd<tall?per:per-1;
@@ -3202,6 +3298,12 @@ Glm53SharedArgs glm53_shared_args(const aiter_tensor_t& gate,
     return sh;
 }
 
+// Shared items of a decode launch, as glm53_shared_gate_items / _down_items count them.
+int glm53_host_shared_rows(int tokens)
+{
+    return 16 * (tokens <= 32 ? 1 : tokens <= 128 ? 2 : 4);
+}
+
 // Down K (256 or 512) and codebook size (512 or 1024) of a packed down stack.
 struct Glm53DownShape { int intermediate; int entries; };
 
@@ -3315,8 +3417,23 @@ void iq2r_glm53_gate_out(const aiter_tensor_t& activations,
                               : glm53_gate_prefill_kernel<4, 8, 4, 2, 8, C, 512>)
                        : (tp4 ? glm53_gate_decode_nobarrier_v2_kernel<16, C, 512>
                               : glm53_gate_decode_nobarrier_v2_kernel<8, C, 512>));
+    const int routed_blocks = static_cast<int>(grid_multiplier) * static_cast<int>(get_num_cu_func());
+    Glm53SharedArgs launch_sh = sh;
+    int shared_blocks = 0;
+    if(sh.gate != nullptr)
+    {
+        const int rows = glm53_host_shared_rows(tokens);
+        const int items = (tokens + rows - 1) / rows * (tp4 ? 16 : 8) * 4;
+        // Own workgroups only if every workgroup is resident at once (two
+        // per CU); otherwise they would start last.
+        if(routed_blocks + items <= 2 * static_cast<int>(get_num_cu_func()))
+        {
+            shared_blocks           = items;
+            launch_sh.routed_blocks = routed_blocks;
+        }
+    }
     hipLaunchKernelGGL(launch,
-                       dim3(static_cast<int>(grid_multiplier) * static_cast<int>(get_num_cu_func())),
+                       dim3(routed_blocks + shared_blocks),
                        dim3(64, prefill ? 4 : 8),
                        0,
                        getCurrentHIPStream(),
@@ -3332,7 +3449,7 @@ void iq2r_glm53_gate_out(const aiter_tensor_t& activations,
                        routes,
                        static_cast<int>(data.size(1)),
                        static_cast<int>(auxiliary.size(1)),
-                       sh);
+                       launch_sh);
     HIP_CALL_LAUNCH(hipGetLastError());
 }
 
@@ -3367,7 +3484,20 @@ void iq2r_glm53_down_out(const aiter_tensor_t& activations,
     const Glm53SharedArgs sh =
         glm53_shared_args(none, none, shared_down, shared_down_scales, scatter, shared_act, K, routes / kGlm53RouteSlots);
     HipDeviceGuard device_guard(data.device_id);
-    const dim3 grid(static_cast<int>(grid_multiplier) * static_cast<int>(get_num_cu_func()));
+    const int routed_blocks = static_cast<int>(grid_multiplier) * static_cast<int>(get_num_cu_func());
+    Glm53SharedArgs launch_sh = sh;
+    int shared_blocks = 0;
+    if(sh.down != nullptr)
+    {
+        const int tokens = routes / kGlm53RouteSlots, rows = glm53_host_shared_rows(tokens);
+        const int items  = (tokens + rows - 1) / rows * 48;
+        if(routed_blocks + items <= 2 * static_cast<int>(get_num_cu_func()))
+        {
+            shared_blocks           = items;
+            launch_sh.routed_blocks = routed_blocks;
+        }
+    }
+    const dim3 grid(routed_blocks + shared_blocks);
 #define GLM53_DOWN_ARGS                                                                     \
     static_cast<const opus::fp8_t*>(activations.data_ptr()),                                \
         static_cast<const uint8_t*>(scales.data_ptr()),                                     \
@@ -3376,7 +3506,7 @@ void iq2r_glm53_down_out(const aiter_tensor_t& activations,
         static_cast<const int32_t*>(tasks.data_ptr()),                                      \
         static_cast<const int32_t*>(task_count.data_ptr()),                                 \
         static_cast<__hip_bfloat16*>(output.data_ptr()), routes, static_cast<int>(data.size(0)),             \
-        static_cast<int>(data.size(1)), static_cast<int>(auxiliary.size(1)), sh
+        static_cast<int>(data.size(1)), static_cast<int>(auxiliary.size(1)), launch_sh
     // Single: one 16-row atom per pass for decode-sized tasks, three workgroups per CU.
 #define GLM53_DOWN_LAUNCH(E)                                                                            \
     if(tp4 && kernel == kGlm53DownSingle2)                                                              \
