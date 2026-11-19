@@ -551,6 +551,130 @@ def iq2r_v2_learn_codebook(
 
 
 # --------------------------------------------------------------------------
+# LDLQ: Hessian error feedback over K
+# --------------------------------------------------------------------------
+#
+# The encoder above minimises an importance-weighted weight error, which uses
+# only the diagonal of the input second moment H = E[x x^T]. LDLQ (QuIP; the
+# error feedback of GPTQ) re-chooses the codeword indices and signs of an
+# encoding to lower the expected output error trace(dW H dW^T): walking K in
+# 8-weight vectors, each vector takes the codeword nearest to its target, and
+# the target of the vectors after it absorbs the error through the Cholesky
+# factor of H^-1. The scales (d, levels) stay as encoded, so the format,
+# bits and kernels do not change.
+
+IQ2R_V2_LDLQ_DAMP = 1.0  # damping, times the mean of H's diagonal
+IQ2R_V2_LDLQ_BATCH = 128  # columns per lazy batch; the result does not depend on it
+
+
+@dataclass(frozen=True)
+class IQ2RV2LdlqFactor:
+    """Upper Cholesky factor ``u`` of ``H^-1`` [K, K] and the inverses of its
+    8 x 8 diagonal blocks ``block_inverses`` [K/8, 8, 8]."""
+
+    u: Tensor
+    block_inverses: Tensor
+
+
+@torch.no_grad()
+def iq2r_v2_ldlq_factor(
+    hessian: Tensor, damp: float = IQ2R_V2_LDLQ_DAMP
+) -> IQ2RV2LdlqFactor:
+    """Factor of ``hessian + damp * mean(diag) * I`` (FP64 Cholesky, FP32 result)."""
+
+    k = hessian.shape[0]
+    if hessian.shape != (k, k) or k % IQ2R_VECTOR_SIZE:
+        raise ValueError("the LDLQ Hessian must be [K, K] with K a multiple of 8")
+    h = hessian.double()
+    h = h + damp * h.diagonal().mean() * torch.eye(k, dtype=h.dtype, device=h.device)
+    u = torch.linalg.cholesky(
+        torch.cholesky_inverse(torch.linalg.cholesky(h)), upper=True
+    )
+    blocks = u.unfold(0, 8, 8).unfold(1, 8, 8).diagonal(dim1=0, dim2=1)
+    inverses = torch.linalg.inv(blocks.permute(2, 0, 1))
+    return IQ2RV2LdlqFactor(u.float().contiguous(), inverses.float().contiguous())
+
+
+@torch.no_grad()
+def iq2r_v2_ldlq(
+    weight: Tensor,
+    encoding: IQ2RV2Encoding,
+    codebook: Tensor,
+    factor: IQ2RV2LdlqFactor,
+    levels: IQ2RV2Levels = IQ2R_V2_LEVELS_C4,
+    *,
+    batch: int = IQ2R_V2_LDLQ_BATCH,
+) -> IQ2RV2Encoding:
+    """Re-choose ``encoding``'s indices and signs for ``weight [N, K]`` by LDLQ.
+
+    Each 8-weight vector keeps its scale ``2^(d - 127 + l // C)`` and codebook
+    copy ``l % C``; it takes the copy's codeword nearest (unweighted) to its
+    target's magnitude over that scale, with the target's signs. Rows are
+    independent, so an interleaved gate/up matrix is two projections sharing
+    ``factor``. Returns a new encoding with the same ``d`` and levels; its
+    ``cost`` is the encoding's unweighted squared error.
+    """
+
+    n, k = weight.shape
+    if k % batch or batch % IQ2R_VECTOR_SIZE:
+        raise ValueError("the LDLQ batch must divide K and be a multiple of 8")
+    if factor.u.shape != (k, k):
+        raise ValueError("the LDLQ factor does not match the weight's K")
+    device = weight.device
+    classes = levels.classes
+    copies = iq2r_v2_codebook_copies(codebook, levels).to(device)  # [C, E, 8]
+    entries = copies.shape[1]
+    flat = copies.reshape(classes * entries, IQ2R_VECTOR_SIZE)
+    norms = copies.square().sum(-1)  # [C, E]
+    u = factor.u.to(device)
+    block_inverses = factor.block_inverses.to(device)
+    level = encoding.levels.long()
+    exponent = (encoding.d.float() - 127).repeat_interleave(8, dim=1) + (
+        level // classes
+    ).float()
+    scale = torch.exp2(exponent).repeat_interleave(4, dim=1)  # [N, K/8]
+    copy = (level % classes).repeat_interleave(4, dim=1)  # [N, K/8]
+
+    target = weight.float().clone()
+    reconstruction = torch.empty_like(target)
+    indices = torch.empty(n, k // IQ2R_VECTOR_SIZE, dtype=torch.int64, device=device)
+    rows = torch.arange(n, device=device)
+    for b0 in range(0, k, batch):
+        b1 = b0 + batch
+        block = target[:, b0:b1].clone()
+        errors = torch.empty(n, batch, device=device)
+        for c0 in range(b0, b1, IQ2R_VECTOR_SIZE):
+            r0, j = c0 - b0, c0 // IQ2R_VECTOR_SIZE
+            r1 = r0 + IQ2R_VECTOR_SIZE
+            t = block[:, r0:r1]
+            s, c = scale[:, j], copy[:, j]
+            dot = (t.abs() / s[:, None]) @ flat.T  # [N, C * E]
+            dot = dot.view(n, classes, entries)[rows, c]
+            index = torch.argmin(norms[c] - 2 * dot, dim=-1)
+            q = copies[c, index] * s[:, None]
+            q = torch.where(t < 0, -q, q)
+            reconstruction[:, c0 : c0 + IQ2R_VECTOR_SIZE] = q
+            indices[:, j] = index
+            e = (t - q) @ block_inverses[j]
+            errors[:, r0:r1] = e
+            if r1 < batch:
+                block[:, r1:] -= e @ u[c0 : c0 + IQ2R_VECTOR_SIZE, c0 + 8 : b1]
+            target[:, c0 : c0 + IQ2R_VECTOR_SIZE] = t
+        if b1 < k:
+            target[:, b1:] -= errors @ u[b0:b1, b1:]
+    negative = target < 0
+    cost = float((weight.double() - reconstruction.double()).square().sum())
+    return IQ2RV2Encoding(
+        indices=indices,
+        negative=negative,
+        levels=encoding.levels.clone(),
+        d=encoding.d.clone(),
+        reconstruction=reconstruction,
+        cost=cost,
+    )
+
+
+# --------------------------------------------------------------------------
 # Canonical records
 # --------------------------------------------------------------------------
 #

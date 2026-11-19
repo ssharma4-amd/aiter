@@ -550,9 +550,9 @@ def _file_metadata(layer: int, projection: str, entries: int = 512) -> dict[str,
     extra = {} if entries == 512 else {"iq2r_codebook_entries": str(entries)}
     return {
         "format": "pt",
-        "iq2r_format": FORMAT
-        if entries == 512
-        else "iq2r-1024-fullsign-c4e4q-e8m0d256-native-v2",
+        "iq2r_format": (
+            FORMAT if entries == 512 else "iq2r-1024-fullsign-c4e4q-e8m0d256-native-v2"
+        ),
         "iq2r_activation_basis": IQ2R_ACTIVATION_BASIS,
         "iq2r_layer": str(layer),
         "iq2r_projection": projection,
@@ -699,6 +699,14 @@ def test_cli_options(monkeypatch, tmp_path, capsys):
     with pytest.raises(SystemExit):
         main([*paths, "--codebook-entries", "768"])
     assert len(calls) == 3
+    # LDLQ needs the layer Hessians, and the Hessians are only for LDLQ.
+    assert main([*paths, "--ldlq", "--hessian-dir", "h"]) == 0
+    assert calls[-1][2]["ldlq_hessian_dir"] == Path("h")
+    capsys.readouterr()
+    for extra in (["--ldlq"], ["--hessian-dir", "h"]):
+        with pytest.raises(SystemExit):
+            main([*paths, *extra])
+    assert len(calls) == 4
 
 
 @pytest.mark.skipif(not _has_gfx950(), reason="requires gfx950")
@@ -794,6 +802,82 @@ def test_compile_packs_layers_and_writes_checkpoint(
         data, aux = encoded[3, "down"]
         assert aux.shape[1] == 1024 * 8 + _HIDDEN * (_INTERMEDIATE // 256) + 8
     # test_checkpoint_keeps_shared_expert_fp8 checks the other files.
+
+
+def _write_hessians(path: Path, layers, seed: int) -> None:
+    """Random correlated layer Hessians in the calibrate --hessian-dir format."""
+    import aiter.quantization.iq2r.glm5.calibrate as calibrate_module
+
+    generator = torch.Generator().manual_seed(seed)
+    buckets = {}
+    for name in ("all", "decision"):
+        bucket = calibrate_module.LayerHessianAccumulator(layers)
+        for layer in layers:
+            basis = torch.randn((_HIDDEN, 32), generator=generator)
+            x = torch.randn((256, 32), generator=generator) @ basis.T
+            bucket.observe(layer, x + 0.3 * torch.randn(x.shape, generator=generator))
+        buckets[name] = bucket
+    calibrate_module.save_hessians(path, buckets, {})
+
+
+@pytest.mark.skipif(not _has_gfx950(), reason="requires gfx950")
+def test_compile_ldlq_reencodes_gate_up_only(tmp_path, monkeypatch, two_experts):
+    source, plain, ldlq = tmp_path / "source", tmp_path / "plain", tmp_path / "ldlq"
+    _write_source_model(source)
+    hessians = tmp_path / "hessians"
+    _write_hessians(hessians, range(3, _LAYERS), 0x53D0)
+    generator = torch.Generator(device="cuda").manual_seed(0x5311)
+    weights = {
+        (layer, expert, projection): torch.randn(
+            shape, generator=generator, device="cuda"
+        )
+        * 0.02
+        for layer in (3, 4)
+        for expert in range(_EXPERTS)
+        for projection, shape in (
+            ("gate_up", (2 * _INTERMEDIATE, _HIDDEN)),
+            ("down", (_HIDDEN, _INTERMEDIATE)),
+        )
+    }
+    monkeypatch.setattr(
+        compile_module,
+        "_source_projection",
+        lambda reader, layout, layer, expert, projection, device: weights[
+            layer, expert, projection
+        ],
+    )
+    run = functools.partial(
+        compile_glm5_iq2r,
+        source,
+        diagnostic_uniform_importance=True,
+        iterations=1,
+        sample_vectors=4096,
+        codebook_entries=1024,
+        layer_indices=[3],
+    )
+    run(plain)
+    run(ldlq, ldlq_hessian_dir=hessians)
+    layout = compile_module.glm5_source_layout(
+        json.loads((source / "config.json").read_text())
+    )
+    factor = compile_module.load_glm5_hessians(hessians, layout).factor(3, "cuda")
+    for suffix, projection in (("gate-up", "gate_up"), ("down", "down")):
+        keys = iq2r_compiled_tensor_keys(3, projection)
+        name = f"iq2r-layer-0003-{suffix}.safetensors"
+        with safe_open(plain / name, "pt") as a, safe_open(ldlq / name, "pt") as b:
+            meta = b.metadata()
+            recipe = json.loads(meta["iq2r_ldlq"])
+            assert recipe["projections"] == ["gate_up"]
+            assert recipe["beta_decision"] == 1.0 and recipe["damp"] == 1.0
+            assert "iq2r_ldlq" not in a.metadata()
+            same = torch.equal(a.get_tensor(keys["data"]), b.get_tensor(keys["data"]))
+            # Down is not re-encoded; gate/up records change.
+            assert same == (projection == "down")
+    # Rebuilding into the LDLQ directory with other Hessians is refused.
+    _write_hessians(tmp_path / "other", range(3, _LAYERS), 0x53D1)
+    with pytest.raises(ValueError, match="does not match"):
+        run(ldlq, ldlq_hessian_dir=tmp_path / "other")
+    assert factor.u.shape == (_HIDDEN, _HIDDEN)
 
 
 if __name__ == "__main__":
