@@ -42,8 +42,10 @@ hashes, counts and each file's digest); ``--output`` is then optional:
         --text-file corpus.jsonl --decision-text-file decisions.jsonl \\
         --hessian-dir hessians/
 
-Needs Transformers with GLM MoE DSA support (5.16 or newer) and, for the FP8
-checkpoint, the ``kernels`` package.
+Needs Transformers with GLM MoE DSA support (5.16 or newer). Its FP8 matmul
+comes from the ``kernels`` package (``kernels-community/finegrained-fp8``);
+without it, the block-FP8 weights are dequantized to BF16 for each matmul
+instead (BF16 activations times the exact weights, slower).
 """
 
 from __future__ import annotations
@@ -696,6 +698,48 @@ def config_fingerprint(config) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _dequantized_fp8_linear(
+    input: Tensor,
+    weight: Tensor,
+    weight_scale_inv: Tensor,
+    block_size=None,
+    activation_scale=None,
+    bias: Tensor | None = None,
+    **_,
+) -> Tensor:
+    """Transformers' ``fp8_linear`` as dequantize-then-matmul in plain torch."""
+    scale = weight_scale_inv.float()
+    if scale.numel() == 1:
+        dense = weight.float() * scale
+    else:
+        rows, columns = weight.shape[-2:]
+        block_rows = -(-rows // scale.shape[-2])
+        block_columns = -(-columns // scale.shape[-1])
+        grid = scale.repeat_interleave(block_rows, -2)[..., :rows, :]
+        grid = grid.repeat_interleave(block_columns, -1)[..., :columns]
+        dense = weight.float() * grid
+    return F.linear(input, dense.to(input.dtype), bias)
+
+
+def _use_dequantized_fp8_if_needed() -> bool:
+    """Route Transformers' FP8 matmuls through ``_dequantized_fp8_linear`` when
+    the finegrained-fp8 kernel cannot be loaded; returns whether it did."""
+    try:
+        from transformers.integrations import finegrained_fp8
+    except ImportError:
+        return False
+    try:
+        finegrained_fp8.load_finegrained_fp8_kernel()
+        return False
+    except ImportError:
+        finegrained_fp8.fp8_linear = _dequantized_fp8_linear
+        print(
+            "finegrained-fp8 kernel unavailable: FP8 matmuls dequantize to BF16",
+            flush=True,
+        )
+        return True
+
+
 def calibrate_glm5(
     model_dir: str | os.PathLike[str],
     text_file: str | os.PathLike[str],
@@ -736,6 +780,7 @@ def calibrate_glm5(
         if isinstance(overrides, dict):
             overrides.setdefault(None, {})
 
+    dequantized_fp8 = fp8_kernel_dir is None and _use_dequantized_fp8_if_needed()
     texts = load_texts(text_file)
     config = AutoConfig.from_pretrained(model_dir)
     if getattr(config, "model_type", None) != "glm_moe_dsa":
@@ -755,6 +800,7 @@ def calibrate_glm5(
         "architectures": list(getattr(config, "architectures", None) or ()),
         "model_config_sha256": config_fingerprint(config),
         "device_map": _DEVICE_MAP,
+        "fp8_matmul": "dequantized-bf16" if dequantized_fp8 else "finegrained-fp8",
     }
     payload: dict[str, Any] = {}
     if output is not None:
