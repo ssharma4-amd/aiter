@@ -3,7 +3,7 @@
 Status 2026-11-16: measured on the study format (v2-B-rw), **not yet in this code**. This note is for porting it into
 the shipped recipe (`aiter.quantization.iq2r.glm5.calibrate` / `compile`, format in `aiter/ops/iq2r_v2.py`) and its
 native kernels. The full study write-up is in the research repo:
-`research/glm53-2bit-quantization/08_targeted_error_reduction/EXPLAINER_ERROR_IMPORTANCE_DIRECTIONS_LDLQ.md`.
+`research/glm53-2bit-quantization/08_iq2r_v3/EXPLAINER_ERROR_IMPORTANCE_DIRECTIONS_LDLQ.md`.
 That folder also holds `PLAN.md`, `STEP1_SENSITIVITY_MAP.md` and `STEP2_IMPORTANCE_AND_CANDIDATES.md`.
 
 ## Why

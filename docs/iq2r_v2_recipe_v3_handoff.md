@@ -2,7 +2,7 @@
 
 Status 2026-11-17: measured on the study format (v2-B-rw) with decode-to-FP8 serving, **not yet in this code**. It
 builds on [iq2r_v2_ldlq_handoff.md](iq2r_v2_ldlq_handoff.md), which covers LDLQ itself; read that first. The study
-write-up is in the research repo: `research/glm53-2bit-quantization/08_targeted_error_reduction/`
+write-up is in the research repo: `research/glm53-2bit-quantization/08_iq2r_v3/`
 (`PLAN_V3_SCALES_AND_DECISION_CORPUS.md` for this step, `PLAN.md` for the whole study).
 
 It is the best 2-bit recipe so far on every measure we ran: held-out output error, AIME-60 (level with MXFP4), and a
@@ -67,7 +67,7 @@ own workload. Setup:
   terminal-agent trajectories generated on non-evaluation tasks.
 - terminus-2 never emits `<tool_call>`; its decisions are end of turn and `</think>` only.
 
-Study write-up: `research/glm53-2bit-quantization/08_targeted_error_reduction/DECISION_CORPUS_SOURCE_STUDY.md`.
+Study write-up: `research/glm53-2bit-quantization/08_iq2r_v3/DECISION_CORPUS_SOURCE_STUDY.md`.
 
 **Whole-model check (2026-11-19).** v3 was re-encoded with an SWE + math mixed bucket, keeping v3's books and scales
 and redoing only the gate/up LDLQ picks. Teacher-forced against FP8 on held-out text:
@@ -188,7 +188,7 @@ excluded):
   of a few tasks between models are within that range.
 - The full benchmark (89 tasks) was last run with earlier 2-bit models: MXFP4 56, 60; 2-bit 49, 52. v3 has not been
   run on it.
-- Analysis of the subset runs (`08_targeted_error_reduction/ANALYSIS_DECISION_VS_GENERAL.md`):
+- Analysis of the subset runs (`08_iq2r_v3/ANALYSIS_DECISION_VS_GENERAL.md`):
   - teacher-forced KL vs FP8 on these conversations: v3 0.080, MXFP4 0.048;
   - decode-to-FP8 serving runs at 52 tok/s vs MXFP4's 60;
   - the `</think>` logit offset did not change thinking length.
