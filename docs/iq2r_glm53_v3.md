@@ -482,3 +482,74 @@ items run on their own workgroups when all of a launch's workgroups are resident
 - MoE call with the fused shared expert, TP8 tuned rows (synthetic): M1 20.5 µs
   (+2.4 over routed only), M2 22.3 (+2.7), M4 25.7 (+2.7), M8 40.0 (+2.3), M16 55.2
   (+0.2), M32 78.5 (+3.3).
+
+## Encoder: LDLQ on gate/up with layer Hessians and a decision corpus
+
+The format and kernels do not change: LDLQ re-chooses only the codeword indices and
+signs of gate/up, so it costs no bits and no speed (the serving tables above apply).
+
+**Recipe.**
+
+- `calibrate --hessian-dir DIR` captures, per MoE layer, `H_all = mean x x^T` (x: the
+  MoE input, 6,144) over the scored positions of the calibration corpus (positions that
+  predict an assistant token, or the end-of-turn token right after assistant text). With
+  `--decision-text-file`, it also captures `H_decision` over the positions of a separate
+  decision corpus where FP8's top-1 next token is end of turn (`<|endoftext|>`,
+  `<|user|>`, `<|observation|>`), `</think>` or `<tool_call>`. Rows with a `kind` field
+  give one Hessian per kind; the bucket is their token-share-weighted mean after each is
+  divided by its trace. Files: `hessian-layer-NNNN.pt` plus `hessians.json` (corpus
+  hashes, position counts, kind weights, per-file digests).
+- `compile --ldlq --hessian-dir DIR` re-encodes gate/up after the normal encode with
+  `H = H_all/tr + 1.0 * H_decision/tr`, damped by `1.0 * mean(diag)`: the Cholesky factor
+  of `H^-1` once per layer, error feedback over K in 8-weight vectors (128-column lazy
+  batches), each vector keeping its scale and codebook copy; gains refitted (0.98). Down
+  is not re-encoded. The layer metadata records the recipe and the Hessians' digest, and
+  every matrix is checked bit-exact (records decode to the encoding, each packed layer
+  round-trips through unpack and pack).
+- Without the `kernels` package (finegrained-fp8), calibrate dequantizes each block-FP8
+  weight to BF16 for its matmul, as the study's captures did.
+
+**Checks.**
+
+- Held-out, shipped format, 1,024-entry book: 18 gate/up matrices (layers 10/40/70 x
+  experts 0/77/200 x gate, up), LDLQ fitted with half A of the SWE decision corpus,
+  relative output error after the 0.98 gain as a ratio to no LDLQ:
+
+  | Fit | expert H | eval texts, all | eval texts, decisions | decision corpus, half B |
+  |---|---|---|---|---|
+  | `H_all` only | 0.645 | 0.594 | 0.648 | 0.627 |
+  | `H_all` + decision bucket | 0.686 | 0.626 | 0.497 | 0.304 |
+  | (study, its format) | 0.687 | 0.627 | 0.498 | 0.305 |
+
+- Capture against the study's on the same text: `H_all` over calibration corpus v2,
+  160,731 positions (identical count), within 2.3% per layer (layer 3 identical);
+  `H_decision` on the SWE decision windows, 4,943 positions vs 4,972, within 2.8%.
+
+**Build.** Decision corpus v2 (`iq2r_v2_decision_corpus_v2.jsonl`, private corpus repo,
+8 kinds, 1.31M tokens; bucket weights = token shares), with its per-kind Hessians merged
+into the capture's `H_all`: `/models/zai-org/GLM-5.3-IQ2Rv3-ldlq-dv2` (234 GB), every
+matrix bit-exact. About 30 min per MoE layer per GPU (encode, LDLQ, checks).
+
+**Tasks, paired, native kernels, TP4** (FP8 KV, max-num-seqs 16): AIME-60 (T 1.0, top-p
+0.95, 2 passes, 24K thinking + 8K answer), SWE-bench Lite 15 disputed tasks (2 runs) and
+the Terminal-Bench 2.0 3-task stress subset (cobol-modernization, write-compressor,
+torch-tensor-parallelism; 5 attempts each). Base and MXFP4 ran side by side, as did the
+LDLQ arms, on 2026-11-20.
+
+| | base (1,024 book) | LDLQ, decision corpus v2 | MXFP4 A4W4 |
+|---|---|---|---|
+| AIME-60 | 54, 54 | 55, 55 | 57, 57 |
+| AIME median output tokens | 23.6K, 22.6K | 15.4K, 14.6K | 14.9K, 12.5K |
+| AIME answers forced at the budget | 29, 28 | 20, 21 | 20, 21 |
+| SWE-bench Lite disc15 | 3, 7 | 8, 7 | 8, 5 |
+| Terminal-Bench 3-task subset | 11/15 | 12/15 | 12/15 |
+
+- LDLQ with the decision bucket removes most of the 1,024-only model's extra thinking
+  (median output 15K vs 23K tokens, as MXFP4) and lifts the 15 SWE tasks from 10 to 15
+  of 30.
+- These are small, hard-case subsets: SWE 15-task runs move by a few tasks, the TB2
+  subset by about +-4 of 15. The full benchmarks (SWE-bench Lite 150, Terminal-Bench 2.0)
+  were not run; earlier 2-bit builds trailed MXFP4 there. The MXFP4 arm here is A4W4;
+  the earlier SWE references used A8W4 (9, 11, 12 on the same 15 tasks).
+- No degenerate output in any arm (proxy logs: no `</think>` collapses, no runaway
+  generations).
