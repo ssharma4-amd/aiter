@@ -31,6 +31,7 @@ from aiter.iq2r_glm53 import (
     _default_config,
     _mxfp8_quantize,
     _tuned_table,
+    iq2r_glm5_shape,
     iq2r_glm53_config,
     iq2r_glm53_dequantize_shared,
     iq2r_glm53_moe_out,
@@ -480,8 +481,10 @@ def test_glm53_moe_chunks_long_prefill(glm53_layer):
             workspace,
         )
     torch.testing.assert_close(chunked, halves, rtol=0, atol=0)
+    # Summation order only: the tuned rows may run the 300-token chunks on the
+    # decode kernels and the whole batch on the prefill kernels.
     relative_rmse, _ = _relative_metrics(chunked, whole)
-    assert relative_rmse < 1e-6
+    assert relative_rmse < 1e-5
 
 
 @functools.lru_cache(maxsize=4)
@@ -699,7 +702,11 @@ def test_glm53_tuned_config():
     rows = table[(table.gfx == get_gfx_runtime()) & (table.cu_num == get_cu_num())]
     for row in rows.itertuples():
         config = iq2r_glm53_config(
-            row.token, row.inter_dim, row.codebook, bool(row.shared)
+            row.token,
+            row.inter_dim,
+            row.codebook,
+            bool(row.shared),
+            iq2r_glm5_shape(row.model_dim),
         )
         assert config == IQ2RGlm53Config(
             row.gate_kernel,
