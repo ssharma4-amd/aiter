@@ -105,41 +105,51 @@ MI355X, which is 5-20% faster on these kernels.
 
 ATOM at TP4 on 4 MI350X, FP8 KV cache, `--max-num-seqs 16`, CUDA graphs. IQ2R: the 1,024-entry LDLQ checkpoint
 on the native kernels, shared expert in the IQ2R launches up to 256 tokens. MXFP4: the FP8 checkpoint with the
-routed and shared experts quantized to MXFP4 at load (`*expert*`), MXFP8 activations (A8W4). Non-expert layers
-are the checkpoint's block FP8 in both.
+routed and shared experts quantized to MXFP4 at load (`*expert*`), with MXFP8 activations (A8W4) or FP4
+activations (A4W4, ATOM's default). Non-expert layers are the checkpoint's block FP8 in every arm.
 
 `benchmark_serving`, random 1024-token prompts and 512 output tokens (`--ignore-eos`), 4 x concurrency prompts
 (at least 16), the second of two repetitions; output tokens/s (mean TPOT, mean TTFT):
 
-| Concurrency | MXFP4 A8W4 | IQ2R | IQ2R / MXFP4 |
-|---|---|---|---|
-| 1 | 98 (10.1 ms, 0.09 s) | 100 (9.9 ms, 0.08 s) | 1.02 |
-| 4 | 368 (10.6 ms, 0.16 s) | 380 (10.3 ms, 0.14 s) | 1.03 |
-| 16 | 1253 (12.5 ms, 0.17 s) | 1333 (11.8 ms, 0.13 s) | 1.06 |
-| 64 (queued at 16) | 1262 (12.5 ms) | 1342 (11.8 ms) | 1.06 |
+| Concurrency | MXFP4 A4W4 | MXFP4 A8W4 | IQ2R | IQ2R / A4W4 | IQ2R / A8W4 |
+|---|---|---|---|---|---|
+| 1 | 105 (9.4 ms, 0.08 s) | 98 (10.1 ms, 0.09 s) | 100 (9.9 ms, 0.08 s) | 0.95 | 1.02 |
+| 4 | 391 (10.0 ms, 0.13 s) | 368 (10.6 ms, 0.16 s) | 380 (10.3 ms, 0.14 s) | 0.97 | 1.03 |
+| 16 | 1337 (11.7 ms, 0.16 s) | 1253 (12.5 ms, 0.17 s) | 1333 (11.8 ms, 0.13 s) | 1.00 | 1.06 |
+| 64 (queued at 16) | 1367 (11.6 ms) | 1262 (12.5 ms) | 1342 (11.8 ms) | 0.98 | 1.06 |
 
-Memory per GPU from ATOM's budget at 0.9 utilization: weights plus peak activations 32.8 GB (MXFP4 46.7 GB),
-which leaves 7% more KV cache (521,546 against 486,840 FP8 blocks). The packed checkpoint is 120 GB.
+IQ2R is level with A4W4 at 16 concurrent requests and 3-5% behind at 1-4; it is 2-6% ahead of A8W4.
+
+Memory per GPU from ATOM's budget at 0.9 utilization: weights plus peak activations 32.8 GB (MXFP4 46.7 GB A8W4,
+48.1 GB A4W4), which leaves 7-8% more KV cache (521,546 against 486,840 and 483,326 FP8 blocks). The packed
+checkpoint is 120 GB.
 
 ## Quality against MXFP4
 
-Paired on one day, one server at a time at TP4, against MXFP4 A8W4 on the same FP8 checkpoint: SWE-bench on
-the servers above, AIME with a BF16 KV cache and `--max-num-seqs 64`.
+Paired on one day, TP4, against MXFP4 on the same FP8 checkpoint: SWE-bench and Terminal-Bench on the servers
+above (Terminal-Bench with `--max-model-len 262144`), AIME with a BF16 KV cache and `--max-num-seqs 64`.
 
-| | IQ2R, 1,024 entries, LDLQ + decision corpus | MXFP4 A8W4 |
-|---|---|---|
-| AIME-60 (T 1.0, top-p 0.95, 2 passes, 24K thinking + 8K answer) | 52, 53 | 53, 53 |
-| AIME median output tokens | 12.8K, 10.4K | 9.6K, 7.4K |
-| AIME answers forced at the budget | 21, 21 | 15, 17 |
-| SWE-bench Lite, the 15 split tasks of `docs/iq2r_glm53.md` (2 runs) | 8, 6 | 8, 10 |
+| | IQ2R, 1,024 entries, LDLQ + decision corpus | MXFP4 A4W4 | MXFP4 A8W4 |
+|---|---|---|---|
+| AIME-60 (T 1.0, top-p 0.95, 2 passes, 24K thinking + 8K answer) | 52, 53 | 51, 55 | 53, 53 |
+| AIME median output tokens | 12.8K, 10.4K | 10.0K, 11.2K | 9.6K, 7.4K |
+| AIME answers forced at the budget | 21, 21 | 17, 20 | 15, 17 |
+| SWE-bench Lite, the 15 split tasks of `docs/iq2r_glm53.md` (2 runs) | 8, 6 | 8, 4 | 8, 10 |
+| Terminal-Bench 2.0, 3 hard tasks (5 attempts each) | 8/15 | 5/15 | 10/15 |
 
 - AIME-60 and the SWE-bench settings are those of `docs/iq2r_glm53.md` (mini-swe-agent 2.4.5, temperature 0.95,
   thinking capped at 16,384 tokens plus 4,096 answer tokens, 150 steps, no network); the 15 tasks were chosen
   on GLM-5.3, not on this model.
-- AIME is level within its run-to-run spread (about +-3); IQ2R still thinks longer than MXFP4 (median output
-  about 1.35x) and is forced to answer at the budget more often.
-- SWE-bench: 14 against 18 of 30. In the first run each arm solved 3 tasks the other did not, in the second
-  IQ2R 2 and MXFP4 6. These are small, hard-case subsets that move by a few tasks between runs.
+- AIME is level within its run-to-run spread (about +-3); IQ2R thinks longer than MXFP4 A8W4 (median output
+  about 1.35x) and is forced to answer at the budget more often; A4W4 sits between them.
+- SWE-bench: IQ2R 14 of 30, A4W4 12, A8W4 18. Against A8W4, in the first run each arm solved 3 tasks the other
+  did not, in the second IQ2R 2 and A8W4 6.
+- Terminal-Bench 2.0: the three tasks of `docs/iq2r_glm53.md` (cobol-modernization, write-compressor,
+  torch-tensor-parallelism) with Harbor 0.25.0 and the terminus-2 agent, temperature 0.95, the same thinking budget,
+  9 concurrent trials and the standard timeouts. Per task IQ2R 5, 0, 3; A4W4 5, 0, 0 (one torch-tensor-parallelism
+  trial lost its sandbox's tmux session); A8W4 4, 1, 5. Most failures are the 900 s agent time limit.
+- These are small, hard-case subsets: 15-task SWE runs move by a few tasks and the Terminal-Bench subset by about
+  +-4 of 15 between runs (GLM-5.3's MXFP4 A8W4 scored 13 and 9 in two identical runs).
 - No degenerate output in any arm (no `</think>` collapses, no runaway generations); 1-3 agent runs per arm
   and repetition ended at the context limit.
 
