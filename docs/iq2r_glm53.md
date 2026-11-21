@@ -8,6 +8,9 @@ weights on MI355X/MI350X (gfx950), at TP4 (`inter_dim` 512) and TP8 (`inter_dim`
   launches as MXFP8;
 - a recipe with LDLQ on gate/up, using layer Hessians from the calibration corpus and a decision corpus.
 
+GLM-5.3-Flash runs on the same kernels, instantiated for its shape (hidden 4096, 288 routed experts, clamped
+SwiGLU): see `docs/iq2r_glm5_next.md`.
+
 IQ2R was developed by the MK1 team at AMD. Its learned codebooks are seeded from the IQ2_XXS grid of
 ggml/llama.cpp (MIT).
 
