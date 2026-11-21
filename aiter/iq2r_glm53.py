@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""GLM-5.3 IQ2R-v2 MoE on the packed layout (TP4 and TP8, gfx950).
+"""GLM-5 IQ2R-v2 MoE on the packed layout (TP4 and TP8, gfx950).
 
-256 routed experts with top-8 routing. The shared expert either stays outside
-the MoE or, for up to 1,024 tokens, runs inside the gate and down launches as
-route slot 8 in MXFP8 (:func:`iq2r_glm53_pack_shared`). The packed layout is a
-byte-exact relayout of the canonical IQ2R-v2 records (``aiter.ops.iq2r_v2``):
+GLM-5.3 (hidden 6144, 256 routed experts) and GLM-5.3-Flash (hidden 4096, 288
+routed experts, clamped SwiGLU), both with top-8 routing; :class:`IQ2RGlm5Shape`
+holds the model shapes and the functions default to GLM-5.3. The shared expert
+either stays outside the MoE or, for up to 1,024 tokens, runs inside the gate
+and down launches as route slot 8 in MXFP8 (:func:`iq2r_glm53_pack_shared`).
+The packed layout is a byte-exact relayout of the canonical IQ2R-v2
+records (``aiter.ops.iq2r_v2``):
 
 * the four 9-bit (or 10-bit) indices of an atom pack as low32 + high4
   (+ high4 in a per-lane extra word for a 1,024-entry codebook);
@@ -58,8 +61,48 @@ from .ops.iq2r_format import iq2r_data_bytes
 if TYPE_CHECKING:
     from .ops.iq2r_v2 import IQ2RV2Levels
 
-HIDDEN = 6144
-EXPERTS = 256
+
+@dataclass(frozen=True, slots=True)
+class IQ2RGlm5Shape:
+    """A model shape of the packed MoE kernels (``csrc/include/iq2r_glm5_shape.h``).
+
+    ``down_rows`` pads the down projection's N (= ``hidden``) to whole down
+    tiles; the padding rows are zero weights whose outputs are dropped.
+    ``swiglu_limit`` is the clamp of GLM-5.3-Flash's SwiGLU (routed and shared
+    experts), None for SiLU(gate) * up.
+    """
+
+    name: str
+    hidden: int
+    experts: int
+    down_rows: int
+    swiglu_limit: float | None
+
+    @property
+    def k_tiles(self) -> int:
+        return self.hidden // 128
+
+    @property
+    def slice_tiles(self) -> int:
+        """K tiles of one decode-gate wave's slice (eight per quad)."""
+        return self.k_tiles // 8
+
+
+GLM53 = IQ2RGlm5Shape("glm53", 6144, 256, 6144, None)
+GLM5_NEXT = IQ2RGlm5Shape("glm5next", 4096, 288, 4608, 10.0)
+SHAPES = (GLM53, GLM5_NEXT)
+
+
+def iq2r_glm5_shape(hidden: int) -> IQ2RGlm5Shape:
+    """The model shape whose hidden size is ``hidden``."""
+    for shape in SHAPES:
+        if shape.hidden == hidden:
+            return shape
+    raise ValueError(f"GLM-5 IQ2R supports hidden {[s.hidden for s in SHAPES]}")
+
+
+HIDDEN = GLM53.hidden
+EXPERTS = GLM53.experts
 TOPK = 8
 # Routes per token in the kernels' layout: the eight routed experts, then slot
 # 8, the fused shared expert when it is enabled (else empty).
@@ -76,11 +119,11 @@ INTERMEDIATE_SIZES = (256, 512)  # TP8, TP4
 
 # Stored slabs (aiter/ops/iq2r_format.py): K tiles per slab and slab bytes of
 # a six-block group, for 512- and 1,024-entry codebooks. A packed gate/up quad
-# (4 x 16 rows) holds 2304 bytes per K tile, plus for 1,024 entries a
-# 12-byte word per lane and six-tile K slice (one decode-gate wave's).
+# (4 x 16 rows) holds 2304 bytes per K tile, plus for 1,024 entries a word of
+# 2 * slice_tiles bytes per lane and K slice (one decode-gate wave's: six tiles
+# for GLM-5.3, four for GLM-5.3-Flash).
 _SLABS = {512: (1, 3584), 1024: (2, 7296)}
 _QUAD_TILE_BYTES = {512: 2304, 1024: 2432}
-_QUAD_SLICE_TILES = 6
 
 # Gate kernels (csrc/include/iq2r.h Glm53GateKernel): "decode" for M2..1024,
 # "prefill" for M2..4096. M1 runs its own gate.
@@ -216,28 +259,37 @@ def _transpose_signs(data: Tensor, logical_k: int, entries: int) -> None:
             record[..., 4 + j].copy_(((new >> (8 * j)) & 255).to(torch.uint8))
 
 
-def _quad_tiles(quad: Tensor, entries: int):
-    """``(tiles [E, N/64, 48, 2304], ext [E, N/64, 8, 64, 12] or None)`` views of a
-    packed gate/up stack: 1,024-entry quads store each six-tile K slice's tiles,
-    then its lanes' 12-byte tenth-bit words (slice tile t's four quad nibbles in
-    bits 16 t .. 16 t + 15, so dword t // 2 holds tiles 2 (t // 2) and + 1)."""
-    experts = quad.shape[0]
+def _quad_tiles(quad: Tensor, entries: int, shape: IQ2RGlm5Shape = GLM53):
+    """``(tiles [E, N/64, K/128, 2304], ext [E, N/64, 8, 64, 2 S] or None)`` views
+    of a packed gate/up stack (S = ``shape.slice_tiles``): 1,024-entry quads store
+    each S-tile K slice's tiles, then its lanes' 2S-byte tenth-bit words (slice
+    tile t's four quad nibbles in bits 16 t .. 16 t + 15, so dword t // 2 holds
+    tiles 2 (t // 2) and + 1)."""
+    experts, slice_tiles = quad.shape[0], shape.slice_tiles
     if entries == 512:
-        return quad.view(experts, -1, 48, 2304), None
-    slices = quad.view(experts, -1, 48 // _QUAD_SLICE_TILES, _QUAD_SLICE_TILES * 2432)
-    tiles = slices[..., : _QUAD_SLICE_TILES * 2304].unflatten(
-        -1, (_QUAD_SLICE_TILES, 2304)
-    )
-    return tiles, slices[..., _QUAD_SLICE_TILES * 2304 :].unflatten(-1, (64, 12))
+        return quad.view(experts, -1, shape.k_tiles, 2304), None
+    slices = quad.view(experts, -1, 8, slice_tiles * 2432)
+    tiles = slices[..., : slice_tiles * 2304].unflatten(-1, (slice_tiles, 2304))
+    ext = slices[..., slice_tiles * 2304 :].unflatten(-1, (64, 2 * slice_tiles))
+    return tiles, ext
 
 
-def _quad_map(data: Tensor, quad: Tensor, logical_n: int, entries: int, to_quad: bool):
-    """Copy gate/up records between the canonical K=6144 records and quads of four
-    16-column blocks (``to_quad``), or back. Every operand is a view, so the
-    copies land in ``data`` or ``quad``."""
-    records, ext = _slabs(data, HIDDEN, entries)
-    tiles, quad_ext = _quad_tiles(quad, entries)
+def _quad_map(
+    data: Tensor,
+    quad: Tensor,
+    logical_n: int,
+    entries: int,
+    to_quad: bool,
+    shape: IQ2RGlm5Shape = GLM53,
+):
+    """Copy gate/up records between the canonical K = ``shape.hidden`` records and
+    quads of four 16-column blocks (``to_quad``), or back. Every operand is a
+    view, so the copies land in ``data`` or ``quad``."""
+    records, ext = _slabs(data, shape.hidden, entries)
+    tiles, quad_ext = _quad_tiles(quad, entries, shape)
     slab_tiles = records.shape[3]
+    # 1,024 entries: two-tile slabs, slice_tiles / 2 of them per K slice.
+    slab_slices = shape.slice_tiles // 2
     for block in range(logical_n // 16):
         atom = block % 3
         offset = (block % 6) // 3 * 1792
@@ -245,11 +297,11 @@ def _quad_map(data: Tensor, quad: Tensor, logical_n: int, entries: int, to_quad:
         for tile in range(slab_tiles):
             source = records[:, block // 6, :, tile]  # [E, slabs, 3584]
             if entries == 512:
-                target = tiles[:, block // 4]  # [E, 48 K tiles, 2304]
+                target = tiles[:, block // 4]  # [E, K tiles, 2304]
             else:
-                # K tile 2 s + tile: six-tile slice s // 3, position 2 (s % 3) + tile
-                source = source.unflatten(1, (8, 3))
-                target = tiles[:, block // 4, :, tile::2]  # [E, 8, 3, 2304]
+                # K tile 2 s + tile: slice s // P, position 2 (s % P) + tile (P = slab_slices)
+                source = source.unflatten(1, (8, slab_slices))
+                target = tiles[:, block // 4, :, tile::2]  # [E, 8, P, 2304]
             third = source[..., offset + 1024 : offset + 1792].unflatten(-1, (64, 12))
             if atom < 2:
                 record = source[..., offset : offset + 1024].unflatten(-1, (64, 16))
@@ -268,13 +320,15 @@ def _quad_map(data: Tensor, quad: Tensor, logical_n: int, entries: int, to_quad:
                 third[..., 8 + atom].copy_(metadata)
             if ext is None:
                 continue
-            # [E, 8 slices, 3 slabs, 64]
-            slab_bytes = ext[:, block // 6, :, (block % 6) // 3].unflatten(1, (8, 3))
-            for position in range(3):
+            # [E, 8 slices, P slabs, 64]
+            slab_bytes = ext[:, block // 6, :, (block % 6) // 3].unflatten(
+                1, (8, slab_slices)
+            )
+            for position in range(slab_slices):
                 raw, shift = _tenth(
                     third[:, :, position], slab_bytes[:, :, position], tile, atom
                 )
-                # [E, 8, 64, 12]: K tile 2 position + tile's 16 bits are in
+                # [E, 8, 64, 2 S]: K tile 2 position + tile's 16 bits are in
                 # dword position, at bit 16 tile.
                 quad_words = quad_ext[
                     :, block // 4, ..., 4 * position : 4 * position + 4
@@ -286,20 +340,59 @@ def _quad_map(data: Tensor, quad: Tensor, logical_n: int, entries: int, to_quad:
                     _set_nibble(raw, shift, (_word(quad_words) >> quad_shift) & 15)
 
 
-def _quad_gate(data: Tensor, logical_n: int, entries: int) -> Tensor:
-    """Regroup K=6144 gate/up records into packed quads (``_quad_tiles``)."""
+def _quad_gate(
+    data: Tensor, logical_n: int, entries: int, shape: IQ2RGlm5Shape = GLM53
+) -> Tensor:
+    """Regroup gate/up records (K = ``shape.hidden``) into packed quads (``_quad_tiles``)."""
     blocks = logical_n // 16
     slab_tiles, slab_bytes = _SLABS[entries]
-    groups = data.shape[1] // (48 // slab_tiles * slab_bytes)
+    groups = data.shape[1] // (shape.k_tiles // slab_tiles * slab_bytes)
     if logical_n % 64 or (blocks + 5) // 6 != groups:
         raise ValueError("gate/up N must be a multiple of 64 matching the data")
     quad = torch.zeros(
-        (data.shape[0], iq2r_glm53_gate_bytes(logical_n, entries)),
+        (data.shape[0], iq2r_glm53_gate_bytes(logical_n, entries, shape)),
         dtype=torch.uint8,
         device=data.device,
     )
-    _quad_map(data, quad, logical_n, entries, to_quad=True)
+    _quad_map(data, quad, logical_n, entries, to_quad=True, shape=shape)
     return quad
+
+
+def _pad_down(
+    data: Tensor, auxiliary: Tensor, k: int, entries: int, shape: IQ2RGlm5Shape
+) -> tuple[Tensor, Tensor]:
+    """Pad canonical down buffers from N = hidden to ``shape.down_rows`` rows.
+
+    The padding records are zero bytes and their d bytes zero (scale 2^-127),
+    so the padding rows decode to zero-scale weights. Buffers that already
+    have ``shape.down_rows`` rows (unpacked ones) are returned as they are.
+    """
+    experts = data.shape[0]
+    group_bytes = iq2r_data_bytes(96, k, entries)  # one six-block (96-row) group
+    groups = (shape.hidden // 16 + 5) // 6
+    padded_groups = shape.down_rows // 96
+    if shape.down_rows == shape.hidden or data.shape[1] == padded_groups * group_bytes:
+        return data, auxiliary
+    if data.shape[1] != groups * group_bytes:
+        raise ValueError("canonical down data size does not match N, K")
+    padding = data.new_zeros((experts, (padded_groups - groups) * group_bytes))
+    columns = k // 256
+    book_bytes = entries * 8
+    d_bytes = shape.hidden * columns
+    d_padding = auxiliary.new_zeros(
+        (experts, (shape.down_rows - shape.hidden) * columns)
+    )
+    return (
+        torch.cat((data, padding), dim=1).contiguous(),
+        torch.cat(
+            (
+                auxiliary[:, : book_bytes + d_bytes],
+                d_padding,
+                auxiliary[:, book_bytes + d_bytes :],
+            ),
+            dim=1,
+        ).contiguous(),
+    )
 
 
 # The packed auxiliary is
@@ -364,14 +457,16 @@ def iq2r_glm53_pack(
     *,
     intermediate_size: int,
     levels: IQ2RV2Levels | None = None,
+    shape: IQ2RGlm5Shape = GLM53,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    """Relayout one GLM-5.3 IQ2R-v2 MoE layer (full checkpoint or a TP shard).
+    """Relayout one GLM-5 IQ2R-v2 MoE layer (full checkpoint or a TP shard).
 
     Inputs are canonical IQ2R-v2 buffers (``aiter.ops.iq2r_v2``), one codebook
     per matrix (gate and up share one), with 512 or 1,024 entries (read from
     the auxiliary size; both matrices must agree); ``levels`` defaults to the
     kernels' level set. Returns
-    ``(gate_quad, gate_auxiliary, down_data, down_auxiliary)``.
+    ``(gate_quad, gate_auxiliary, down_data, down_auxiliary)``; the down
+    buffers have ``shape.down_rows`` rows.
     """
     from .ops.iq2r_v2 import (
         IQ2R_V2_LEVELS_C4,
@@ -380,8 +475,14 @@ def iq2r_glm53_pack(
     )
 
     levels = levels or IQ2R_V2_LEVELS_C4
-    entries = _canonical_entries(gate_up_auxiliary, 2 * intermediate_size, HIDDEN)
-    if _canonical_entries(down_auxiliary, HIDDEN, intermediate_size) != entries:
+    entries = _canonical_entries(gate_up_auxiliary, 2 * intermediate_size, shape.hidden)
+    down_entries = [
+        e
+        for n in {shape.hidden, shape.down_rows}
+        for e in _SLABS
+        if down_auxiliary.shape[1] == e * 8 + n * (intermediate_size // 256) + 8
+    ]
+    if entries not in down_entries:
         raise ValueError("gate/up and down codebooks must have the same size")
 
     def aux(auxiliary: Tensor, n: int, k: int, atoms: int) -> Tensor:
@@ -406,14 +507,17 @@ def iq2r_glm53_pack(
         ).contiguous()
 
     gate = gate_up_data.clone(memory_format=torch.contiguous_format)
-    _pack_indices(gate, HIDDEN, entries)
-    _transpose_signs(gate, HIDDEN, entries)
-    quad = _quad_gate(gate, 2 * intermediate_size, entries)
+    _pack_indices(gate, shape.hidden, entries)
+    _transpose_signs(gate, shape.hidden, entries)
+    quad = _quad_gate(gate, 2 * intermediate_size, entries, shape)
     del gate
+    down_data, down_auxiliary = _pad_down(
+        down_data, down_auxiliary, intermediate_size, entries, shape
+    )
     down = down_data.clone(memory_format=torch.contiguous_format)
     _pack_indices(down, intermediate_size, entries)
-    gate_aux = aux(gate_up_auxiliary, 2 * intermediate_size, HIDDEN, 4)
-    down_aux = aux(down_auxiliary, HIDDEN, intermediate_size, 3)
+    gate_aux = aux(gate_up_auxiliary, 2 * intermediate_size, shape.hidden, 4)
+    down_aux = aux(down_auxiliary, shape.down_rows, intermediate_size, 3)
     return quad, gate_aux, down, down_aux
 
 
@@ -450,20 +554,24 @@ def _untranspose_signs(data: Tensor, logical_k: int, entries: int) -> None:
             record[..., 4 + j].copy_(((old >> (8 * j)) & 255).to(torch.uint8))
 
 
-def _unquad_gate(quad: Tensor, logical_n: int, entries: int) -> Tensor:
-    """Inverse of ``_quad_gate``: packed quads -> K=6144 records.
+def _unquad_gate(
+    quad: Tensor, logical_n: int, entries: int, shape: IQ2RGlm5Shape = GLM53
+) -> Tensor:
+    """Inverse of ``_quad_gate``: packed quads -> records (K = ``shape.hidden``).
 
     The padding N blocks of the last 6-block group (``_quad_gate`` drops them)
     come back as zeros, as ``iq2r_v2_write_data`` writes them.
     """
-    if logical_n % 64 or quad.shape[1] != iq2r_glm53_gate_bytes(logical_n, entries):
+    if logical_n % 64 or quad.shape[1] != iq2r_glm53_gate_bytes(
+        logical_n, entries, shape
+    ):
         raise ValueError("packed gate/up size does not match N")
     data = torch.zeros(
-        (quad.shape[0], iq2r_data_bytes(logical_n, HIDDEN, entries)),
+        (quad.shape[0], iq2r_data_bytes(logical_n, shape.hidden, entries)),
         dtype=torch.uint8,
         device=quad.device,
     )
-    _quad_map(data, quad, logical_n, entries, to_quad=False)
+    _quad_map(data, quad, logical_n, entries, to_quad=False, shape=shape)
     return data
 
 
@@ -482,11 +590,12 @@ def iq2r_glm53_unpack(
     *,
     intermediate_size: int,
     levels: IQ2RV2Levels | None = None,
+    shape: IQ2RGlm5Shape = GLM53,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Inverse of :func:`iq2r_glm53_pack`: packed buffers (as stored in a
     ``glm53-packed-v2`` or ``glm53-packed-v3`` checkpoint, full or a TP shard)
     -> canonical ``(gate_up_data, gate_up_auxiliary, down_data, down_auxiliary)``
-    for ``iq2r_v2_materialize``.
+    for ``iq2r_v2_materialize``. The down buffers keep ``shape.down_rows`` rows.
 
     The canonical auxiliary keeps codebook copy 0 (the codebook); copies 1..C-1
     are recomputed by packing, so ``pack(unpack(x)) == x`` holds whenever the
@@ -496,7 +605,7 @@ def iq2r_glm53_unpack(
 
     classes = (levels or IQ2R_V2_LEVELS_C4).classes
     entries = iq2r_glm53_codebook_entries(
-        gate_auxiliary.shape[1], 2 * intermediate_size, HIDDEN, classes, gate=True
+        gate_auxiliary.shape[1], 2 * intermediate_size, shape.hidden, classes, gate=True
     )
 
     def aux(packed: Tensor, n: int, k: int, atoms: int) -> Tensor:
@@ -511,13 +620,13 @@ def iq2r_glm53_unpack(
             (packed[:, : entries * 8], d.reshape(experts, -1), packed[:, -8:]), dim=1
         ).contiguous()
 
-    gate = _unquad_gate(gate_quad, 2 * intermediate_size, entries)
-    _untranspose_signs(gate, HIDDEN, entries)
-    _unpack_indices(gate, HIDDEN, entries)
+    gate = _unquad_gate(gate_quad, 2 * intermediate_size, entries, shape)
+    _untranspose_signs(gate, shape.hidden, entries)
+    _unpack_indices(gate, shape.hidden, entries)
     down = down_data.clone(memory_format=torch.contiguous_format)
     _unpack_indices(down, intermediate_size, entries)
-    gate_aux = aux(gate_auxiliary, 2 * intermediate_size, HIDDEN, 4)
-    down_aux = aux(down_auxiliary, HIDDEN, intermediate_size, 3)
+    gate_aux = aux(gate_auxiliary, 2 * intermediate_size, shape.hidden, 4)
+    down_aux = aux(down_auxiliary, shape.down_rows, intermediate_size, 3)
     return gate.contiguous(), gate_aux, down, down_aux
 
 
@@ -545,6 +654,7 @@ def iq2r_glm53_slice_down_aux(
     full_k: int,
     classes: int,
     codebook_entries: int = 512,
+    shape: IQ2RGlm5Shape = GLM53,
 ) -> Tensor:
     """Input-column slice of a packed v2 down auxiliary (256-aligned).
 
@@ -553,28 +663,47 @@ def iq2r_glm53_slice_down_aux(
     if start % 256 or length % 256:
         raise ValueError("IQ2R-v2 down slices must be aligned to 256 columns")
     books = classes * _entries(codebook_entries) * 8
-    table = aux[:, books:-8].reshape(aux.shape[0], HIDDEN // 48, full_k // 256, 64)
+    table = aux[:, books:-8].reshape(
+        aux.shape[0], shape.down_rows // 48, full_k // 256, 64
+    )
     picked = table[:, :, start // 256 : (start + length) // 256].reshape(
         aux.shape[0], -1
     )
     return torch.cat((aux[:, :books], picked, aux[:, -8:]), dim=1).contiguous()
 
 
-def iq2r_glm53_gate_bytes(logical_n: int, codebook_entries: int = 512) -> int:
-    """Bytes per expert of a packed GLM-5.3 gate/up matrix (K=6144)."""
+def iq2r_glm53_gate_bytes(
+    logical_n: int, codebook_entries: int = 512, shape: IQ2RGlm5Shape = GLM53
+) -> int:
+    """Bytes per expert of a packed gate/up matrix (K = ``shape.hidden``)."""
     if logical_n % 64:
         raise ValueError("packed gate/up N must be a multiple of 64")
-    return logical_n // 64 * 48 * _QUAD_TILE_BYTES[_entries(codebook_entries)]
+    return (
+        logical_n // 64 * shape.k_tiles * _QUAD_TILE_BYTES[_entries(codebook_entries)]
+    )
+
+
+def iq2r_glm5_down_bytes(
+    intermediate_size: int, codebook_entries: int = 512, shape: IQ2RGlm5Shape = GLM53
+) -> int:
+    """Bytes per expert of packed down data (N = ``shape.down_rows``)."""
+    return iq2r_data_bytes(
+        shape.down_rows, intermediate_size, _entries(codebook_entries)
+    )
 
 
 def iq2r_glm53_slice_gate(
-    gate: Tensor, start: int, length: int, codebook_entries: int = 512
+    gate: Tensor,
+    start: int,
+    length: int,
+    codebook_entries: int = 512,
+    shape: IQ2RGlm5Shape = GLM53,
 ) -> Tensor:
     """Output-column slice [start, start+length) of a packed gate/up matrix.
 
     Both bounds must be multiples of 64 so the slice consists of whole quads.
     """
-    quad_bytes = 48 * _QUAD_TILE_BYTES[_entries(codebook_entries)]
+    quad_bytes = shape.k_tiles * _QUAD_TILE_BYTES[_entries(codebook_entries)]
     if start % 64 or length % 64 or gate.shape[1] % quad_bytes:
         raise ValueError("packed gate/up slices must be aligned to 64 columns")
     quads = gate.view(gate.shape[0], -1, quad_bytes)
@@ -595,12 +724,13 @@ def iq2r_glm53_slice_gate(
 # 16g..16g+15 and 64+16g..64+16g+15 of the tile, and the E8M0 scale of
 # 32-block g of its row.
 #
-# * gate/up [N/64][48 K tiles][4 atoms][64 lanes][32 bytes], scales
-#   [N/64][48][64 lanes][4 atoms]; the 64 rows of an N tile interleave gate
-#   and up as the routed gate quads do (atom a, row r: intermediate column
+# * gate/up [N/64][hidden/128 K tiles][4 atoms][64 lanes][32 bytes], scales
+#   [N/64][hidden/128][64 lanes][4 atoms]; the 64 rows of an N tile interleave
+#   gate and up as the routed gate quads do (atom a, row r: intermediate column
 #   32 * tile + 8a + r // 2, gate for even r).
-# * down [384 column blocks][K/128][64 lanes][32 bytes], scales
-#   [384][K/128][64 lanes].
+# * down [down_rows/16 column blocks][K/128][64 lanes][32 bytes], scales
+#   [down_rows/16][K/128][64 lanes]; the blocks past hidden are zero padding,
+#   like the routed down rows'.
 
 
 @dataclass(slots=True)
@@ -611,10 +741,11 @@ class IQ2RGlm53Shared:
     gate_scales: Tensor
     down: Tensor
     down_scales: Tensor
+    shape: IQ2RGlm5Shape = GLM53
 
     @property
     def intermediate_size(self) -> int:
-        return self.gate.shape[0] // (48 * 4 * 64 * 32) * 32
+        return self.gate.shape[0] // (self.shape.k_tiles * 4 * 64 * 32) * 32
 
 
 def _mxfp8_quantize(weight: Tensor) -> tuple[Tensor, Tensor]:
@@ -650,18 +781,20 @@ def _mxfp8_tiles(values: Tensor, scales: Tensor):
     )
 
 
-def iq2r_glm53_pack_shared(gate: Tensor, up: Tensor, down: Tensor) -> IQ2RGlm53Shared:
-    """Pack one rank's shared expert: ``gate``/``up`` [I, 6144] and ``down``
-    [6144, I] (any float dtype; I = 256 or 512)."""
-    intermediate = gate.shape[0]
+def iq2r_glm53_pack_shared(
+    gate: Tensor, up: Tensor, down: Tensor, shape: IQ2RGlm5Shape = GLM53
+) -> IQ2RGlm53Shared:
+    """Pack one rank's shared expert: ``gate``/``up`` [I, hidden] and ``down``
+    [hidden, I] (any float dtype; I = 256 or 512)."""
+    intermediate, hidden = gate.shape[0], shape.hidden
     if (
         intermediate not in INTERMEDIATE_SIZES
-        or gate.shape != (intermediate, HIDDEN)
+        or gate.shape != (intermediate, hidden)
         or up.shape != gate.shape
-        or down.shape != (HIDDEN, intermediate)
+        or down.shape != (hidden, intermediate)
     ):
         raise ValueError(
-            "GLM-5.3 shared expert must be gate/up [I, 6144], down [6144, I]"
+            f"{shape.name} shared expert must be gate/up [I, {hidden}], down [{hidden}, I]"
         )
     # Routed gate quad order: tile t, atom a, row r -> column 32t + 8a + r // 2.
     columns = torch.arange(2 * intermediate, device=gate.device)
@@ -672,14 +805,21 @@ def iq2r_glm53_pack_shared(gate: Tensor, up: Tensor, down: Tensor) -> IQ2RGlm53S
     )
     values, scales = _mxfp8_tiles(*_mxfp8_quantize(gate_up))
     nt = intermediate // 32
-    gate_values = values.view(nt, 4, 48, 64, 32).transpose(1, 2).contiguous()
-    gate_scales = scales.view(nt, 4, 48, 64).permute(0, 2, 3, 1).contiguous()
-    down_values, down_scales = _mxfp8_tiles(*_mxfp8_quantize(down.float()))
+    k_tiles = shape.k_tiles
+    gate_values = values.view(nt, 4, k_tiles, 64, 32).transpose(1, 2).contiguous()
+    gate_scales = scales.view(nt, 4, k_tiles, 64).permute(0, 2, 3, 1).contiguous()
+    padded = down.float()
+    if shape.down_rows != hidden:
+        padded = torch.cat(
+            (padded, padded.new_zeros((shape.down_rows - hidden, intermediate)))
+        )
+    down_values, down_scales = _mxfp8_tiles(*_mxfp8_quantize(padded))
     return IQ2RGlm53Shared(
         gate=gate_values.reshape(-1),
         gate_scales=gate_scales.reshape(-1),
         down=down_values.reshape(-1),
         down_scales=down_scales.reshape(-1),
+        shape=shape,
     )
 
 
@@ -757,14 +897,14 @@ def _config_problem(
 _TUNED: dict[str, dict] = {}
 
 
-def _tuned_table(tuned_file: str) -> dict:
+def _tuned_table(tuned_file: str, shape: IQ2RGlm5Shape = GLM53) -> dict:
     """(gfx, cu_num, intermediate, codebook, shared) -> [(token, config)] sorted
-    by token.
+    by token, for ``shape``'s rows.
 
     Rows without a ``codebook`` column are 512-entry rows; rows without a
     ``shared`` column were tuned without the fused shared expert (0).
     """
-    if tuned_file not in _TUNED:
+    if (tuned_file, shape) not in _TUNED:
         table = pd.read_csv(tuned_file).drop_duplicates()
         if "codebook" not in table.columns:
             table = table.assign(codebook=512)
@@ -772,15 +912,15 @@ def _tuned_table(tuned_file: str) -> dict:
             table = table.assign(shared=0)
         # Other model families may share the file; keep only this shape.
         table = table[
-            (table.model_dim == HIDDEN)
-            & (table.expert == EXPERTS)
+            (table.model_dim == shape.hidden)
+            & (table.expert == shape.experts)
             & (table.topk == TOPK)
         ]
         keys = ["gfx", "cu_num", "token", "inter_dim", "codebook", "shared"]
         duplicate = table[table.duplicated(keys, keep=False)]
         if len(duplicate):
             raise ValueError(
-                f"{tuned_file}: more than one GLM-5.3 IQ2R row for\n"
+                f"{tuned_file}: more than one {shape.name} IQ2R row for\n"
                 f"{duplicate[keys].drop_duplicates().to_string(index=False)}"
             )
         shapes: dict = {}
@@ -807,8 +947,8 @@ def _tuned_table(tuned_file: str) -> dict:
                 int(row.shared),
             )
             shapes.setdefault(key, []).append((int(row.token), config))
-        _TUNED[tuned_file] = shapes
-    return _TUNED[tuned_file]
+        _TUNED[tuned_file, shape] = shapes
+    return _TUNED[tuned_file, shape]
 
 
 @functools.lru_cache(maxsize=1024)
@@ -817,6 +957,7 @@ def iq2r_glm53_config(
     intermediate_size: int,
     codebook_entries: int = 512,
     shared: bool = False,
+    shape: IQ2RGlm5Shape = GLM53,
 ) -> IQ2RGlm53Config:
     """Config of the smallest tuned M >= ``tokens`` that can run ``tokens``.
 
@@ -825,12 +966,12 @@ def iq2r_glm53_config(
     expert) the rows tuned with it come first, and prefill rows are skipped.
     """
     tuned_file = AITER_CONFIGS.AITER_CONFIG_IQ2R_GLM53_FILE
-    table = _tuned_table(tuned_file)
-    shape = (get_gfx(), get_cu_num(), intermediate_size)
+    table = _tuned_table(tuned_file, shape)
+    key = (get_gfx(), get_cu_num(), intermediate_size)
     rows = (
-        (table.get((*shape, codebook_entries, 1)) if shared else None)
-        or table.get((*shape, codebook_entries, 0))
-        or table.get((*shape, 512, 0))
+        (table.get((*key, codebook_entries, 1)) if shared else None)
+        or table.get((*key, codebook_entries, 0))
+        or table.get((*key, 512, 0))
     )
     for tuned_tokens, config in rows or ():
         if shared and config.gate_kernel == "prefill":
@@ -840,7 +981,7 @@ def iq2r_glm53_config(
         ):
             if AITER_LOG_TUNED_CONFIG:
                 logger.info(
-                    f"IQ2R GLM-5.3 M={tokens} I={intermediate_size} "
+                    f"IQ2R {shape.name} M={tokens} I={intermediate_size} "
                     f"codebook {codebook_entries} shared {int(shared)}: tuned "
                     f"M={tuned_tokens} {config} from {tuned_file}"
                 )
@@ -853,10 +994,10 @@ def iq2r_glm53_config(
 # --------------------------------------------------------------------------
 
 
-def _task_capacity(routes: int, rows: int) -> int:
+def _task_capacity(routes: int, rows: int, experts: int = EXPERTS) -> int:
     # At most one partial task per routed expert (invalid routes get none); the
     # kernels check the same bound.
-    return (routes + rows - 1) // rows + min(routes, EXPERTS)
+    return (routes + rows - 1) // rows + min(routes, experts)
 
 
 @dataclass(slots=True)
@@ -868,6 +1009,7 @@ class IQ2RGlm53Workspace:
 
     max_tokens: int
     intermediate_size: int
+    shape: IQ2RGlm5Shape
     route_input_fp8: Tensor
     route_input_scales: Tensor
     intermediate_fp8: Tensor
@@ -885,12 +1027,15 @@ class IQ2RGlm53Workspace:
 
     @classmethod
     def allocate(
-        cls, max_tokens: int, intermediate_size: int, *, device: torch.device | str
+        cls,
+        max_tokens: int,
+        intermediate_size: int,
+        *,
+        device: torch.device | str,
+        shape: IQ2RGlm5Shape = GLM53,
     ) -> IQ2RGlm53Workspace:
         if intermediate_size not in INTERMEDIATE_SIZES:
-            raise ValueError(
-                "GLM-5.3 IQ2R supports intermediate 256 (TP8) or 512 (TP4)"
-            )
+            raise ValueError("GLM-5 IQ2R supports intermediate 256 (TP8) or 512 (TP4)")
         # Longer batches run in MAX_CHUNK_TOKENS pieces.
         max_tokens = min(max(max_tokens, 1), MAX_CHUNK_TOKENS)
         routes = max_tokens * ROUTE_SLOTS
@@ -899,24 +1044,35 @@ class IQ2RGlm53Workspace:
         i32 = {"dtype": torch.int32, "device": device}
         u8 = {"dtype": torch.uint8, "device": device}
         fp8 = {"dtype": torch.float8_e4m3fn, "device": device}
+        experts = shape.experts
         return cls(
             max_tokens=max_tokens,
             intermediate_size=intermediate_size,
-            route_input_fp8=torch.empty((rows, HIDDEN), **fp8),
-            route_input_scales=torch.empty((rows, HIDDEN // 32), **u8),
+            shape=shape,
+            route_input_fp8=torch.empty((rows, shape.hidden), **fp8),
+            route_input_scales=torch.empty((rows, shape.hidden // 32), **u8),
             intermediate_fp8=torch.empty((routes, intermediate_size), **fp8),
             intermediate_scales=torch.empty((routes, intermediate_size // 32), **u8),
+            # The down kernels write every down row, padding included.
             route_output=torch.empty(
-                (routes, HIDDEN), dtype=torch.bfloat16, device=device
+                (routes, shape.down_rows), dtype=torch.bfloat16, device=device
             ),
             gather_indices=torch.empty((routes,), **i32),
             scatter_indices=torch.empty((routes,), **i32),
             tasks=torch.empty(
-                (max(_task_capacity(routes, 64), _task_capacity(decode_routes, 32)), 3),
+                (
+                    max(
+                        _task_capacity(routes, 64, experts),
+                        _task_capacity(decode_routes, 32, experts),
+                    ),
+                    3,
+                ),
                 **i32,
             ),
             task_count=torch.empty((1,), **i32),
-            gate_tasks=torch.empty((_task_capacity(decode_routes, 16), 3), **i32),
+            gate_tasks=torch.empty(
+                (_task_capacity(decode_routes, 16, experts), 3), **i32
+            ),
             gate_task_count=torch.empty((1,), **i32),
             # Prefill sort histograms: 512 int32 buckets per 256-route chunk,
             # plus two rows of totals and expert offsets (iq2r_moe_aux_gfx950.cu).
@@ -944,14 +1100,16 @@ def iq2r_glm53_moe_out(
     config: IQ2RGlm53Config | None = None,
     shared: IQ2RGlm53Shared | None = None,
 ) -> None:
-    """Routed GLM-5.3 MoE on packed weights: ``output = sum_k w_k * expert_k(x)``,
+    """Routed GLM-5 MoE on packed weights: ``output = sum_k w_k * expert_k(x)``,
     plus ``shared_expert(x)`` when ``shared`` is given (up to 1,024 tokens).
 
-    ``hidden_states`` is BF16 [tokens, 6144]; ``topk_ids``/``topk_weights``
-    are int32/float32 [tokens, 8] over the 256 routed experts; the weights come
-    from :func:`iq2r_glm53_pack`. Routes with an id outside 0..255
-    contribute nothing. ``config`` overrides the tuned launch choice (used by
-    the tuner); it must fit ``tokens``, and ``tokens`` must fit the workspace.
+    The model shape is the workspace's. ``hidden_states`` is BF16
+    [tokens, hidden]; ``topk_ids``/``topk_weights`` are int32/float32
+    [tokens, 8] over the routed experts; the weights come from
+    :func:`iq2r_glm53_pack` (and :func:`iq2r_glm53_pack_shared`) for the
+    same shape. Routes with an id outside the experts contribute nothing.
+    ``config`` overrides the tuned launch choice (used by the tuner); it must
+    fit ``tokens``, and ``tokens`` must fit the workspace.
     """
     # The gate and down kernel bodies are built for gfx950 only and are empty
     # on other targets, which would leave ``output`` unwritten.
@@ -987,20 +1145,27 @@ def iq2r_glm53_moe_out(
         return
     if tokens == 0:
         return
+    shape = workspace.shape
+    if hidden_states.shape[1] != shape.hidden or gate_up_data.shape[0] != shape.experts:
+        raise ValueError(
+            f"{shape.name} IQ2R expects hidden {shape.hidden} and {shape.experts} experts"
+        )
+    if shared is not None and shared.shape != shape:
+        raise ValueError("the shared expert was packed for another model shape")
     if topk_ids.shape != (tokens, TOPK) or topk_weights.shape != (tokens, TOPK):
-        raise ValueError("GLM-5.3 IQ2R expects top-8 routing [tokens, 8]")
+        raise ValueError("GLM-5 IQ2R expects top-8 routing [tokens, 8]")
     if topk_weights.dtype != torch.float32 or not topk_weights.is_contiguous():
         raise ValueError("topk_weights must be contiguous float32")
     if config is None:
         entries = iq2r_glm53_codebook_entries(
             gate_up_auxiliary.shape[1],
             2 * workspace.intermediate_size,
-            HIDDEN,
+            shape.hidden,
             4,
             gate=True,
         )
         config = iq2r_glm53_config(
-            tokens, workspace.intermediate_size, entries, shared is not None
+            tokens, workspace.intermediate_size, entries, shared is not None, shape
         )
         if shared is not None and config.gate_kernel == "prefill":
             # No decode row covers this M: the shared expert runs with the
@@ -1050,8 +1215,8 @@ def iq2r_glm53_moe_out(
     elif config.gate_kernel != "prefill":
         # One launch sorts routes into M32 down / M16 gate tasks and quantizes
         # each token row once; the gate gathers rows through ``gather``.
-        tasks = tasks[: _task_capacity(routes, 32)]
-        gate_tasks = workspace.gate_tasks[: _task_capacity(routes, 16)]
+        tasks = tasks[: _task_capacity(routes, 32, shape.experts)]
+        gate_tasks = workspace.gate_tasks[: _task_capacity(routes, 16, shape.experts)]
         iq2r_glm53_sort_quant_out(
             hidden_states, ids, gather, scatter, tasks, count, quant, quant_scales,
             gate_tasks, workspace.gate_task_count, int(shared is not None),
@@ -1062,7 +1227,7 @@ def iq2r_glm53_moe_out(
             GATE_KERNELS[config.gate_kernel], config.gate_grid, *shared_gate_args,
         )  # fmt: skip
     else:
-        tasks = tasks[: _task_capacity(routes, 64)]
+        tasks = tasks[: _task_capacity(routes, 64, shape.experts)]
         iq2r_glm53_prefill_sort_quant_out(
             hidden_states, ids, gather, scatter, tasks, count, quant, quant_scales,
             workspace.sort_scratch,
@@ -1096,9 +1261,14 @@ def iq2r_glm53_moe_out(
 
 
 __all__ = [
+    "GLM5_NEXT",
+    "GLM53",
+    "IQ2RGlm5Shape",
     "IQ2RGlm53Config",
     "IQ2RGlm53Shared",
     "IQ2RGlm53Workspace",
+    "iq2r_glm5_down_bytes",
+    "iq2r_glm5_shape",
     "iq2r_glm53_aux_bytes",
     "iq2r_glm53_codebook_entries",
     "iq2r_glm53_config",

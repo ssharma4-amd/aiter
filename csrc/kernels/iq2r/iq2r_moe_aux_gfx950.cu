@@ -6,6 +6,7 @@
 #include "aiter_opus_plus.h"
 #include "aiter_stream.h"
 #include "iq2r.h"
+#include "iq2r_glm5_shape.h"
 #include "mx_quant_utils.h"
 #include "quant_amax_floor.h"
 
@@ -17,38 +18,41 @@
 namespace aiter {
 namespace {
 
-constexpr int kThreads     = 256;
 constexpr int kTaskColumns = 3;
 constexpr int kQuantGroup  = 32;
 
-// GLM-5.3 IQ2R-v2 packed MoE routing: 256 routed experts, top-8 ids and
-// weights ([tokens, 8]). Routes keep nine slots per token (route token * 9 +
-// k); slot 8 is the shared expert when it is fused (weight 1), else empty.
-// Sorted, the shared routes follow the routed ones in token order.
-constexpr int kGlm53Experts    = 256;
+// GLM-5 IQ2R-v2 packed MoE routing, per model shape (Glm5MoeShape,
+// iq2r_glm5_shape.h: GLM-5.3's 256 routed experts and hidden 6144,
+// GLM-5.3-Flash's 288 and 4096): top-8 ids and weights ([tokens, 8]). Routes
+// keep nine slots per token (route token * 9 + k); slot 8 is the shared expert
+// when it is fused (weight 1), else empty. Sorted, the shared routes follow the
+// routed ones in token order.
 constexpr int kGlm53TopK       = 8;
 constexpr int kGlm53RouteSlots = 9;
-constexpr int kGlm53Hidden     = 6144;
-constexpr int kGlm53Groups     = kGlm53Hidden / kQuantGroup;
+static_assert(Glm53Shape::HiddenScales == Glm53Shape::Hidden / kQuantGroup);
 
-// Expert id of ``route``; -1 for the empty slot and for ids outside 0..255.
+// Expert id of ``route``; -1 for the empty slot and for ids outside
+// 0..Shape::Experts-1.
+template<class Shape>
 __device__ __forceinline__ int glm53_route_id(const int32_t* ids,int route)
 {
     const int k=route%kGlm53RouteSlots;
     const int id=k<kGlm53TopK?ids[route/kGlm53RouteSlots*kGlm53TopK+k]:-1;
-    return id<kGlm53Experts?id:-1;
+    return id<Shape::Experts?id:-1;
 }
 
 // Prefill route sort in three passes. Each 256-route chunk owns its histogram
 // and ranks; the prefix passes assign disjoint expert ranges before the scatter.
-// Invalid routes (an empty slot 8, ids outside 0..255) share bucket 256.
+// Invalid routes (an empty slot 8, ids outside the experts) share bucket
+// Shape::Experts.
 //
-// Sort scratch, int32 rows of kGlm53SortBuckets buckets (256 experts and the
+// Sort scratch, int32 rows of kGlm53SortBuckets buckets (the experts and the
 // invalid bucket, padded to one 512-thread block): rows 0..chunks-1 hold each
 // chunk's counts, then its exclusive prefix over chunks; row chunks the
 // per-bucket totals; row chunks + 1 each bucket's first sorted route. Hence
 // chunks * 512 + 1024 int32 (iq2r_glm53_prefill_sort_quant_out checks it).
 constexpr int kGlm53SortBuckets = 512;
+template<class Shape>
 __global__ __launch_bounds__(256) void glm53_sort_histogram(
     const int32_t* ids, int32_t* local_ranks, int32_t* histogram, int routes)
 {
@@ -60,8 +64,8 @@ __global__ __launch_bounds__(256) void glm53_sort_histogram(
     const int route=blockIdx.x*256+t;
     if(route<routes)
     {
-        const int id=glm53_route_id(ids,route);
-        local_ranks[route]=atomicAdd(counts+(id>=0?id:kGlm53Experts),1);
+        const int id=glm53_route_id<Shape>(ids,route);
+        local_ranks[route]=atomicAdd(counts+(id>=0?id:Shape::Experts),1);
     }
     __syncthreads();
     histogram[blockIdx.x*kGlm53SortBuckets+t]=counts[t];
@@ -101,6 +105,7 @@ __global__ __launch_bounds__(512) void glm53_sort_chunk_prefix(int32_t* histogra
 
 // Invalid routes get no tasks: they would be skipped anyway, and as the last
 // tasks they would all fall to one XCD in the gate's per-XCD split.
+template<class Shape>
 __global__ __launch_bounds__(512) void glm53_sort_expert_prefix(
     int32_t* histogram,int32_t* tasks,int32_t* task_count,
     int chunks,int task_rows,int task_capacity)
@@ -108,10 +113,10 @@ __global__ __launch_bounds__(512) void glm53_sort_expert_prefix(
 #if defined(__gfx950__)
     __shared__ int waves[8];
     const int expert=threadIdx.x;
-    const int count=expert<=kGlm53Experts?histogram[chunks*kGlm53SortBuckets+expert]:0;
+    const int count=expert<=Shape::Experts?histogram[chunks*kGlm53SortBuckets+expert]:0;
     const int begin=glm53_block_scan(count,waves)-count;
     histogram[chunks*kGlm53SortBuckets+kGlm53SortBuckets+expert]=begin;
-    const int nt=expert<kGlm53Experts?(count+task_rows-1)/task_rows:0;
+    const int nt=expert<Shape::Experts?(count+task_rows-1)/task_rows:0;
     const int task_end=glm53_block_scan(nt,waves);
     if(expert==511)task_count[0]=task_end<=task_capacity?task_end:-1;
     for(int i=0;i<nt;++i)
@@ -127,6 +132,7 @@ __global__ __launch_bounds__(512) void glm53_sort_expert_prefix(
 #endif
 }
 
+template<class Shape>
 __global__ __launch_bounds__(256) void glm53_sort_scatter(
     const int32_t* ids,int32_t* gather,int32_t* scatter,
     const int32_t* histogram,int routes)
@@ -135,8 +141,8 @@ __global__ __launch_bounds__(256) void glm53_sort_scatter(
     const int route=blockIdx.x*256+threadIdx.x;
     if(route<routes)
     {
-        const int id=glm53_route_id(ids,route);
-        const int bucket=id>=0?id:kGlm53Experts;
+        const int id=glm53_route_id<Shape>(ids,route);
+        const int bucket=id>=0?id:Shape::Experts;
         const int rank=scatter[route]+histogram[blockIdx.x*kGlm53SortBuckets+bucket]+
                        histogram[((routes+255)/256)*kGlm53SortBuckets+kGlm53SortBuckets+bucket];
         gather[rank]=route;
@@ -178,7 +184,9 @@ __device__ __forceinline__ uint8_t glm53_quant32(const opus::bf16_t* __restrict_
     return block_scale.byte;
 }
 
-// Quantizes one 32-column group of a token row (group_id = token * 192 + group).
+// Quantizes one 32-column group of a token row (group_id = token *
+// Shape::HiddenScales + group).
+template<class Shape>
 __device__ __forceinline__ void glm53_quant_group(
     const opus::bf16_t* __restrict__ input,
     opus::fp8_t* __restrict__ output,
@@ -187,23 +195,24 @@ __device__ __forceinline__ void glm53_quant_group(
     int input_stride,
     int group_id)
 {
-    if(group_id >= tokens * kGlm53Groups)
+    if(group_id >= tokens * Shape::HiddenScales)
         return;
-    const int token = group_id / kGlm53Groups;
-    const int group = group_id % kGlm53Groups;
+    const int token = group_id / Shape::HiddenScales;
+    const int group = group_id % Shape::HiddenScales;
     glm53_fp8_group quantized;
     const uint8_t scale =
         glm53_quant32(input + static_cast<int64_t>(token) * input_stride + group * kQuantGroup, quantized);
-    *reinterpret_cast<glm53_fp8_group*>(output + static_cast<int64_t>(token) * kGlm53Hidden +
+    *reinterpret_cast<glm53_fp8_group*>(output + static_cast<int64_t>(token) * Shape::Hidden +
                                         group * kQuantGroup) = quantized;
-    scales[static_cast<int64_t>(token) * kGlm53Groups + group] = scale;
+    scales[static_cast<int64_t>(token) * Shape::HiddenScales + group] = scale;
 }
 
+template<class Shape>
 __global__ __launch_bounds__(256) void glm53_quant_kernel(
     const opus::bf16_t* input,opus::fp8_t* output,uint8_t* scales,int tokens,int stride)
 {
 #if defined(__gfx950__)
-    glm53_quant_group(input,output,scales,tokens,stride,
+    glm53_quant_group<Shape>(input,output,scales,tokens,stride,
         static_cast<int>(blockIdx.x)*256+static_cast<int>(threadIdx.x));
 #endif
 }
@@ -213,6 +222,7 @@ __global__ __launch_bounds__(256) void glm53_quant_kernel(
 // and its row copied to every route. Slot 8 gets no task: with the fused shared
 // expert (``shared``) its scatter entry is 8, the gate and down launches run it
 // themselves; otherwise it is empty (scatter -1).
+template<class Shape>
 __global__ __launch_bounds__(256) void glm53_m1_route_quant_kernel(
     const opus::bf16_t* input,const int32_t* ids,int32_t* scatter,int32_t* tasks,
     int32_t* count,opus::fp8_t* output,uint8_t* scales,int shared)
@@ -221,7 +231,7 @@ __global__ __launch_bounds__(256) void glm53_m1_route_quant_kernel(
     const int t=threadIdx.x;
     if(t<kGlm53TopK)
     {
-        const int id=glm53_route_id(ids,t);
+        const int id=glm53_route_id<Shape>(ids,t);
         scatter[t]=id>=0?t:-1;
         tasks[t*kTaskColumns]=t;
         tasks[t*kTaskColumns+1]=1;
@@ -230,22 +240,29 @@ __global__ __launch_bounds__(256) void glm53_m1_route_quant_kernel(
     }
     else if(t<kGlm53RouteSlots)
         scatter[t]=shared?t:-1;
-    if(t>=kGlm53Groups)return;
+    if(t>=Shape::HiddenScales)return;
     glm53_fp8_group quantized;
     const uint8_t scale=glm53_quant32(input+t*kQuantGroup,quantized);
 #pragma unroll
     for(int route=0;route<kGlm53TopK;++route)
     {
-        *reinterpret_cast<glm53_fp8_group*>(output+route*kGlm53Hidden+t*kQuantGroup)=quantized;
-        scales[route*kGlm53Groups+t]=scale;
+        *reinterpret_cast<glm53_fp8_group*>(output+route*Shape::Hidden+t*kQuantGroup)=quantized;
+        scales[route*Shape::HiddenScales+t]=scale;
     }
 #endif
 }
+
+// Threads of the decode sort CTA, at least one per routed expert (the CTAs
+// that quantize use the same block size): 256 for GLM-5.3, 512 for
+// GLM-5.3-Flash's 288 experts.
+template<class Shape>
+constexpr int glm53_sort_threads() { return Shape::Experts <= 256 ? 256 : 512; }
 
 // Decode route sort in one CTA: one thread per routed expert, wave scans for
 // offsets, and two task lists over the same sorted routes: M32 tasks for the
 // down GEMM and M16 tasks for the gate GEMM. Invalid routes are appended after
 // the routed experts with scatter -1 and get no tasks.
+template<class Shape>
 __device__ __forceinline__ void glm53_sort_routes(
     const int32_t* __restrict__ expert_ids,
     int32_t* __restrict__ gather_indices,
@@ -260,81 +277,93 @@ __device__ __forceinline__ void glm53_sort_routes(
     int shared)
 {
     constexpr int task_rows = 32;
-    __shared__ int counts[kGlm53Experts + 1];
-    __shared__ int offsets[kGlm53Experts + 1];
-    __shared__ int cursors[kGlm53Experts + 1];
-    __shared__ int wave_totals[4];
+    constexpr int Experts   = Shape::Experts;
+    constexpr int Threads   = glm53_sort_threads<Shape>();
+    static_assert(Experts <= Threads, "one thread per routed expert");
+    // Threads past the experts own empty buckets; the invalid bucket is Experts
+    // (slot Threads holds it when every thread owns an expert).
+    __shared__ int counts[Threads + 1];
+    __shared__ int offsets[Threads + 1];
+    __shared__ int cursors[Threads + 1];
+    __shared__ int wave_totals[Threads / 64];
     __shared__ int valid_task_count;
 
     const int expert = static_cast<int>(threadIdx.x);
     counts[expert]   = 0;
     if(expert == 0)
-        counts[kGlm53Experts] = 0;
+        counts[Experts] = 0;
     __syncthreads();
 
-    for(int route = expert; route < routes; route += kThreads)
+    for(int route = expert; route < routes; route += Threads)
     {
-        const int id = glm53_route_id(expert_ids, route);
-        atomicAdd(counts + (id >= 0 ? id : kGlm53Experts), 1);
+        const int id = glm53_route_id<Shape>(expert_ids, route);
+        atomicAdd(counts + (id >= 0 ? id : Experts), 1);
     }
     __syncthreads();
 
-    const int count_prefix = glm53_block_scan(counts[expert], wave_totals);
-    offsets[expert]        = count_prefix - counts[expert];
-    cursors[expert]        = offsets[expert];
+    // This thread's expert's route count, read where it is used. Every thread
+    // owns an expert when Experts == Threads (GLM-5.3).
+    const bool owns_expert = Experts == Threads || expert < Experts;
+    const auto own_count   = [&] { return owns_expert ? counts[expert] : 0; };
+    const int count_prefix = glm53_block_scan(own_count(), wave_totals);
+    if(owns_expert)
+    {
+        offsets[expert] = count_prefix - own_count();
+        cursors[expert] = offsets[expert];
+    }
     // The shared routes (counted with the invalid ones) take the first
     // tokens rows after the routed ones; they get no tasks.
     const int shared_routes = shared ? routes / kGlm53RouteSlots : 0;
-    if(expert == kGlm53Experts - 1)
+    if(expert == Experts - 1)
     {
-        offsets[kGlm53Experts] = count_prefix;
-        cursors[kGlm53Experts] = count_prefix + shared_routes;
+        offsets[Experts] = count_prefix;
+        cursors[Experts] = count_prefix + shared_routes;
     }
     __syncthreads();
 
-    for(int route = expert; route < routes; route += kThreads)
+    for(int route = expert; route < routes; route += Threads)
     {
-        const int id = glm53_route_id(expert_ids, route);
+        const int id = glm53_route_id<Shape>(expert_ids, route);
         if(shared && route % kGlm53RouteSlots == kGlm53TopK)
         {
-            const int sorted_route       = offsets[kGlm53Experts] + route / kGlm53RouteSlots;
+            const int sorted_route       = offsets[Experts] + route / kGlm53RouteSlots;
             gather_indices[sorted_route] = route;
             scatter_indices[route]       = sorted_route;
             continue;
         }
-        const int sorted_route       = atomicAdd(cursors + (id >= 0 ? id : kGlm53Experts), 1);
+        const int sorted_route       = atomicAdd(cursors + (id >= 0 ? id : Experts), 1);
         gather_indices[sorted_route] = route;
         scatter_indices[route]       = id >= 0 ? sorted_route : -1;
     }
     __syncthreads();
 
-    const int local_tasks = (counts[expert] + task_rows - 1) / task_rows;
-    // Each task prefix fits in 16 bits: at most 1024*8/16 + 256 = 768 gate tasks. Summing the packed pair
+    const int local_tasks = (own_count() + task_rows - 1) / task_rows;
+    // Each task prefix fits in 16 bits: at most 1024*8/16 + 288 = 800 gate tasks. Summing the packed pair
     // cannot carry from the low field to the high.
-    const int local_gate_tasks=(counts[expert]+15)/16;
+    const int local_gate_tasks=(own_count()+15)/16;
     const int packed_prefix=glm53_block_scan(local_tasks+(local_gate_tasks<<16),wave_totals);
     const int task_prefix=packed_prefix&65535;
     const int gate_begin=(packed_prefix>>16)-local_gate_tasks;
     const int task_begin  = task_prefix - local_tasks;
     int task              = task_begin;
-    for(int local = 0; local < counts[expert]; local += task_rows, ++task)
+    for(int local = 0; local < own_count(); local += task_rows, ++task)
     {
         if(task < task_capacity)
         {
             tasks[task * kTaskColumns]     = offsets[expert] + local;
-            tasks[task * kTaskColumns + 1] = min(task_rows, counts[expert] - local);
+            tasks[task * kTaskColumns + 1] = min(task_rows, own_count() - local);
             tasks[task * kTaskColumns + 2] = expert;
         }
     }
-    for(int local=0,t=gate_begin;local<counts[expert];local+=16,++t)
+    for(int local=0,t=gate_begin;local<own_count();local+=16,++t)
     {
         if(t<gate_capacity) {
             gate_tasks[t*kTaskColumns]=offsets[expert]+local;
-            gate_tasks[t*kTaskColumns+1]=min(16,counts[expert]-local);
+            gate_tasks[t*kTaskColumns+1]=min(16,own_count()-local);
             gate_tasks[t*kTaskColumns+2]=expert;
         }
     }
-    if(expert == kGlm53Experts - 1)
+    if(expert == Experts - 1)
         valid_task_count=packed_prefix;
     __syncthreads();
 
@@ -348,7 +377,8 @@ __device__ __forceinline__ void glm53_sort_routes(
 
 // CTA 0 sorts the routes while the other CTAs quantize each token once; the
 // gate GEMM gathers token rows through the sorted route order.
-__global__ __launch_bounds__(256) void glm53_sort_quant_kernel(
+template<class Shape>
+__global__ __launch_bounds__(glm53_sort_threads<Shape>()) void glm53_sort_quant_kernel(
     const opus::bf16_t* input,const int32_t* ids,
     int32_t* gather,int32_t* scatter,int32_t* tasks,int32_t* count,
     opus::fp8_t* output,uint8_t* scales,int tokens,int stride,int capacity,int32_t* gate_tasks,int32_t* gate_count,int gate_capacity,
@@ -356,16 +386,18 @@ __global__ __launch_bounds__(256) void glm53_sort_quant_kernel(
 {
 #if defined(__gfx950__)
     if(blockIdx.x==0)
-        glm53_sort_routes(ids,gather,scatter,tasks,count,
+        glm53_sort_routes<Shape>(ids,gather,scatter,tasks,count,
             tokens*kGlm53RouteSlots,capacity,gate_tasks,gate_count,gate_capacity,shared);
     else
-        glm53_quant_group(input,output,scales,tokens,stride,
-            (static_cast<int>(blockIdx.x)-1)*256+static_cast<int>(threadIdx.x));
+        glm53_quant_group<Shape>(input,output,scales,tokens,stride,
+            (static_cast<int>(blockIdx.x)-1)*glm53_sort_threads<Shape>()+static_cast<int>(threadIdx.x));
 #endif
 }
 
 // Weighted top-8 sum: one wave owns 512 columns; one FP32 FMA per route in
-// route order, then one BF16 rounding.
+// route order, then one BF16 rounding. Route outputs are [routes,
+// Shape::DownRows]; the columns past Hidden are padding.
+template<class Shape>
 __global__ __launch_bounds__(64) void glm53_route_reduce_kernel(
     const __hip_bfloat16* __restrict__ route_output,
     const float* __restrict__ route_weights,const int32_t* __restrict__ scatter,
@@ -373,7 +405,7 @@ __global__ __launch_bounds__(64) void glm53_route_reduce_kernel(
 {
 #if defined(__gfx950__)
     constexpr int Items=8,Batch=3;
-    constexpr int Columns=64*Items,Tiles=kGlm53Hidden/Columns;
+    constexpr int Columns=64*Items,Tiles=Shape::Hidden/Columns;
     const int token=blockIdx.x/Tiles,tile=blockIdx.x%Tiles,lane=threadIdx.x;
     if(token>=tokens)return;
     const int column=tile*Columns+lane*Items;
@@ -391,7 +423,7 @@ __global__ __launch_bounds__(64) void glm53_route_reduce_kernel(
 #pragma unroll
         for(int i=0;i<Batch;++i)
             if(rows[first+i]>=0)
-                reinterpret_cast<uint4*>(packed[i])[0]=reinterpret_cast<const uint4*>(route_output+static_cast<int64_t>(rows[first+i])*kGlm53Hidden+column)[0];
+                reinterpret_cast<uint4*>(packed[i])[0]=reinterpret_cast<const uint4*>(route_output+static_cast<int64_t>(rows[first+i])*Shape::DownRows+column)[0];
         // Explicit register operands keep every independent load before conversion.
         asm volatile("" : "+v"(packed[0][0]),"+v"(packed[0][1]),"+v"(packed[1][0]),"+v"(packed[1][1]),"+v"(packed[2][0]),"+v"(packed[2][1]));
 #pragma unroll
@@ -412,13 +444,26 @@ __global__ __launch_bounds__(64) void glm53_route_reduce_kernel(
     opus::vector_t<opus::bf16_t,Items> result;
 #pragma unroll
     for(int i=0;i<Items;++i)result[i]=__builtin_bit_cast(opus::bf16_t,__float2bfloat16(acc[i]));
-    reinterpret_cast<uint4*>(output+static_cast<int64_t>(token)*kGlm53Hidden+column)[0]=reinterpret_cast<uint4*>(&result)[0];
+    reinterpret_cast<uint4*>(output+static_cast<int64_t>(token)*Shape::Hidden+column)[0]=reinterpret_cast<uint4*>(&result)[0];
 #endif
 }
 
 } // namespace
 
 namespace {
+
+// Calls f(Shape{}) for the model (Glm5MoeShape) whose hidden size is
+// ``hidden``: 6144 for GLM-5.3, 4096 for GLM-5.3-Flash.
+template<class F>
+void glm5_with_shape(int64_t hidden, F&& f)
+{
+    if(hidden == Glm53Shape::Hidden)
+        f(Glm53Shape{});
+    else if(hidden == Glm5NextShape::Hidden)
+        f(Glm5NextShape{});
+    else
+        AITER_CHECK(false, "GLM-5 IQ2R supports hidden 6144 (GLM-5.3) or 4096 (GLM-5.3-Flash), got ", hidden);
+}
 
 void glm53_check_routes(std::initializer_list<const aiter_tensor_t*> tensors,
                         int device,
@@ -435,11 +480,12 @@ void glm53_check_task_table(const aiter_tensor_t& tasks,
                             const aiter_tensor_t& task_count,
                             int device,
                             int64_t routes,
-                            int64_t rows)
+                            int64_t rows,
+                            int64_t experts)
 {
     AITER_CHECK(tasks.is_gpu() && tasks.device_id == device && tasks.is_contiguous() &&
                     tasks.dtype() == AITER_DTYPE_i32 && tasks.dim() == 2 && tasks.size(1) == 3 &&
-                    tasks.size(0) >= (routes + rows - 1) / rows + std::min<int64_t>(routes, kGlm53Experts),
+                    tasks.size(0) >= (routes + rows - 1) / rows + std::min<int64_t>(routes, experts),
                 "GLM-5.3 IQ2R task table is too small");
     AITER_CHECK(task_count.is_gpu() && task_count.device_id == device &&
                     task_count.dtype() == AITER_DTYPE_i32 && task_count.numel() == 1,
@@ -448,13 +494,14 @@ void glm53_check_task_table(const aiter_tensor_t& tasks,
 
 void glm53_check_input(const aiter_tensor_t& input, int64_t min_tokens, int64_t max_tokens)
 {
+    // The hidden size picks the model (glm5_with_shape).
     AITER_CHECK(input.is_gpu() && input.dtype() == AITER_DTYPE_bf16 && input.dim() == 2 &&
-                    input.size(1) == kGlm53Hidden && input.is_contiguous() &&
-                    input.size(0) >= min_tokens && input.size(0) <= max_tokens,
-                "GLM-5.3 IQ2R input must be contiguous BF16 [tokens, 6144] with a supported "
+                    input.is_contiguous() && input.size(0) >= min_tokens && input.size(0) <= max_tokens,
+                "GLM-5 IQ2R input must be contiguous BF16 [tokens, hidden] with a supported "
                 "token count");
 }
 
+template<class Shape>
 void glm53_check_quant_output(const aiter_tensor_t& output,
                               const aiter_tensor_t& scales,
                               int device,
@@ -462,12 +509,12 @@ void glm53_check_quant_output(const aiter_tensor_t& output,
 {
     AITER_CHECK(output.is_gpu() && output.device_id == device && output.is_contiguous() &&
                     output.dtype() == AITER_DTYPE_fp8 && output.dim() == 2 &&
-                    output.size(0) == rows && output.size(1) == kGlm53Hidden,
-                "GLM-5.3 IQ2R quantized input must be FP8 [rows, 6144]");
+                    output.size(0) == rows && output.size(1) == Shape::Hidden,
+                "GLM-5 IQ2R quantized input must be FP8 [rows, hidden]");
     AITER_CHECK(scales.is_gpu() && scales.device_id == device && scales.is_contiguous() &&
                     scales.dtype() == AITER_DTYPE_u8 && scales.dim() == 2 &&
-                    scales.size(0) == rows && scales.size(1) == kGlm53Groups,
-                "GLM-5.3 IQ2R input scales must be uint8 [rows, 192]");
+                    scales.size(0) == rows && scales.size(1) == Shape::HiddenScales,
+                "GLM-5 IQ2R input scales must be uint8 [rows, hidden / 32]");
 }
 
 } // namespace
@@ -494,23 +541,26 @@ void iq2r_glm53_m1_route_quant_out(const aiter_tensor_t& input,
                     task_count.is_gpu() && task_count.device_id == device &&
                     task_count.dtype() == AITER_DTYPE_i32 && task_count.numel() == 1,
                 "GLM-5.3 IQ2R M1 tasks must be int32 [>=9, 3] with one int32 count");
-    glm53_check_quant_output(output, scales, device, kGlm53RouteSlots);
+    glm5_with_shape(input.size(1), [&](auto shape) {
+        using Shape = decltype(shape);
+        glm53_check_quant_output<Shape>(output, scales, device, kGlm53RouteSlots);
 
-    HipDeviceGuard device_guard(device);
-    hipLaunchKernelGGL(glm53_m1_route_quant_kernel,
-                       dim3(1),
-                       dim3(256),
-                       0,
-                       getCurrentHIPStream(),
-                       static_cast<const opus::bf16_t*>(input.data_ptr()),
-                       static_cast<const int32_t*>(topk_ids.data_ptr()),
-                       static_cast<int32_t*>(scatter_indices.data_ptr()),
-                       static_cast<int32_t*>(tasks.data_ptr()),
-                       static_cast<int32_t*>(task_count.data_ptr()),
-                       static_cast<opus::fp8_t*>(output.data_ptr()),
-                       static_cast<uint8_t*>(scales.data_ptr()),
-                       static_cast<int>(shared != 0));
-    HIP_CALL_LAUNCH(hipGetLastError());
+        HipDeviceGuard device_guard(device);
+        hipLaunchKernelGGL(glm53_m1_route_quant_kernel<Shape>,
+                           dim3(1),
+                           dim3(256),
+                           0,
+                           getCurrentHIPStream(),
+                           static_cast<const opus::bf16_t*>(input.data_ptr()),
+                           static_cast<const int32_t*>(topk_ids.data_ptr()),
+                           static_cast<int32_t*>(scatter_indices.data_ptr()),
+                           static_cast<int32_t*>(tasks.data_ptr()),
+                           static_cast<int32_t*>(task_count.data_ptr()),
+                           static_cast<opus::fp8_t*>(output.data_ptr()),
+                           static_cast<uint8_t*>(scales.data_ptr()),
+                           static_cast<int>(shared != 0));
+        HIP_CALL_LAUNCH(hipGetLastError());
+    });
 }
 
 // Decode front end for 2..1024 tokens: block 0 sorts the 9 route slots per token
@@ -535,32 +585,36 @@ void iq2r_glm53_sort_quant_out(const aiter_tensor_t& input,
     const int64_t routes = static_cast<int64_t>(tokens) * kGlm53RouteSlots;
     glm53_check_routes({&topk_ids}, device, static_cast<int64_t>(tokens) * kGlm53TopK);
     glm53_check_routes({&gather_indices, &scatter_indices}, device, routes);
-    glm53_check_task_table(tasks, task_count, device, routes, 32);
-    glm53_check_task_table(gate_tasks, gate_task_count, device, routes, 16);
-    glm53_check_quant_output(output, scales, device, tokens);
+    glm5_with_shape(input.size(1), [&](auto shape) {
+        using Shape = decltype(shape);
+        constexpr int threads = glm53_sort_threads<Shape>();
+        glm53_check_task_table(tasks, task_count, device, routes, 32, Shape::Experts);
+        glm53_check_task_table(gate_tasks, gate_task_count, device, routes, 16, Shape::Experts);
+        glm53_check_quant_output<Shape>(output, scales, device, tokens);
 
-    HipDeviceGuard device_guard(device);
-    hipLaunchKernelGGL(glm53_sort_quant_kernel,
-                       dim3(1 + (tokens * kGlm53Groups + 255) / 256),
-                       dim3(256),
-                       0,
-                       getCurrentHIPStream(),
-                       static_cast<const opus::bf16_t*>(input.data_ptr()),
-                       static_cast<const int32_t*>(topk_ids.data_ptr()),
-                       static_cast<int32_t*>(gather_indices.data_ptr()),
-                       static_cast<int32_t*>(scatter_indices.data_ptr()),
-                       static_cast<int32_t*>(tasks.data_ptr()),
-                       static_cast<int32_t*>(task_count.data_ptr()),
-                       static_cast<opus::fp8_t*>(output.data_ptr()),
-                       static_cast<uint8_t*>(scales.data_ptr()),
-                       tokens,
-                       static_cast<int>(input.stride(0)),
-                       static_cast<int>(tasks.size(0)),
-                       static_cast<int32_t*>(gate_tasks.data_ptr()),
-                       static_cast<int32_t*>(gate_task_count.data_ptr()),
-                       static_cast<int>(gate_tasks.size(0)),
-                       static_cast<int>(shared != 0));
-    HIP_CALL_LAUNCH(hipGetLastError());
+        HipDeviceGuard device_guard(device);
+        hipLaunchKernelGGL(glm53_sort_quant_kernel<Shape>,
+                           dim3(1 + (tokens * Shape::HiddenScales + threads - 1) / threads),
+                           dim3(threads),
+                           0,
+                           getCurrentHIPStream(),
+                           static_cast<const opus::bf16_t*>(input.data_ptr()),
+                           static_cast<const int32_t*>(topk_ids.data_ptr()),
+                           static_cast<int32_t*>(gather_indices.data_ptr()),
+                           static_cast<int32_t*>(scatter_indices.data_ptr()),
+                           static_cast<int32_t*>(tasks.data_ptr()),
+                           static_cast<int32_t*>(task_count.data_ptr()),
+                           static_cast<opus::fp8_t*>(output.data_ptr()),
+                           static_cast<uint8_t*>(scales.data_ptr()),
+                           tokens,
+                           static_cast<int>(input.stride(0)),
+                           static_cast<int>(tasks.size(0)),
+                           static_cast<int32_t*>(gate_tasks.data_ptr()),
+                           static_cast<int32_t*>(gate_task_count.data_ptr()),
+                           static_cast<int>(gate_tasks.size(0)),
+                           static_cast<int>(shared != 0));
+        HIP_CALL_LAUNCH(hipGetLastError());
+    });
 }
 
 // Prefill front end for 2..4096 tokens. Route sort: per-chunk expert
@@ -584,48 +638,51 @@ void iq2r_glm53_prefill_sort_quant_out(const aiter_tensor_t& input,
     const int64_t routes    = static_cast<int64_t>(tokens) * kGlm53RouteSlots;
     glm53_check_routes({&topk_ids}, device, static_cast<int64_t>(tokens) * kGlm53TopK);
     glm53_check_routes({&gather_indices, &scatter_indices}, device, routes);
-    glm53_check_task_table(tasks, task_count, device, routes, kTaskRows);
-    glm53_check_quant_output(output, scales, device, tokens);
-    const int chunks = static_cast<int>((routes + 255) / 256);
-    AITER_CHECK(scratch.is_gpu() && scratch.device_id == device && scratch.is_contiguous() &&
-                    scratch.dtype() == AITER_DTYPE_i32 &&
-                    scratch.numel() >= static_cast<int64_t>(chunks + 2) * kGlm53SortBuckets,
-                "GLM-5.3 IQ2R sort scratch is too small");
+    glm5_with_shape(input.size(1), [&](auto shape) {
+        using Shape = decltype(shape);
+        glm53_check_task_table(tasks, task_count, device, routes, kTaskRows, Shape::Experts);
+        glm53_check_quant_output<Shape>(output, scales, device, tokens);
+        const int chunks = static_cast<int>((routes + 255) / 256);
+        AITER_CHECK(scratch.is_gpu() && scratch.device_id == device && scratch.is_contiguous() &&
+                        scratch.dtype() == AITER_DTYPE_i32 &&
+                        scratch.numel() >= static_cast<int64_t>(chunks + 2) * kGlm53SortBuckets,
+                    "GLM-5 IQ2R sort scratch is too small");
 
-    HipDeviceGuard device_guard(device);
-    const auto stream = getCurrentHIPStream();
-    const auto* ids   = static_cast<const int32_t*>(topk_ids.data_ptr());
-    auto* gather      = static_cast<int32_t*>(gather_indices.data_ptr());
-    auto* scatter     = static_cast<int32_t*>(scatter_indices.data_ptr());
-    auto* histogram   = static_cast<int32_t*>(scratch.data_ptr());
-    const int count   = static_cast<int>(routes);
-    hipLaunchKernelGGL(glm53_sort_histogram, dim3(chunks), dim3(256), 0, stream, ids, scatter, histogram, count);
-    // One block per bucket: 256 experts and the invalid routes.
-    hipLaunchKernelGGL(
-        glm53_sort_chunk_prefix, dim3(kGlm53Experts + 1), dim3(512), 0, stream, histogram, chunks);
-    hipLaunchKernelGGL(glm53_sort_expert_prefix,
-                       dim3(1),
-                       dim3(512),
-                       0,
-                       stream,
-                       histogram,
-                       static_cast<int32_t*>(tasks.data_ptr()),
-                       static_cast<int32_t*>(task_count.data_ptr()),
-                       chunks,
-                       kTaskRows,
-                       static_cast<int>(tasks.size(0)));
-    hipLaunchKernelGGL(glm53_sort_scatter, dim3(chunks), dim3(256), 0, stream, ids, gather, scatter, histogram, count);
-    hipLaunchKernelGGL(glm53_quant_kernel,
-                       dim3((tokens * kGlm53Groups + 255) / 256),
-                       dim3(256),
-                       0,
-                       stream,
-                       static_cast<const opus::bf16_t*>(input.data_ptr()),
-                       static_cast<opus::fp8_t*>(output.data_ptr()),
-                       static_cast<uint8_t*>(scales.data_ptr()),
-                       tokens,
-                       static_cast<int>(input.stride(0)));
-    HIP_CALL_LAUNCH(hipGetLastError());
+        HipDeviceGuard device_guard(device);
+        const auto stream = getCurrentHIPStream();
+        const auto* ids   = static_cast<const int32_t*>(topk_ids.data_ptr());
+        auto* gather      = static_cast<int32_t*>(gather_indices.data_ptr());
+        auto* scatter     = static_cast<int32_t*>(scatter_indices.data_ptr());
+        auto* histogram   = static_cast<int32_t*>(scratch.data_ptr());
+        const int count   = static_cast<int>(routes);
+        hipLaunchKernelGGL(glm53_sort_histogram<Shape>, dim3(chunks), dim3(256), 0, stream, ids, scatter, histogram, count);
+        // One block per bucket: the experts and the invalid routes.
+        hipLaunchKernelGGL(
+            glm53_sort_chunk_prefix, dim3(Shape::Experts + 1), dim3(512), 0, stream, histogram, chunks);
+        hipLaunchKernelGGL(glm53_sort_expert_prefix<Shape>,
+                           dim3(1),
+                           dim3(512),
+                           0,
+                           stream,
+                           histogram,
+                           static_cast<int32_t*>(tasks.data_ptr()),
+                           static_cast<int32_t*>(task_count.data_ptr()),
+                           chunks,
+                           kTaskRows,
+                           static_cast<int>(tasks.size(0)));
+        hipLaunchKernelGGL(glm53_sort_scatter<Shape>, dim3(chunks), dim3(256), 0, stream, ids, gather, scatter, histogram, count);
+        hipLaunchKernelGGL(glm53_quant_kernel<Shape>,
+                           dim3((tokens * Shape::HiddenScales + 255) / 256),
+                           dim3(256),
+                           0,
+                           stream,
+                           static_cast<const opus::bf16_t*>(input.data_ptr()),
+                           static_cast<opus::fp8_t*>(output.data_ptr()),
+                           static_cast<uint8_t*>(scales.data_ptr()),
+                           tokens,
+                           static_cast<int>(input.stride(0)));
+        HIP_CALL_LAUNCH(hipGetLastError());
+    });
 }
 
 void iq2r_glm53_route_reduce_out(const aiter_tensor_t& route_output,
@@ -635,34 +692,38 @@ void iq2r_glm53_route_reduce_out(const aiter_tensor_t& route_output,
 {
     iq2r_check_gfx950();
     const int device = output.device_id;
+    // The output's hidden size picks the model (glm5_with_shape).
     AITER_CHECK(output.is_gpu() && output.dtype() == AITER_DTYPE_bf16 && output.dim() == 2 &&
-                    output.size(1) == kGlm53Hidden && output.is_contiguous(),
-                "GLM-5.3 IQ2R reduce output must be contiguous BF16 [tokens, 6144]");
-    const int tokens     = static_cast<int>(output.size(0));
-    const int64_t routes = static_cast<int64_t>(tokens) * kGlm53RouteSlots;
-    AITER_CHECK(route_output.is_gpu() && route_output.device_id == device &&
-                    route_output.dtype() == AITER_DTYPE_bf16 && route_output.is_contiguous() &&
-                    route_output.dim() == 2 && route_output.size(0) == routes &&
-                    route_output.size(1) == kGlm53Hidden,
-                "GLM-5.3 IQ2R route output must be contiguous BF16 [tokens * 9, 6144]");
-    AITER_CHECK(route_weights.is_gpu() && route_weights.device_id == device &&
-                    route_weights.dtype() == AITER_DTYPE_fp32 && route_weights.is_contiguous() &&
-                    route_weights.numel() == static_cast<int64_t>(tokens) * kGlm53TopK,
-                "GLM-5.3 IQ2R route weights must be contiguous FP32 [tokens, 8]");
-    glm53_check_routes({&scatter_indices}, device, routes);
+                    output.is_contiguous(),
+                "GLM-5 IQ2R reduce output must be contiguous BF16 [tokens, hidden]");
+    glm5_with_shape(output.size(1), [&](auto shape) {
+        using Shape = decltype(shape);
+        const int tokens     = static_cast<int>(output.size(0));
+        const int64_t routes = static_cast<int64_t>(tokens) * kGlm53RouteSlots;
+        AITER_CHECK(route_output.is_gpu() && route_output.device_id == device &&
+                        route_output.dtype() == AITER_DTYPE_bf16 && route_output.is_contiguous() &&
+                        route_output.dim() == 2 && route_output.size(0) == routes &&
+                        route_output.size(1) == Shape::DownRows,
+                    "GLM-5 IQ2R route output must be contiguous BF16 [tokens * 9, down rows]");
+        AITER_CHECK(route_weights.is_gpu() && route_weights.device_id == device &&
+                        route_weights.dtype() == AITER_DTYPE_fp32 && route_weights.is_contiguous() &&
+                        route_weights.numel() == static_cast<int64_t>(tokens) * kGlm53TopK,
+                    "GLM-5.3 IQ2R route weights must be contiguous FP32 [tokens, 8]");
+        glm53_check_routes({&scatter_indices}, device, routes);
 
-    HipDeviceGuard device_guard(device);
-    hipLaunchKernelGGL(glm53_route_reduce_kernel,
-                       dim3(tokens * (kGlm53Hidden / 512)),
-                       dim3(64),
-                       0,
-                       getCurrentHIPStream(),
-                       static_cast<const __hip_bfloat16*>(route_output.data_ptr()),
-                       static_cast<const float*>(route_weights.data_ptr()),
-                       static_cast<const int32_t*>(scatter_indices.data_ptr()),
-                       static_cast<__hip_bfloat16*>(output.data_ptr()),
-                       tokens);
-    HIP_CALL_LAUNCH(hipGetLastError());
+        HipDeviceGuard device_guard(device);
+        hipLaunchKernelGGL(glm53_route_reduce_kernel<Shape>,
+                           dim3(tokens * (Shape::Hidden / 512)),
+                           dim3(64),
+                           0,
+                           getCurrentHIPStream(),
+                           static_cast<const __hip_bfloat16*>(route_output.data_ptr()),
+                           static_cast<const float*>(route_weights.data_ptr()),
+                           static_cast<const int32_t*>(scatter_indices.data_ptr()),
+                           static_cast<__hip_bfloat16*>(output.data_ptr()),
+                           tokens);
+        HIP_CALL_LAUNCH(hipGetLastError());
+    });
 }
 
 } // namespace aiter

@@ -9,9 +9,10 @@ from torch import Tensor
 
 from ..jit.core import compile_ops
 
-# GLM-5.3 packed-layout MoE stages (TP4/TP8, 256 routed experts, top-8,
-# hidden 6144).  Shapes are validated natively; see
-# ``aiter.iq2r_glm53`` for the orchestration and tuned dispatch.
+# GLM-5 packed-layout MoE stages (TP4/TP8, top-8): GLM-5.3 (hidden 6144,
+# 256 routed experts) and GLM-5.3-Flash (hidden 4096, 288 routed experts).
+# Shapes are validated natively; see ``aiter.iq2r_glm53`` for the
+# orchestration and tuned dispatch.
 
 
 @compile_ops("module_iq2r_moe", fc_name="iq2r_glm53_m1_route_quant_out", develop=True)
