@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Compile a block-FP8 GLM-5.3 checkpoint into the packed IQ2R-v2 checkpoint.
+"""Compile a block-FP8 GLM-5.3 or GLM-5.3-Flash checkpoint into packed IQ2R-v2.
 
-For each MoE layer the 256 routed experts are encoded in IQ2R-v2
-(``aiter/ops/iq2r_v2.py``) on the GPU, packed with
+For each MoE layer the routed experts (GLM-5.3: 256, GLM-5.3-Flash
+``glm5_next``: 288) are encoded in IQ2R-v2 (``aiter/ops/iq2r_v2.py``) on the
+GPU, packed for the model's kernel shape with
 ``aiter.iq2r_glm53.iq2r_glm53_pack`` and written as
-``iq2r-layer-NNNN-{gate-up,down}.safetensors``. The shared expert and the MTP
+``iq2r-layer-NNNN-{gate-up,down}.safetensors``. GLM-5.3-Flash's layers sit
+under ``model.language_model.``, and its packed down rows are padded from
+4,096 to 4,608 with zero weights (layouts ``glm5next-packed-v2``/``-v3``). The shared expert and the MTP
 layer keep their block-FP8 weights. A run over every MoE layer then copies the
 remaining FP8 tensors into new shards and writes the index, config.json and
 tokenizer files, so the output directory is a complete checkpoint.
@@ -60,9 +63,11 @@ from safetensors.torch import save_file
 from torch import Tensor
 
 from aiter.iq2r_glm53 import (
-    EXPERTS,
-    HIDDEN,
+    GLM5_NEXT,
+    GLM53,
     TOPK,
+    IQ2RGlm5Shape,
+    iq2r_glm5_down_bytes,
     iq2r_glm53_aux_bytes,
     iq2r_glm53_gate_bytes,
     iq2r_glm53_pack,
@@ -95,6 +100,7 @@ _TARGET_PATTERN = re.compile(
 LAYOUT = "glm53-packed-v2"
 # Layout of a checkpoint per codebook size.
 LAYOUTS = {512: LAYOUT, 1024: "glm53-packed-v3"}
+GLM5_NEXT_LAYOUTS = {512: "glm5next-packed-v2", 1024: "glm5next-packed-v3"}
 # The recipe: the kernels' level set, the reconstruction gain <W, Wq> / <W, W>,
 # the routed-token count below which an expert's importance falls back to its
 # weight energy, and the codebook learner's rounds and sample size.
@@ -112,10 +118,18 @@ _DEVICE = "cuda:0"
 # The serving kernels are built for this shape. ATOM slices the 2048-wide
 # experts into the TP4 (512) and TP8 (256) shards they cover.
 _GLM53_SHAPE = {
-    "hidden_size": HIDDEN,
+    "hidden_size": GLM53.hidden,
     "moe_intermediate_size": 2048,
-    "n_routed_experts": EXPERTS,
+    "n_routed_experts": GLM53.experts,
     "num_experts_per_tok": TOPK,
+}
+# GLM-5.3-Flash (glm5_next): fields under text_config; SwiGLU clamped at 10.
+_GLM5_NEXT_SHAPE = {
+    "hidden_size": GLM5_NEXT.hidden,
+    "moe_intermediate_size": 2048,
+    "n_routed_experts": GLM5_NEXT.experts,
+    "num_experts_per_tok": TOPK,
+    "swiglu_limit": GLM5_NEXT.swiglu_limit,
 }
 _SHARD_BYTES = 5 << 30
 _PROJECTIONS = {"gate_up": "gate-up", "down": "down"}
@@ -124,12 +138,16 @@ _MODEL_FILES = (
     "tokenizer.json",
     "tokenizer_config.json",
     "chat_template.jinja",
+    "processor_config.json",
     "LICENSE",
 )
 
 
-def iq2r_compiled_tensor_keys(layer_index: int, projection: str) -> dict[str, str]:
-    """Return the checkpoint keys for one stacked projection."""
+def iq2r_compiled_tensor_keys(
+    layer_index: int, projection: str, prefix: str = "model."
+) -> dict[str, str]:
+    """Return the checkpoint keys for one stacked projection (``prefix``: the
+    decoder layers' checkpoint prefix)."""
 
     if projection == "gate_up":
         module_name = "up_gate_proj"
@@ -137,7 +155,7 @@ def iq2r_compiled_tensor_keys(layer_index: int, projection: str) -> dict[str, st
         module_name = "down_proj"
     else:
         raise ValueError(f"projection must be 'gate_up' or 'down', got {projection!r}")
-    prefix = f"model.layers.{layer_index}.mlp.{module_name}.0"
+    prefix = f"{prefix}layers.{layer_index}.mlp.{module_name}.0"
     return {
         "data": f"{prefix}.iq2r_data",
         "auxiliary": f"{prefix}.iq2r_auxiliary",
@@ -149,10 +167,12 @@ def _layer_file(layer: int, projection: str) -> str:
     return f"iq2r-layer-{layer:04d}-{_PROJECTIONS[projection]}.safetensors"
 
 
-def iq2r_glm5_source_keys(layer_index: int, expert_index: int) -> dict[str, str]:
+def iq2r_glm5_source_keys(
+    layer_index: int, expert_index: int, prefix: str = "model."
+) -> dict[str, str]:
     """Return GLM-5 block-FP8 source keys for one routed expert."""
 
-    prefix = f"model.layers.{layer_index}.mlp.experts.{expert_index}"
+    prefix = f"{prefix}layers.{layer_index}.mlp.experts.{expert_index}"
     return {
         f"{projection}_{kind}": f"{prefix}.{projection}.{kind}"
         for projection in ("gate_proj", "up_proj", "down_proj")
@@ -185,10 +205,18 @@ class GLM5Layout:
     intermediate_size: int
     block_n: int
     block_k: int
+    # The kernels' model shape, the decoder layers' checkpoint prefix and the
+    # layout name per codebook size.
+    shape: IQ2RGlm5Shape = GLM53
+    prefix: str = "model."
+    layouts: tuple[tuple[int, str], ...] = tuple(LAYOUTS.items())
 
     @property
     def moe_layers(self) -> int:
         return self.layer_count - self.first_moe_layer
+
+    def layout_name(self, entries: int) -> str:
+        return dict(self.layouts)[entries]
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,17 +247,36 @@ class GLM5Importance:
 
 
 def glm5_source_layout(config: dict[str, Any]) -> GLM5Layout:
-    """Return the checkpoint layout for GLM-5.3."""
+    """Return the checkpoint layout for GLM-5.3 or GLM-5.3-Flash."""
 
     architectures = config.get("architectures") or []
-    if not (
-        config.get("model_type") == "glm_moe_dsa"
-        or any(
-            isinstance(name, str) and name.startswith("GlmMoeDsa")
+
+    def is_model(model_type: str, architecture: str) -> bool:
+        return config.get("model_type") == model_type or any(
+            isinstance(name, str) and name.startswith(architecture)
             for name in architectures
         )
-    ):
-        raise ValueError("IQ2R GLM compiler requires a GLM MoE DSA checkpoint")
+
+    if is_model("glm5_next", "Glm5Next"):
+        # The text model's fields sit under text_config; quantization_config
+        # stays at the top level.
+        text = config.get("text_config")
+        if not isinstance(text, dict):
+            raise ValueError("GLM-5.3-Flash config has no text_config object")
+        model = (
+            GLM5_NEXT,
+            "model.language_model.",
+            GLM5_NEXT_LAYOUTS,
+            _GLM5_NEXT_SHAPE,
+        )
+    elif is_model("glm_moe_dsa", "GlmMoeDsa"):
+        text = config
+        model = (GLM53, "model.", LAYOUTS, _GLM53_SHAPE)
+    else:
+        raise ValueError(
+            "IQ2R GLM compiler requires a GLM MoE DSA or GLM-5.3-Flash checkpoint"
+        )
+    shape, prefix, layouts, fields = model
     quantization = config.get("quantization_config")
     if not isinstance(quantization, dict) or quantization.get("quant_method") != "fp8":
         raise ValueError("GLM-5 IQ2R source must use block-FP8 weights")
@@ -241,26 +288,29 @@ def glm5_source_layout(config: dict[str, Any]) -> GLM5Layout:
     ):
         raise ValueError("GLM-5 FP8 config has no valid weight_block_size")
     layout = GLM5Layout(
-        layer_count=int(config.get("num_hidden_layers", -1)),
-        first_moe_layer=int(config.get("first_k_dense_replace", -1)),
-        expert_count=int(config.get("n_routed_experts", -1)),
-        hidden_size=int(config.get("hidden_size", -1)),
-        intermediate_size=int(config.get("moe_intermediate_size", -1)),
+        layer_count=int(text.get("num_hidden_layers", -1)),
+        first_moe_layer=int(text.get("first_k_dense_replace", -1)),
+        expert_count=int(text.get("n_routed_experts", -1)),
+        hidden_size=int(text.get("hidden_size", -1)),
+        intermediate_size=int(text.get("moe_intermediate_size", -1)),
         block_n=block_size[0],
         block_k=block_size[1],
+        shape=shape,
+        prefix=prefix,
+        layouts=tuple(layouts.items()),
     )
     if not (0 <= layout.first_moe_layer < layout.layer_count):
         raise ValueError("GLM-5 config has an invalid routed-MoE layer range")
-    if config.get("n_shared_experts") != 1:
+    if text.get("n_shared_experts") != 1:
         raise ValueError("GLM-5 IQ2R requires exactly one shared expert")
     mismatched = {
-        name: config.get(name)
-        for name, value in _GLM53_SHAPE.items()
-        if config.get(name) != value
+        name: text.get(name)
+        for name, value in fields.items()
+        if text.get(name) != value
     }
     if mismatched:
         raise ValueError(
-            f"the GLM-5.3 IQ2R kernels need {_GLM53_SHAPE}; this config has "
+            f"the {shape.name} IQ2R kernels need {fields}; this config has "
             f"{mismatched}"
         )
     return layout
@@ -591,7 +641,7 @@ def _encoding_entries(encoding: dict[str, str]) -> int:
 
 
 def _layer_file_metadata(
-    layer: int, projection: str, encoding: dict[str, str]
+    layer: int, projection: str, encoding: dict[str, str], layout: GLM5Layout
 ) -> dict[str, str]:
     entries = _encoding_entries(encoding)
     return {
@@ -601,7 +651,7 @@ def _layer_file_metadata(
         "iq2r_layer": str(layer),
         "iq2r_projection": projection,
         **encoding,
-        "iq2r_layout": LAYOUTS[entries],
+        "iq2r_layout": layout.layout_name(entries),
     }
 
 
@@ -613,7 +663,7 @@ def _source_projection(
     projection: str,
     device: torch.device | str,
 ) -> Tensor:
-    names = iq2r_glm5_source_keys(layer, expert)
+    names = iq2r_glm5_source_keys(layer, expert, layout.prefix)
     if projection == "gate_up":
         gate = dequantize_block_fp8(
             reader.get(names["gate_proj_weight"]),
@@ -650,25 +700,27 @@ def _validate_projection_shard(
 
     entries = _encoding_entries(encoding)
     metadata = _projection_metadata(layout, projection, entries)
+    shape = layout.shape
     data_bytes = (
-        iq2r_glm53_gate_bytes(metadata.logical_n, entries)
+        iq2r_glm53_gate_bytes(metadata.logical_n, entries, shape)
         if projection == "gate_up"
-        else metadata.data_bytes
+        else iq2r_glm5_down_bytes(metadata.logical_k, entries, shape)
     )
+    # Packed down rows are padded to the kernels' shape.down_rows.
     auxiliary_bytes = iq2r_glm53_aux_bytes(
-        metadata.logical_n,
+        metadata.logical_n if projection == "gate_up" else shape.down_rows,
         metadata.logical_k,
         _LEVELS.classes,
         gate=projection == "gate_up",
         codebook_entries=entries,
     )
-    keys = iq2r_compiled_tensor_keys(layer, projection)
+    keys = iq2r_compiled_tensor_keys(layer, projection, layout.prefix)
     expected_tensors = {
         keys["data"]: ([layout.expert_count, data_bytes], "U8"),
         keys["auxiliary"]: ([layout.expert_count, auxiliary_bytes], "U8"),
         keys["tile_n"]: ([1], "I32"),
     }
-    expected_metadata = _layer_file_metadata(layer, projection, encoding)
+    expected_metadata = _layer_file_metadata(layer, projection, encoding, layout)
     try:
         with safe_open(shard_path, framework="pt", device="cpu") as handle:
             actual_keys = set(handle.keys())
@@ -828,17 +880,14 @@ def _compile_layer(
     ]
     # Returns (gate_quad, gate_auxiliary, down_data, down_auxiliary).
     canonical = [tensor.to(device) for pair in encoded for tensor in pair]
-    packed = iq2r_glm53_pack(
-        *canonical, intermediate_size=layout.intermediate_size, levels=_LEVELS
-    )
+    sizes = {
+        "intermediate_size": layout.intermediate_size,
+        "levels": _LEVELS,
+        "shape": layout.shape,
+    }
+    packed = iq2r_glm53_pack(*canonical, **sizes)
     # The packed layer round-trips: packing its unpacked records gives it back.
-    repacked = iq2r_glm53_pack(
-        *iq2r_glm53_unpack(
-            *packed, intermediate_size=layout.intermediate_size, levels=_LEVELS
-        ),
-        intermediate_size=layout.intermediate_size,
-        levels=_LEVELS,
-    )
+    repacked = iq2r_glm53_pack(*iq2r_glm53_unpack(*packed, **sizes), **sizes)
     if not all(torch.equal(a, b) for a, b in zip(repacked, packed)):
         raise RuntimeError(f"layer {layer}: the packed layer does not round-trip")
     del canonical, repacked
@@ -849,7 +898,7 @@ def _compile_layer(
         path = output_dir / _layer_file(layer, projection)
         if path.exists():
             continue
-        keys = iq2r_compiled_tensor_keys(layer, projection)
+        keys = iq2r_compiled_tensor_keys(layer, projection, layout.prefix)
         temporary = path.with_suffix(path.suffix + ".tmp")
         save_file(
             {
@@ -858,7 +907,7 @@ def _compile_layer(
                 keys["tile_n"]: torch.tensor([128], dtype=torch.int32),
             },
             temporary,
-            metadata=_layer_file_metadata(layer, projection, metadata),
+            metadata=_layer_file_metadata(layer, projection, metadata, layout),
         )
         os.replace(temporary, path)
 
@@ -908,7 +957,7 @@ def _write_checkpoint_files(
         name
         for layer in layers
         for expert in range(layout.expert_count)
-        for name in iq2r_glm5_source_keys(layer, expert).values()
+        for name in iq2r_glm5_source_keys(layer, expert, layout.prefix).values()
     }
     missing = compiled - weight_map.keys()
     if missing:
@@ -944,7 +993,7 @@ def _write_checkpoint_files(
             output_map.update(dict.fromkeys(names, shard))
     for layer in layers:
         for projection in _PROJECTIONS:
-            keys = iq2r_compiled_tensor_keys(layer, projection).values()
+            keys = iq2r_compiled_tensor_keys(layer, projection, layout.prefix).values()
             output_map.update(dict.fromkeys(keys, _layer_file(layer, projection)))
     total_size = sum(
         sum(_tensor_bytes(output_dir / shard).values())
@@ -959,11 +1008,12 @@ def _write_checkpoint_files(
     output_config["quantization_config"] = {
         "quant_method": "iq2r",
         "base_quantization_config": config["quantization_config"],
-        # ATOM fnmatches patterns that contain "*". One pattern per compiled
-        # layer keeps the MTP layer's experts and the shared experts on the
-        # FP8 path.
+        # ATOM fnmatches patterns that contain "*" against its module names
+        # (GLM-5.3-Flash's without model.language_model.). One pattern per
+        # compiled layer keeps the MTP layer's experts and the shared experts
+        # on the FP8 path.
         "iq2r_modules": [f"model.layers.{layer}.mlp.experts*" for layer in layers],
-        "iq2r_layout": LAYOUTS[entries],
+        "iq2r_layout": layout.layout_name(entries),
         "iq2r_format": iq2r_v2_format_name(_LEVELS, entries),
     }
     config_path = output_dir / "config.json"
