@@ -51,6 +51,11 @@ Needs Transformers with GLM MoE DSA support (5.16 or newer). Its FP8 matmul
 comes from the ``kernels`` package (``kernels-community/finegrained-fp8``);
 without it, the block-FP8 weights are dequantized to BF16 for each matmul
 instead (BF16 activations times the exact weights, slower).
+
+GLM-5.3-Flash (``glm5_next``) loads through its multimodal model class with
+the block-FP8 weights dequantized to BF16 at load (that also keeps the KDA
+forget-gate projections as stored); only the text model runs, and the down
+input recorded is the experts' clamped SwiGLU output.
 """
 
 from __future__ import annotations
@@ -99,6 +104,19 @@ class TargetSpec:
     width: int
 
 
+def routed_expert_count(config) -> int:
+    """Routed experts per MoE layer (``num_local_experts`` aliases it on GLM-5.3)."""
+
+    count = getattr(config, "n_routed_experts", None)
+    return int(count if count is not None else config.num_local_experts)
+
+
+def _text_model(model):
+    """The decoder stack (GLM-5.3-Flash wraps it in a multimodal model)."""
+
+    return getattr(model.model, "language_model", model.model)
+
+
 def glm5_target_specs(config) -> list[TargetSpec]:
     """Return the routed-expert targets (one group per expert) per MoE layer."""
 
@@ -108,7 +126,7 @@ def glm5_target_specs(config) -> list[TargetSpec]:
         for projection, width in widths.items():
             specs.append(
                 TargetSpec(
-                    routed_target(layer, projection), config.num_local_experts, width
+                    routed_target(layer, projection), routed_expert_count(config), width
                 )
             )
     return specs
@@ -206,12 +224,12 @@ class GLM5CalibrationObserver:
     """
 
     def __init__(self, model, accumulator: DiagonalSecondMomentAccumulator):
-        config = model.config
+        config = model.config.get_text_config()
         self.model = model
         self.accumulator = accumulator
         self.layers = range(config.first_k_dense_replace, config.num_hidden_layers)
         self.capture_mask = torch.zeros(
-            config.num_hidden_layers, config.num_local_experts, dtype=torch.bool
+            config.num_hidden_layers, routed_expert_count(config), dtype=torch.bool
         )
         self.capture_mask[config.first_k_dense_replace :] = True
         self.force_mask = torch.zeros_like(self.capture_mask)
@@ -250,7 +268,7 @@ class GLM5CalibrationObserver:
             self.force_mask[layer] = unobserved
 
     def run(self, input_ids: Tensor) -> None:
-        self.model.model(input_ids=input_ids, use_cache=False)
+        _text_model(self.model)(input_ids=input_ids, use_cache=False)
 
     @staticmethod
     def _project(module, projection: str, expert: int, values: Tensor) -> Tensor:
@@ -424,7 +442,9 @@ def capture_glm5_calibration(
             "force_unobserved_tokens non-negative"
         )
     device = torch.device(device) if device is not None else model.device
-    accumulator = DiagonalSecondMomentAccumulator(glm5_target_specs(model.config))
+    accumulator = DiagonalSecondMomentAccumulator(
+        glm5_target_specs(model.config.get_text_config())
+    )
     observer = GLM5CalibrationObserver(model, accumulator)
     natural_tokens = 0
     forced_tokens = 0
@@ -608,7 +628,7 @@ class MergedHessians:
 
 
 def _moe_layers(model) -> range:
-    config = model.config
+    config = model.config.get_text_config()
     return range(config.first_k_dense_replace, config.num_hidden_layers)
 
 
@@ -651,7 +671,7 @@ def capture_glm5_hessians(
                         accumulator.observe(layer, rows)
 
                 handles.append(
-                    model.model.layers[layer].mlp.register_forward_pre_hook(hook)
+                    _text_model(model).layers[layer].mlp.register_forward_pre_hook(hook)
                 )
             try:
                 if decision:
@@ -661,7 +681,7 @@ def capture_glm5_hessians(
                     top1 = logits[0][scored.to(logits.device)].argmax(-1).cpu()
                     chosen = torch.isin(top1, decision_ids)
                 else:
-                    model.model(input_ids=input_ids.to(device), use_cache=False)
+                    _text_model(model)(input_ids=input_ids.to(device), use_cache=False)
             finally:
                 for handle in handles:
                     handle.remove()
@@ -825,6 +845,33 @@ def _use_dequantized_fp8_if_needed() -> bool:
         return True
 
 
+def _load_glm5_next(model_dir, config):
+    """GLM-5.3-Flash with its block-FP8 weights dequantized to BF16 at load.
+
+    The FP8 path would wrap the KDA forget-gate projections, stored in BF16,
+    in FP8 modules with uninitialized scales. The vision tower is loaded but
+    unused.
+    """
+
+    from transformers import AutoModelForImageTextToText, FineGrainedFP8Config
+
+    quantization = config.quantization_config
+    if not isinstance(quantization, dict):
+        quantization = quantization.to_dict()
+    return AutoModelForImageTextToText.from_pretrained(
+        model_dir,
+        config=config,
+        device_map=_DEVICE_MAP,
+        dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+        quantization_config=FineGrainedFP8Config(
+            weight_block_size=tuple(quantization["weight_block_size"]),
+            modules_to_not_convert=quantization.get("modules_to_not_convert"),
+            dequantize=True,
+        ),
+    ).eval()
+
+
 def calibrate_glm5(
     model_dir: str | os.PathLike[str],
     text_file: str | os.PathLike[str],
@@ -865,19 +912,25 @@ def calibrate_glm5(
         if isinstance(overrides, dict):
             overrides.setdefault(None, {})
 
-    dequantized_fp8 = fp8_kernel_dir is None and _use_dequantized_fp8_if_needed()
     texts = load_texts(text_file)
     config = AutoConfig.from_pretrained(model_dir)
-    if getattr(config, "model_type", None) != "glm_moe_dsa":
-        raise ValueError(f"{model_dir} is not a GLM MoE DSA checkpoint")
+    model_type = getattr(config, "model_type", None)
+    if model_type not in ("glm_moe_dsa", "glm5_next"):
+        raise ValueError(f"{model_dir} is not a GLM MoE DSA or GLM-5.3-Flash checkpoint")
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_dir,
-        config=config,
-        device_map=_DEVICE_MAP,
-        torch_dtype="auto",
-        low_cpu_mem_usage=True,
-    ).eval()
+    if model_type == "glm5_next":
+        model = _load_glm5_next(model_dir, config)
+        fp8_matmul = "dequantized-bf16-at-load"
+    else:
+        dequantized_fp8 = fp8_kernel_dir is None and _use_dequantized_fp8_if_needed()
+        model = AutoModelForCausalLM.from_pretrained(
+            model_dir,
+            config=config,
+            device_map=_DEVICE_MAP,
+            torch_dtype="auto",
+            low_cpu_mem_usage=True,
+        ).eval()
+        fp8_matmul = "dequantized-bf16" if dequantized_fp8 else "finegrained-fp8"
     model_metadata = {
         "model_path": str(Path(model_dir).resolve()),
         "model_revision": getattr(config, "_commit_hash", None),
@@ -885,7 +938,7 @@ def calibrate_glm5(
         "architectures": list(getattr(config, "architectures", None) or ()),
         "model_config_sha256": config_fingerprint(config),
         "device_map": _DEVICE_MAP,
-        "fp8_matmul": "dequantized-bf16" if dequantized_fp8 else "finegrained-fp8",
+        "fp8_matmul": fp8_matmul,
     }
     payload: dict[str, Any] = {}
     if output is not None:
@@ -943,7 +996,9 @@ def main(argv: list[str] | None = None) -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
-        "--model-dir", required=True, help="GLM-5.3 block-FP8 checkpoint"
+        "--model-dir",
+        required=True,
+        help="GLM-5.3 or GLM-5.3-Flash block-FP8 checkpoint",
     )
     parser.add_argument(
         "--text-file",
