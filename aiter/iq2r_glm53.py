@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""GLM-5 IQ2R-v2 MoE on the packed layout (TP4 and TP8, gfx950).
+"""GLM-5 IQ2R-v2 MoE on the packed layout (gfx950; TP4 and TP8 kernels, wider
+ranks as 512-wide shards).
 
 GLM-5.3 (hidden 6144, 256 routed experts) and GLM-5.3-Flash (hidden 4096, 288
 routed experts, clamped SwiGLU), both with top-8 routing; :class:`IQ2RGlm5Shape`
@@ -114,7 +115,25 @@ DEFAULT_DECODE_TOKENS = 256  # untuned shapes switch to the prefill kernels abov
 # MAX_DECODE_TOKENS with the decode kernels, slower than a separate MLP).
 FUSED_SHARED_TOKENS = 256
 MAX_CHUNK_TOKENS = 4096
-INTERMEDIATE_SIZES = (256, 512)  # TP8, TP4
+INTERMEDIATE_SIZES = (256, 512)  # the kernels' widths: TP8, TP4
+# A wider rank (GLM-5.3-Flash at TP2: 1024, TP1: 2048) runs its intermediate as
+# SHARD_INTERMEDIATE-wide shards, shard s being the slice TP4 rank s of the
+# rank's range would hold, stacked [shards, experts, bytes]. The routes sort
+# once; each shard runs the gate and down kernels, and the shard outputs sum in
+# FP32, as TP4's all-reduce sums its ranks'.
+SHARD_INTERMEDIATE = 512
+RANK_INTERMEDIATE_SIZES = (256, 512, 1024, 2048)
+
+
+def iq2r_glm53_shards(intermediate_size: int) -> int:
+    """Kernel shards of a rank whose intermediate is ``intermediate_size``."""
+    if intermediate_size not in RANK_INTERMEDIATE_SIZES:
+        raise ValueError(
+            f"GLM-5 IQ2R supports a rank intermediate of {RANK_INTERMEDIATE_SIZES}, "
+            f"not {intermediate_size}"
+        )
+    return max(intermediate_size // SHARD_INTERMEDIATE, 1)
+
 
 # Stored slabs (aiter/ops/iq2r_format.py): K tiles per slab and slab bytes of
 # a six-block group, for 512- and 1,024-entry codebooks. A packed gate/up quad
@@ -700,6 +719,65 @@ def iq2r_glm53_slice_gate(
     return picked.reshape(gate.shape[0], -1).clone()
 
 
+def iq2r_glm53_slice_layer(
+    name: str,
+    weight: Tensor,
+    start: int,
+    length: int,
+    full_intermediate: int,
+    codebook_entries: int = 512,
+    shape: IQ2RGlm5Shape = GLM53,
+    classes: int | None = None,
+) -> Tensor:
+    """Intermediate columns [start, start+length) of one packed full-layer
+    stack: ``name`` is ``gate``, ``gate_aux``, ``down`` or ``down_aux``. A
+    length above SHARD_INTERMEDIATE stacks its 512-wide kernel shards
+    [shards, experts, bytes]."""
+    from .ops.iq2r_format import IQ2RMetadata, iq2r_slice_input_data
+    from .ops.iq2r_v2 import IQ2R_V2_LEVELS_C4
+
+    if length > SHARD_INTERMEDIATE:
+        return torch.stack(
+            [
+                iq2r_glm53_slice_layer(
+                    name,
+                    weight,
+                    begin,
+                    SHARD_INTERMEDIATE,
+                    full_intermediate,
+                    codebook_entries,
+                    shape,
+                    classes,
+                )
+                for begin in range(start, start + length, SHARD_INTERMEDIATE)
+            ]
+        )
+    classes = classes or IQ2R_V2_LEVELS_C4.classes
+    if name == "gate":
+        return iq2r_glm53_slice_gate(
+            weight, 2 * start, 2 * length, codebook_entries, shape
+        )
+    if name == "gate_aux":
+        return iq2r_glm53_v2_slice_gate_aux(
+            weight, 2 * start, 2 * length, 2 * full_intermediate, classes,
+            codebook_entries,
+        )  # fmt: skip
+    if name == "down":
+        metadata = IQ2RMetadata(
+            logical_n=shape.down_rows,
+            logical_k=full_intermediate,
+            codebook_entries=codebook_entries,
+        )
+        return iq2r_slice_input_data(weight, metadata, start, length)
+    if name == "down_aux":
+        # The d table runs along the down input, so it shards like the data.
+        return iq2r_glm53_v2_slice_down_aux(
+            weight, start, length, full_intermediate, classes, codebook_entries,
+            shape,
+        )  # fmt: skip
+    raise ValueError(f"unknown packed layer stack {name!r}")
+
+
 # --------------------------------------------------------------------------
 # Shared expert (MXFP8, fused into the MoE launches)
 # --------------------------------------------------------------------------
@@ -722,7 +800,8 @@ def iq2r_glm53_slice_gate(
 
 @dataclass(slots=True)
 class IQ2RGlm53Shared:
-    """Packed MXFP8 shared expert of one tensor-parallel rank."""
+    """Packed MXFP8 shared expert of one tensor-parallel rank; a rank of
+    several kernel shards stacks the shards' tensors [shards, ...]."""
 
     gate: Tensor
     gate_scales: Tensor
@@ -732,7 +811,17 @@ class IQ2RGlm53Shared:
 
     @property
     def intermediate_size(self) -> int:
-        return self.gate.shape[0] // (self.shape.k_tiles * 4 * 64 * 32) * 32
+        return self.gate.numel() // (self.shape.k_tiles * 4 * 64 * 32) * 32
+
+    def shard(self, index: int) -> IQ2RGlm53Shared:
+        """Kernel shard ``index`` of a rank packed in several shards."""
+        return IQ2RGlm53Shared(
+            self.gate[index],
+            self.gate_scales[index],
+            self.down[index],
+            self.down_scales[index],
+            self.shape,
+        )
 
 
 def _mxfp8_quantize(weight: Tensor) -> tuple[Tensor, Tensor]:
@@ -772,16 +861,32 @@ def iq2r_glm53_pack_shared(
     gate: Tensor, up: Tensor, down: Tensor, shape: IQ2RGlm5Shape = GLM53
 ) -> IQ2RGlm53Shared:
     """Pack one rank's shared expert: ``gate``/``up`` [I, hidden] and ``down``
-    [hidden, I] (any float dtype; I = 256 or 512)."""
+    [hidden, I] (any float dtype; I = 256 or 512, or a multiple of 512 packed
+    as stacked 512-wide kernel shards)."""
     intermediate, hidden = gate.shape[0], shape.hidden
     if (
-        intermediate not in INTERMEDIATE_SIZES
+        intermediate not in RANK_INTERMEDIATE_SIZES
         or gate.shape != (intermediate, hidden)
         or up.shape != gate.shape
         or down.shape != (hidden, intermediate)
     ):
         raise ValueError(
             f"{shape.name} shared expert must be gate/up [I, {hidden}], down [{hidden}, I]"
+        )
+    if intermediate > SHARD_INTERMEDIATE:
+        parts = [
+            iq2r_glm53_pack_shared(gate[rows], up[rows], down[:, rows], shape)
+            for rows in (
+                slice(begin, begin + SHARD_INTERMEDIATE)
+                for begin in range(0, intermediate, SHARD_INTERMEDIATE)
+            )
+        ]
+        return IQ2RGlm53Shared(
+            *(
+                torch.stack([getattr(p, name) for p in parts])
+                for name in ("gate", "gate_scales", "down", "down_scales")
+            ),
+            shape=shape,
         )
     # Routed gate quad order: tile t, atom a, row r -> column 32t + 8a + r // 2.
     columns = torch.arange(2 * intermediate, device=gate.device)
@@ -857,10 +962,12 @@ def _config_problem(
         return None if tokens in (2, 4) else "route9 covers M1, M2 and M4"
     if config.down_kernel not in DOWN_KERNELS:
         return f"unknown decode down kernel {config.down_kernel!r}"
-    if config.down_kernel == "ordered" and intermediate_size != 256:
+    # A rank wider than a shard runs SHARD_INTERMEDIATE-wide kernels.
+    width = min(intermediate_size, SHARD_INTERMEDIATE)
+    if config.down_kernel == "ordered" and width != 256:
         return "the ordered down kernel is TP8 (intermediate 256) only"
-    if config.down_kernel == "single2" and intermediate_size != 512:
-        return "the single2 down kernel is TP4 (intermediate 512) only"
+    if config.down_kernel == "single2" and width != 512:
+        return "the single2 down kernel runs 512-wide (TP4) shards only"
     return None if 1 <= config.down_grid <= 16 else "down_grid must be 1..16"
 
 
@@ -978,8 +1085,10 @@ class IQ2RGlm53Workspace:
     """
 
     max_tokens: int
-    intermediate_size: int
+    intermediate_size: int  # the rank's; the kernels run shard_size-wide shards
     shape: IQ2RGlm5Shape
+    shards: int
+    shard_size: int
     route_input_fp8: Tensor
     route_input_scales: Tensor
     intermediate_fp8: Tensor
@@ -993,6 +1102,7 @@ class IQ2RGlm53Workspace:
     gate_task_count: Tensor
     sort_scratch: Tensor
     shared_act: Tensor
+    shard_output: Tensor  # [shards, tokens, hidden] of a rank of several shards
     empty: Tensor
 
     @classmethod
@@ -1004,10 +1114,8 @@ class IQ2RGlm53Workspace:
         device: torch.device | str,
         shape: IQ2RGlm5Shape = GLM53,
     ) -> IQ2RGlm53Workspace:
-        if intermediate_size not in INTERMEDIATE_SIZES:
-            raise ValueError(
-                "GLM-5 IQ2R supports intermediate 256 (TP8) or 512 (TP4)"
-            )
+        shards = iq2r_glm53_shards(intermediate_size)
+        shard_size = intermediate_size // shards
         # Longer batches run in MAX_CHUNK_TOKENS pieces.
         max_tokens = min(max(max_tokens, 1), MAX_CHUNK_TOKENS)
         routes = max_tokens * ROUTE_SLOTS
@@ -1021,10 +1129,13 @@ class IQ2RGlm53Workspace:
             max_tokens=max_tokens,
             intermediate_size=intermediate_size,
             shape=shape,
+            shards=shards,
+            shard_size=shard_size,
             route_input_fp8=torch.empty((rows, shape.hidden), **fp8),
             route_input_scales=torch.empty((rows, shape.hidden // 32), **u8),
-            intermediate_fp8=torch.empty((routes, intermediate_size), **fp8),
-            intermediate_scales=torch.empty((routes, intermediate_size // 32), **u8),
+            # The shards run one after another through one set of buffers.
+            intermediate_fp8=torch.empty((routes, shard_size), **fp8),
+            intermediate_scales=torch.empty((routes, shard_size // 32), **u8),
             # The down kernels write every down row, padding included.
             route_output=torch.empty(
                 (routes, shape.down_rows), dtype=torch.bfloat16, device=device
@@ -1049,7 +1160,12 @@ class IQ2RGlm53Workspace:
             sort_scratch=torch.empty(((routes + 255) // 256 * 512 + 1024,), **i32),
             # SiLU(gate) * up of the fused shared expert, BF16 [tokens, I].
             shared_act=torch.empty(
-                (min(max_tokens, MAX_DECODE_TOKENS), intermediate_size),
+                (min(max_tokens, MAX_DECODE_TOKENS), shard_size),
+                dtype=torch.bfloat16,
+                device=device,
+            ),
+            shard_output=torch.empty(
+                (shards, max_tokens, shape.hidden) if shards > 1 else (0,),
                 dtype=torch.bfloat16,
                 device=device,
             ),
@@ -1079,7 +1195,9 @@ def iq2r_glm53_moe_out(
     :func:`iq2r_glm53_pack_v2` (and :func:`iq2r_glm53_pack_shared`) for the
     same shape. Routes with an id outside the experts contribute nothing.
     ``config`` overrides the tuned launch choice (used by the tuner); it must
-    fit ``tokens``, and ``tokens`` must fit the workspace.
+    fit ``tokens``, and ``tokens`` must fit the workspace. A workspace of
+    several shards (a rank wider than 512) takes the four weight stacks and the
+    shared expert stacked [shards, ...].
     """
     # The gate and down kernel bodies are built for gfx950 only and are empty
     # on other targets, which would leave ``output`` unwritten.
@@ -1116,20 +1234,30 @@ def iq2r_glm53_moe_out(
     if tokens == 0:
         return
     shape = workspace.shape
-    if hidden_states.shape[1] != shape.hidden or gate_up_data.shape[0] != shape.experts:
+    shards, width = workspace.shards, workspace.shard_size
+    stacks = (gate_up_data, gate_up_auxiliary, down_data, down_auxiliary)
+    if hidden_states.shape[1] != shape.hidden or any(
+        t.dim() != (2 if shards == 1 else 3)
+        or t.shape[-2] != shape.experts
+        or (shards > 1 and t.shape[0] != shards)
+        for t in stacks
+    ):
         raise ValueError(
-            f"{shape.name} IQ2R expects hidden {shape.hidden} and {shape.experts} experts"
+            f"{shape.name} IQ2R expects hidden {shape.hidden} and {shape.experts} "
+            f"experts" + (f" in {shards} stacked shards" if shards > 1 else "")
         )
-    if shared is not None and shared.shape != shape:
-        raise ValueError("the shared expert was packed for another model shape")
+    if shared is not None and (
+        shared.shape != shape or shared.intermediate_size != workspace.intermediate_size
+    ):
+        raise ValueError("the shared expert was packed for another model shape or rank")
     if topk_ids.shape != (tokens, TOPK) or topk_weights.shape != (tokens, TOPK):
         raise ValueError("GLM-5 IQ2R expects top-8 routing [tokens, 8]")
     if topk_weights.dtype != torch.float32 or not topk_weights.is_contiguous():
         raise ValueError("topk_weights must be contiguous float32")
     if config is None:
         entries = iq2r_glm53_v2_codebook_entries(
-            gate_up_auxiliary.shape[1],
-            2 * workspace.intermediate_size,
+            gate_up_auxiliary.shape[-1],
+            2 * width,
             shape.hidden,
             4,
             gate=True,
@@ -1160,17 +1288,9 @@ def iq2r_glm53_moe_out(
     quant_scales = workspace.route_input_scales[:quant_rows]
     empty = workspace.empty
     act = workspace.shared_act[: min(tokens, MAX_DECODE_TOKENS)]
-    shared_gate_args = (
-        (empty, empty, act)
-        if shared is None
-        else (shared.gate, shared.gate_scales, act)
-    )
-    shared_down_args = (
-        (empty, empty, act)
-        if shared is None
-        else (shared.down, shared.down_scales, act)
-    )
+    prefill = tokens > 1 and config.gate_kernel == "prefill"
 
+    # Route sort and activation quantization, once for every shard.
     if tokens == 1:
         # One-row tasks; each route gets its own copy of the quantized row.
         tasks = tasks[:routes]
@@ -1178,11 +1298,7 @@ def iq2r_glm53_moe_out(
             hidden_states, ids, scatter, tasks, count, quant, quant_scales,
             int(shared is not None),
         )  # fmt: skip
-        iq2r_glm53_gate_m1_out(
-            quant, quant_scales, gate_up_data, gate_up_auxiliary, tasks, count,
-            intermediate, intermediate_scales, *shared_gate_args,
-        )  # fmt: skip
-    elif config.gate_kernel != "prefill":
+    elif not prefill:
         # One launch sorts routes into M32 down / M16 gate tasks and quantizes
         # each token row once; the gate gathers rows through ``gather``.
         tasks = tasks[: _task_capacity(routes, 32, shape.experts)]
@@ -1191,48 +1307,73 @@ def iq2r_glm53_moe_out(
             hidden_states, ids, gather, scatter, tasks, count, quant, quant_scales,
             gate_tasks, workspace.gate_task_count, int(shared is not None),
         )  # fmt: skip
-        iq2r_glm53_gate_out(
-            quant, quant_scales, gate_up_data, gate_up_auxiliary, gate_tasks,
-            workspace.gate_task_count, gather, intermediate, intermediate_scales,
-            GATE_KERNELS[config.gate_kernel], config.gate_grid, *shared_gate_args,
-        )  # fmt: skip
     else:
         tasks = tasks[: _task_capacity(routes, 64, shape.experts)]
         iq2r_glm53_prefill_sort_quant_out(
             hidden_states, ids, gather, scatter, tasks, count, quant, quant_scales,
             workspace.sort_scratch,
         )  # fmt: skip
-        iq2r_glm53_gate_out(
-            quant, quant_scales, gate_up_data, gate_up_auxiliary, tasks, count,
-            gather, intermediate, intermediate_scales, GATE_KERNELS["prefill"],
-            config.gate_grid, empty, empty, act,
-        )  # fmt: skip
-        iq2r_glm53_down_reduce_out(
-            intermediate, intermediate_scales, down_data, down_auxiliary, tasks,
-            count, workspace.route_output[:routes], scatter, topk_weights, output,
-            config.down_chunks,
-        )  # fmt: skip
-        return
 
-    if config.down_kernel == "route9":
-        # Token-owned down projection with the weighted top-8 sum fused in.
-        iq2r_glm53_down_route9_out(
-            intermediate, intermediate_scales, down_data, down_auxiliary, ids,
-            scatter, topk_weights, output, *shared_down_args,
+    for index in range(shards):
+        if shards == 1:
+            gate_up, gate_aux, down, down_aux = stacks
+            part, out = shared, output
+        else:
+            gate_up, gate_aux, down, down_aux = (t[index] for t in stacks)
+            part = None if shared is None else shared.shard(index)
+            out = workspace.shard_output[index, :tokens]
+        shared_gate_args = (
+            (empty, empty, act) if part is None else (part.gate, part.gate_scales, act)
+        )
+        shared_down_args = (
+            (empty, empty, act) if part is None else (part.down, part.down_scales, act)
+        )
+        if tokens == 1:
+            iq2r_glm53_gate_m1_out(
+                quant, quant_scales, gate_up, gate_aux, tasks, count,
+                intermediate, intermediate_scales, *shared_gate_args,
+            )  # fmt: skip
+        elif not prefill:
+            iq2r_glm53_gate_out(
+                quant, quant_scales, gate_up, gate_aux, gate_tasks,
+                workspace.gate_task_count, gather, intermediate, intermediate_scales,
+                GATE_KERNELS[config.gate_kernel], config.gate_grid, *shared_gate_args,
+            )  # fmt: skip
+        else:
+            iq2r_glm53_gate_out(
+                quant, quant_scales, gate_up, gate_aux, tasks, count,
+                gather, intermediate, intermediate_scales, GATE_KERNELS["prefill"],
+                config.gate_grid, empty, empty, act,
+            )  # fmt: skip
+            iq2r_glm53_down_reduce_out(
+                intermediate, intermediate_scales, down, down_aux, tasks,
+                count, workspace.route_output[:routes], scatter, topk_weights, out,
+                config.down_chunks,
+            )  # fmt: skip
+            continue
+        if config.down_kernel == "route9":
+            # Token-owned down projection with the weighted top-8 sum fused in.
+            iq2r_glm53_down_route9_out(
+                intermediate, intermediate_scales, down, down_aux, ids,
+                scatter, topk_weights, out, *shared_down_args,
+            )  # fmt: skip
+            continue
+        route_output = workspace.route_output[:routes]
+        iq2r_glm53_down_out(
+            intermediate, intermediate_scales, down, down_aux, tasks, count,
+            route_output, DOWN_KERNELS[config.down_kernel], config.down_grid, scatter,
+            *shared_down_args,
         )  # fmt: skip
-        return
-    route_output = workspace.route_output[:routes]
-    iq2r_glm53_down_out(
-        intermediate, intermediate_scales, down_data, down_auxiliary, tasks, count,
-        route_output, DOWN_KERNELS[config.down_kernel], config.down_grid, scatter,
-        *shared_down_args,
-    )  # fmt: skip
-    iq2r_glm53_route_reduce_out(route_output, topk_weights, scatter, output)
+        iq2r_glm53_route_reduce_out(route_output, topk_weights, scatter, out)
+    if shards > 1:
+        output.copy_(workspace.shard_output[:, :tokens].sum(dim=0, dtype=torch.float32))
 
 
 __all__ = [
     "GLM53",
     "GLM5_NEXT",
+    "RANK_INTERMEDIATE_SIZES",
+    "SHARD_INTERMEDIATE",
     "IQ2RGlm5Shape",
     "iq2r_glm5_down_bytes",
     "iq2r_glm5_shape",
@@ -1245,6 +1386,8 @@ __all__ = [
     "iq2r_glm53_dequantize_shared",
     "iq2r_glm53_pack_shared",
     "iq2r_glm53_pack_v2",
+    "iq2r_glm53_shards",
+    "iq2r_glm53_slice_layer",
     "iq2r_glm53_slice_gate",
     "iq2r_glm53_unpack_v2",
     "iq2r_glm53_v2_aux_bytes",
