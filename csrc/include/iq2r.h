@@ -64,6 +64,8 @@ void iq2r_glm53_route_reduce_out(const aiter_tensor_t& route_output,
                                  const aiter_tensor_t& scatter_indices,
                                  aiter_tensor_t& output);
 
+void iq2r_glm53_shard_sum_out(const aiter_tensor_t& shard_output, aiter_tensor_t& output);
+
 void iq2r_glm53_gate_m1_out(const aiter_tensor_t& activations,
                             const aiter_tensor_t& scales,
                             const aiter_tensor_t& data,

@@ -439,6 +439,31 @@ __global__ __launch_bounds__(64) void glm53_route_reduce_kernel(
 #endif
 }
 
+// Sum of a rank's kernel shards' outputs [shards][tokens][hidden]: FP32 in
+// shard order, one BF16 rounding. A wave sums 512 columns of a token row.
+template<class Shape>
+__global__ __launch_bounds__(64) void glm53_shard_sum_kernel(
+    const __hip_bfloat16* __restrict__ shard_output,__hip_bfloat16* __restrict__ output,int tokens,int shards)
+{
+#if defined(__gfx950__)
+    constexpr int Items=8;
+    const int64_t element=(static_cast<int64_t>(blockIdx.x)*64+threadIdx.x)*Items;
+    const int64_t stride=static_cast<int64_t>(tokens)*Shape::Hidden;
+    float total[Items]={};
+    for(int shard=0;shard<shards;++shard)
+    {
+        union {uint4 bits;__hip_bfloat16 values[Items];} loaded;
+        loaded.bits=*reinterpret_cast<const uint4*>(shard_output+shard*stride+element);
+#pragma unroll
+        for(int i=0;i<Items;++i)total[i]+=__bfloat162float(loaded.values[i]);
+    }
+    union {uint4 bits;__hip_bfloat16 values[Items];} result;
+#pragma unroll
+    for(int i=0;i<Items;++i)result.values[i]=__float2bfloat16(total[i]);
+    *reinterpret_cast<uint4*>(output+element)=result.bits;
+#endif
+}
+
 } // namespace
 
 namespace {
@@ -719,6 +744,34 @@ void iq2r_glm53_route_reduce_out(const aiter_tensor_t& route_output,
                            static_cast<__hip_bfloat16*>(output.data_ptr()),
                            tokens,
                            shards);
+        HIP_CALL_LAUNCH(hipGetLastError());
+    });
+}
+
+void iq2r_glm53_shard_sum_out(const aiter_tensor_t& shard_output, aiter_tensor_t& output)
+{
+    iq2r_check_gfx950();
+    AITER_CHECK(output.is_gpu() && output.dtype() == AITER_DTYPE_bf16 && output.dim() == 2 &&
+                    output.is_contiguous(),
+                "GLM-5 IQ2R shard sum output must be contiguous BF16 [tokens, hidden]");
+    AITER_CHECK(shard_output.is_gpu() && shard_output.device_id == output.device_id &&
+                    shard_output.dtype() == AITER_DTYPE_bf16 && shard_output.is_contiguous() &&
+                    shard_output.dim() == 3 && shard_output.size(1) == output.size(0) &&
+                    shard_output.size(2) == output.size(1),
+                "GLM-5 IQ2R shard outputs must be contiguous BF16 [shards, tokens, hidden]");
+    const int tokens = static_cast<int>(output.size(0));
+    glm5_with_shape(output.size(1), [&](auto shape) {
+        using Shape = decltype(shape);
+        HipDeviceGuard device_guard(output.device_id);
+        hipLaunchKernelGGL(glm53_shard_sum_kernel<Shape>,
+                           dim3(tokens * (Shape::Hidden / 512)),
+                           dim3(64),
+                           0,
+                           getCurrentHIPStream(),
+                           static_cast<const __hip_bfloat16*>(shard_output.data_ptr()),
+                           static_cast<__hip_bfloat16*>(output.data_ptr()),
+                           tokens,
+                           static_cast<int>(shard_output.size(0)));
         HIP_CALL_LAUNCH(hipGetLastError());
     });
 }

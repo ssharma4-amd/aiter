@@ -48,6 +48,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("route_weights"),
           py::arg("scatter_indices"),
           py::arg("output"));
+    m.def("iq2r_glm53_shard_sum_out",
+          &aiter::iq2r_glm53_shard_sum_out,
+          py::arg("shard_output"),
+          py::arg("output"));
     m.def("iq2r_glm53_gate_m1_out",
           &aiter::iq2r_glm53_gate_m1_out,
           py::arg("activations"),

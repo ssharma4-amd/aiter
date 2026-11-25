@@ -69,6 +69,10 @@ def iq2r_glm53_route_reduce_out(
 ) -> None: ...
 
 
+@compile_ops("module_iq2r_moe", fc_name="iq2r_glm53_shard_sum_out", develop=True)
+def iq2r_glm53_shard_sum_out(shard_output: Tensor, output: Tensor) -> None: ...
+
+
 @compile_ops("module_iq2r_moe", fc_name="iq2r_glm53_gate_m1_out", develop=True)
 def iq2r_glm53_gate_m1_out(
     activations: Tensor,
@@ -163,5 +167,6 @@ __all__ = [
     "iq2r_glm53_m1_route_quant_out",
     "iq2r_glm53_prefill_sort_quant_out",
     "iq2r_glm53_route_reduce_out",
+    "iq2r_glm53_shard_sum_out",
     "iq2r_glm53_sort_quant_out",
 ]

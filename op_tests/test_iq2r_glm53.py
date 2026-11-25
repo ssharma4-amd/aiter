@@ -715,7 +715,8 @@ def test_glm53_tuned_config():
             row.down_grid,
             row.down_chunks,
         )
-    for intermediate in (256, 512):
+    # Rank widths: TP8, TP4, and TP2/TP1 (512-wide kernel shards).
+    for intermediate in (256, 512, 1024, 2048):
         lookup = functools.partial(iq2r_glm53_config, intermediate_size=intermediate)
         assert lookup(77) == lookup(128)
         # route9 cannot run M3, so M3 rounds up past a route9 M4 row.

@@ -55,6 +55,7 @@ from .ops.iq2r import (
     iq2r_glm53_m1_route_quant_out,
     iq2r_glm53_prefill_sort_quant_out,
     iq2r_glm53_route_reduce_out,
+    iq2r_glm53_shard_sum_out,
     iq2r_glm53_sort_quant_out,
 )
 
@@ -1342,7 +1343,7 @@ def iq2r_glm53_moe_out(
                 config.down_chunks,
             )  # fmt: skip
         if shards > 1:
-            output.copy_(shard_output.sum(dim=0, dtype=torch.float32))
+            iq2r_glm53_shard_sum_out(shard_output, output)
         return
 
     # M1 and decode: each launch runs every shard (stacked [shards, ...]).
@@ -1380,7 +1381,7 @@ def iq2r_glm53_moe_out(
             scatter, topk_weights, out, *shared_down_args,
         )  # fmt: skip
         if shards > 1:
-            output.copy_(out.sum(dim=0, dtype=torch.float32))
+            iq2r_glm53_shard_sum_out(out, output)
         return
     route_output = workspace.stacked(workspace.route_output, routes)
     iq2r_glm53_down_out(

@@ -50,6 +50,7 @@ from aiter.iq2r_glm53 import (
     iq2r_glm53_moe_out,
     iq2r_glm53_pack_shared,
     iq2r_glm53_pack_v2,
+    iq2r_glm53_slice_layer,
 )
 from aiter.jit import core
 from aiter.ops.iq2r_v2 import (
@@ -341,7 +342,7 @@ class IQ2RGlm53Tuner(TunerCommon):
                 dtype=object,
             ).isin(supported)
             | (self.untunedf.topk != TOPK)
-            | ~self.untunedf.inter_dim.isin(glm53.INTERMEDIATE_SIZES)
+            | ~self.untunedf.inter_dim.isin(glm53.RANK_INTERMEDIATE_SIZES)
             | ~self.untunedf.codebook.isin([512, 1024])
             | ~self.untunedf.shared.isin([0, 1])
             | ((self.untunedf.shared == 1) & (self.untunedf.token > MAX_DECODE_TOKENS))
@@ -350,7 +351,7 @@ class IQ2RGlm53Tuner(TunerCommon):
             raise ValueError(
                 "the GLM-5 IQ2R tuner covers (model_dim, expert) "
                 f"{sorted(supported)}, top-8, "
-                f"inter_dim {glm53.INTERMEDIATE_SIZES}, codebooks of 512 or 1024 "
+                f"inter_dim {glm53.RANK_INTERMEDIATE_SIZES}, codebooks of 512 or 1024 "
                 f"and the shared expert (0/1) up to {MAX_DECODE_TOKENS} tokens"
             )
 
@@ -370,6 +371,14 @@ class IQ2RGlm53Tuner(TunerCommon):
             packed, gate, down, pick = synthetic_weights(
                 intermediate_size, "cuda", entries, model
             )
+            if intermediate_size > glm53.SHARD_INTERMEDIATE:
+                # A wide rank (TP1, TP2) runs stacked 512-wide kernel shards.
+                packed = tuple(
+                    iq2r_glm53_slice_layer(
+                        name, t, 0, intermediate_size, intermediate_size, entries, model
+                    )
+                    for name, t in zip(("gate", "gate_aux", "down", "down_aux"), packed)
+                )
             self._layer_key = (model, intermediate_size, entries)
             self._layers, self._dense = [packed], (gate, down, pick)
         while len(self._layers) < copies:
