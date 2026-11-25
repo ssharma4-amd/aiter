@@ -376,13 +376,16 @@ __global__ __launch_bounds__(glm53_sort_threads<Shape>()) void glm53_sort_quant_
 }
 
 // Weighted top-8 sum: one wave owns 512 columns; one FP32 FMA per route in
-// route order, then one BF16 rounding. Route outputs are [routes, DownRows];
-// the columns past Hidden are padding.
+// route order, then one BF16 rounding. Route outputs are [shards][routes,
+// DownRows]; the columns past Hidden are padding. Kernel shards (a rank wider
+// than the kernels) each round their sum to BF16, and the shard sums add in
+// FP32 in shard order before the output's BF16 rounding, as summing the
+// shards' outputs does.
 template<class Shape>
 __global__ __launch_bounds__(64) void glm53_route_reduce_kernel(
     const __hip_bfloat16* __restrict__ route_output,
     const float* __restrict__ route_weights,const int32_t* __restrict__ scatter,
-    __hip_bfloat16* __restrict__ output,int tokens)
+    __hip_bfloat16* __restrict__ output,int tokens,int shards)
 {
 #if defined(__gfx950__)
     constexpr int Items=8,Batch=3;
@@ -396,6 +399,10 @@ __global__ __launch_bounds__(64) void glm53_route_reduce_kernel(
     int rows[9];float weights[9];
 #pragma unroll
     for(int i=0;i<9;++i){rows[i]=__shfl(r,i);weights[i]=__shfl(w,i);}
+    float total[Items]={};
+    for(int shard=0;shard<shards;++shard)
+    {
+    const __hip_bfloat16* shard_output=route_output+static_cast<int64_t>(shard)*tokens*kGlm53RouteSlots*Shape::DownRows;
     float acc[Items]={};
 #pragma unroll
     for(int first=0;first<9;first+=Batch)
@@ -404,7 +411,7 @@ __global__ __launch_bounds__(64) void glm53_route_reduce_kernel(
 #pragma unroll
         for(int i=0;i<Batch;++i)
             if(rows[first+i]>=0)
-                reinterpret_cast<uint4*>(packed[i])[0]=reinterpret_cast<const uint4*>(route_output+static_cast<int64_t>(rows[first+i])*Shape::DownRows+column)[0];
+                reinterpret_cast<uint4*>(packed[i])[0]=reinterpret_cast<const uint4*>(shard_output+static_cast<int64_t>(rows[first+i])*Shape::DownRows+column)[0];
         // Explicit register operands keep every independent load before conversion.
         asm volatile("" : "+v"(packed[0][0]),"+v"(packed[0][1]),"+v"(packed[1][0]),"+v"(packed[1][1]),"+v"(packed[2][0]),"+v"(packed[2][1]));
 #pragma unroll
@@ -422,9 +429,12 @@ __global__ __launch_bounds__(64) void glm53_route_reduce_kernel(
                 }
             }
     }
+#pragma unroll
+    for(int i=0;i<Items;++i)total[i]+=__bfloat162float(__float2bfloat16(acc[i]));
+    }
     opus::vector_t<opus::bf16_t,Items> result;
 #pragma unroll
-    for(int i=0;i<Items;++i)result[i]=__builtin_bit_cast(opus::bf16_t,__float2bfloat16(acc[i]));
+    for(int i=0;i<Items;++i)result[i]=__builtin_bit_cast(opus::bf16_t,__float2bfloat16(total[i]));
     reinterpret_cast<uint4*>(output+static_cast<int64_t>(token)*Shape::Hidden+column)[0]=reinterpret_cast<uint4*>(&result)[0];
 #endif
 }
@@ -680,10 +690,13 @@ void iq2r_glm53_route_reduce_out(const aiter_tensor_t& route_output,
                 "GLM-5 IQ2R reduce output must be contiguous BF16 [tokens, hidden]");
     const int tokens     = static_cast<int>(output.size(0));
     const int64_t routes = static_cast<int64_t>(tokens) * kGlm53RouteSlots;
+    // [shards, routes, down rows] for kernel shards, else [routes, down rows].
+    const int shards = route_output.dim() == 3 ? static_cast<int>(route_output.size(0)) : 1;
     AITER_CHECK(route_output.is_gpu() && route_output.device_id == device &&
                     route_output.dtype() == AITER_DTYPE_bf16 && route_output.is_contiguous() &&
-                    route_output.dim() == 2 && route_output.size(0) == routes,
-                "GLM-5 IQ2R route output must be contiguous BF16 [tokens * 9, down rows]");
+                    (route_output.dim() == 2 || (route_output.dim() == 3 && shards >= 1)) &&
+                    route_output.size(route_output.dim() - 2) == routes,
+                "GLM-5 IQ2R route output must be contiguous BF16 [shards, tokens * 9, down rows]");
     AITER_CHECK(route_weights.is_gpu() && route_weights.device_id == device &&
                     route_weights.dtype() == AITER_DTYPE_fp32 && route_weights.is_contiguous() &&
                     route_weights.numel() == static_cast<int64_t>(tokens) * kGlm53TopK,
@@ -692,8 +705,8 @@ void iq2r_glm53_route_reduce_out(const aiter_tensor_t& route_output,
 
     glm5_with_shape(output.size(1), [&](auto shape) {
         using Shape = decltype(shape);
-        AITER_CHECK(route_output.size(1) == Shape::DownRows,
-                    "GLM-5 IQ2R route output must be [tokens * 9, down rows]");
+        AITER_CHECK(route_output.size(route_output.dim() - 1) == Shape::DownRows,
+                    "GLM-5 IQ2R route output must be [shards, tokens * 9, down rows]");
         HipDeviceGuard device_guard(device);
         hipLaunchKernelGGL(glm53_route_reduce_kernel<Shape>,
                            dim3(tokens * (Shape::Hidden / 512)),
@@ -704,7 +717,8 @@ void iq2r_glm53_route_reduce_out(const aiter_tensor_t& route_output,
                            static_cast<const float*>(route_weights.data_ptr()),
                            static_cast<const int32_t*>(scatter_indices.data_ptr()),
                            static_cast<__hip_bfloat16*>(output.data_ptr()),
-                           tokens);
+                           tokens,
+                           shards);
         HIP_CALL_LAUNCH(hipGetLastError());
     });
 }

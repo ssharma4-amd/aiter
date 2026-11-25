@@ -593,7 +593,32 @@ struct Glm53SharedArgs
     // both, shared items first). The launchers add the shared workgroups only
     // when all of the launch's workgroups are resident at once.
     int routed_blocks;
+    // Kernel shards of the launch (0 or 1: one). A rank wider than the
+    // kernels stacks its shards: the routed weights [shards][experts][bytes],
+    // the gate output and down input [shards][routes][I], the down route
+    // output [shards][routes][down rows], and the shared expert's tensors and
+    // ``act`` [shards][...] (aiter/iq2r_glm53.py). Every shard of an expert
+    // holds the same codebook, so a book in LDS serves all of its shards.
+    int shards;
 };
+
+__device__ __forceinline__ int glm53_shards(const Glm53SharedArgs& sh)
+{
+    return sh.shards>1 ? sh.shards : 1;
+}
+
+// The shared expert operands of shard ``shard`` (``I`` intermediate columns
+// per shard).
+template<class Shape>
+__device__ __forceinline__ Glm53SharedArgs glm53_shared_shard(Glm53SharedArgs sh,int shard,int I)
+{
+    const int64_t gate=static_cast<int64_t>(shard)*2*I*Shape::Hidden;
+    const int64_t down=static_cast<int64_t>(shard)*I*Shape::DownRows;
+    if(sh.gate!=nullptr){sh.gate+=gate;sh.gate_scales+=gate/32;}
+    if(sh.down!=nullptr){sh.down+=down;sh.down_scales+=down/32;}
+    if(sh.act!=nullptr)sh.act+=static_cast<int64_t>(shard)*sh.tokens*I;
+    return sh;
+}
 
 // Routed workgroups of a launch (see Glm53SharedArgs::routed_blocks).
 __device__ __forceinline__ int glm53_routed_grid(const Glm53SharedArgs& sh)
@@ -779,24 +804,32 @@ __global__ __launch_bounds__(512,1) void glm53_gate_m1_kernel(
     const int lane=threadIdx.x,wave=threadIdx.y;
     const int lane_row=lane%16,lane_group=lane/16;
     const int num_tasks=task_count[0];
-    // Shared expert items first (activation row 0 is the token's).
-    const int shared_items=glm53_shared_gate_items<NT>(sh);
-    const int total=shared_items+num_tasks*NT;
+    const int shards=glm53_shards(sh);
+    // Shared expert items first (activation row 0 is the token's), then the
+    // routed items of every shard.
+    const int shard_items=glm53_shared_gate_items<NT>(sh);
+    const int shared_items=shard_items*shards;
+    const int total=shared_items+num_tasks*NT*shards;
     for(int work=blockIdx.x;work<total;work+=gridDim.x)
     {
         if(work<shared_items)
         {
-            glm53_shared_gate_item_ma<Shape,NT,Slice,1>(sh,activations,scales,work,reinterpret_cast<float*>(shared.partial));
+            glm53_shared_gate_item_ma<Shape,NT,Slice,1>(glm53_shared_shard<Shape>(sh,work/shard_items,NT*32),activations,scales,
+                                                        work%shard_items,reinterpret_cast<float*>(shared.partial));
             continue;
         }
         const int task=(work-shared_items)%num_tasks;
-        const int n_tile=(work-shared_items)/num_tasks;
+        const int shard=(work-shared_items)/num_tasks/NT;
+        const int n_tile=(work-shared_items)/num_tasks%NT;
         const int row_begin=tasks[task*3];
         const int row_end=min(row_begin+Rows,tasks[task*3]+tasks[task*3+1]);
         const int expert=tasks[task*3+2];
         if(row_begin>=row_end || row_begin<0 || row_end>routes || expert<0 || expert>=Shape::Experts) continue;
-        const uint8_t* data=all_data+static_cast<int64_t>(expert)*data_bytes;
-        const uint8_t* aux=all_auxiliary+static_cast<int64_t>(expert)*auxiliary_bytes;
+        const int64_t stacked=static_cast<int64_t>(shard)*Shape::Experts+expert;
+        const uint8_t* data=all_data+stacked*data_bytes;
+        const uint8_t* aux=all_auxiliary+stacked*auxiliary_bytes;
+        opus::fp8_t* shard_output=output+static_cast<int64_t>(shard)*routes*(NT*32);
+        uint8_t* shard_scales=output_scales+static_cast<int64_t>(shard)*routes*NT;
         // Previous work ends with a barrier protecting the codebook and partials.
         // Copy 0 of the book loads with the scales, gain and first weights, and
         // the other copies are formed below.
@@ -929,8 +962,8 @@ __global__ __launch_bounds__(512,1) void glm53_gate_m1_kernel(
                         const float inverse=1.0f/bs.dq_scale;
 #pragma unroll
                         for(int atom=0;atom<4;++atom)
-                            output[static_cast<int64_t>(output_row)*(NT*32)+n_tile*32+atom*8+lane_row/2]=opus::fp32_to_fp8(activated[atom]*inverse);
-                        if(lane_row==0) output_scales[static_cast<int64_t>(output_row)*NT+n_tile]=bs.byte;
+                            shard_output[static_cast<int64_t>(output_row)*(NT*32)+n_tile*32+atom*8+lane_row/2]=opus::fp32_to_fp8(activated[atom]*inverse);
+                        if(lane_row==0) shard_scales[static_cast<int64_t>(output_row)*NT+n_tile]=bs.byte;
                     }
                 }
             }
@@ -1374,14 +1407,17 @@ __global__ __launch_bounds__(64*Waves,Occupancy) void glm53_down_tp4_kernel(
     // (three workgroups per CU) without spilling.
     const int lane=threadIdx.x,wave=__builtin_amdgcn_readfirstlane(threadIdx.y),linear=wave*64+lane;
     const int lane_row=lane%16,lane_group=lane/16;
-    const int nt=task_count[0];
-    opus::gmem<uint8_t> a_buffer(activations,static_cast<unsigned int>(M*K));
-    opus::gmem<opus::bf16_t> out_buffer(output,static_cast<unsigned int>(M*Shape::DownRows*sizeof(__hip_bfloat16)));
-    opus::gmem<uint8_t> scale_buffer(activation_scales,static_cast<unsigned int>(M*(K/32)));
+    // Tasks of every shard: shard s's task t is virtual task s * tasks + t.
+    const int shards=glm53_shards(sh),tasks_per_shard=task_count[0],nt=tasks_per_shard*shards;
+    opus::gmem<uint8_t> a_buffer(activations,static_cast<unsigned int>(shards*M*K));
+    opus::gmem<opus::bf16_t> out_buffer(output,static_cast<unsigned int>(shards*M*Shape::DownRows*sizeof(__hip_bfloat16)));
+    opus::gmem<uint8_t> scale_buffer(activation_scales,static_cast<unsigned int>(shards*M*(K/32)));
     {
         const int2 span=glm53_shared_span(sh);
-        for(int item=span.x;item>=0 && item<glm53_shared_down_items<Shape>(sh);item+=span.y)
-            glm53_shared_down_item<Shape,KT>(sh,output,M,item);
+        const int shard_items=glm53_shared_down_items<Shape>(sh);
+        for(int item=span.x;item>=0 && item<shard_items*shards;item+=span.y)
+            glm53_shared_down_item<Shape,KT>(glm53_shared_shard<Shape>(sh,item/shard_items,K),
+                                             output+static_cast<int64_t>(item/shard_items)*M*Shape::DownRows,M,item%shard_items);
         if(static_cast<int>(blockIdx.x)>=glm53_routed_grid(sh))return;
     }
     int previous_expert=-1;
@@ -1403,10 +1439,15 @@ __global__ __launch_bounds__(64*Waves,Occupancy) void glm53_down_tp4_kernel(
             task=first+local%valid;output_tile=local/valid;
         }
         const int n_tile=output_tile;
+        const int shard=task/tasks_per_shard;
+        task%=tasks_per_shard;
         const int begin=tasks[task*3],count=tasks[task*3+1],expert=tasks[task*3+2];
         if(begin<0 || count<=0 || begin+count>M || expert<0 || expert>=expert_count)continue;
-        const uint8_t* data=all_data+static_cast<int64_t>(expert)*data_bytes;
-        const uint8_t* aux=all_auxiliary+static_cast<int64_t>(expert)*auxiliary_bytes;
+        const int64_t stacked=static_cast<int64_t>(shard)*expert_count+expert;
+        const uint8_t* data=all_data+stacked*data_bytes;
+        const uint8_t* aux=all_auxiliary+stacked*auxiliary_bytes;
+        // Rows of this shard's input, scales and route output.
+        const int shard_row=shard*M;
         // 1,024 entries stage only copy 0 (8 KB rather than 32 KB of stored
         // copies) and form copies 1-3 before the barrier.
         bool form_book=false;
@@ -1430,14 +1471,14 @@ __global__ __launch_bounds__(64*Waves,Occupancy) void glm53_down_tp4_kernel(
             {
                 const int offset=(linear+copy*Threads)*16;
                 const int r=offset/K,col=(offset%K)^((r&15)<<4);
-                const int src=(row_base+min(r,row_count-1))*K+col;
+                const int src=(shard_row+row_base+min(r,row_count-1))*K+col;
                 const int dest=(wave*64+copy*Threads)*16;
                 if(dest<Rows*K)a_buffer.template async_load<16>(shared.input+dest,src);
             }
             if(linear<Rows*(K/128))
             {
                 const int r=linear/(K/128),col=(linear%(K/128))*4;
-                scale_buffer.template async_load<4>(shared.scales+wave*64*4,(row_base+min(r,row_count-1))*(K/32)+col);
+                scale_buffer.template async_load<4>(shared.scales+wave*64*4,(shard_row+row_base+min(r,row_count-1))*(K/32)+col);
             }
             IQ2RCompressedTriplet pending[KT];
             uint64_t pending_bases=0;
@@ -1496,7 +1537,7 @@ __global__ __launch_bounds__(64*Waves,Occupancy) void glm53_down_tp4_kernel(
                     opus::vector_t<opus::bf16_t,4> packed;
 #pragma unroll
                     for(int c=0;c<4;++c)packed[c]=__builtin_bit_cast(opus::bf16_t,__float2bfloat16(sums[atom][m][c]*iq2r_gain<Classes>(aux,auxiliary_bytes,0)));
-                    out_buffer.template store<4>(packed,glm53_row_offset(out_r<row_count,(row_base+out_r)*Shape::DownRows+out_col));
+                    out_buffer.template store<4>(packed,glm53_row_offset(out_r<row_count,(shard_row+row_base+out_r)*Shape::DownRows+out_col));
                 }
             }
             __syncthreads();
@@ -2112,6 +2153,17 @@ __global__ __launch_bounds__(512,1) void glm53_down_route9_v2_kernel(
     const int expert=__builtin_amdgcn_readfirstlane(expert_ids[token*Routes+route]);
     const int row=__builtin_amdgcn_readfirstlane(scatter[token*9+route]);
     const int rows=static_cast<int>(gridDim.y)*9;
+    // Kernel shard blockIdx.z (Glm53SharedArgs::shards): its weights, input
+    // rows, shared expert and output [shards][tokens][hidden].
+    {
+        const int shard=static_cast<int>(blockIdx.z);
+        activations+=static_cast<int64_t>(shard)*rows*K;
+        scales+=static_cast<int64_t>(shard)*rows*(K/32);
+        output+=static_cast<int64_t>(shard)*gridDim.y*N;
+        all_data+=static_cast<int64_t>(shard)*Shape::Experts*data_bytes;
+        all_auxiliary+=static_cast<int64_t>(shard)*Shape::Experts*auxiliary_bytes;
+        sh=glm53_shared_shard<Shape>(sh,shard,K);
+    }
     // The scalars the epilogue and the loads need are loaded with the
     // prologue's, so no scalar load latency lands after the vector loads.
     asm volatile("" : "+s"(data_bytes), "+s"(auxiliary_bytes));
@@ -2344,6 +2396,17 @@ __global__ __launch_bounds__(512,1) void glm53_down_route9_wide_kernel(
     const int expert=__builtin_amdgcn_readfirstlane(expert_ids[token*Routes+route]);
     const int row=__builtin_amdgcn_readfirstlane(scatter[token*9+route]);
     const int rows=static_cast<int>(gridDim.y)*9;
+    // Kernel shard blockIdx.z (Glm53SharedArgs::shards): its weights, input
+    // rows, shared expert and output [shards][tokens][hidden].
+    {
+        const int shard=static_cast<int>(blockIdx.z);
+        activations+=static_cast<int64_t>(shard)*rows*K;
+        scales+=static_cast<int64_t>(shard)*rows*(K/32);
+        output+=static_cast<int64_t>(shard)*gridDim.y*N;
+        all_data+=static_cast<int64_t>(shard)*Shape::Experts*data_bytes;
+        all_auxiliary+=static_cast<int64_t>(shard)*Shape::Experts*auxiliary_bytes;
+        sh=glm53_shared_shard<Shape>(sh,shard,K);
+    }
     asm volatile("" : "+s"(data_bytes), "+s"(auxiliary_bytes));
     float weights[Routes];
 #pragma unroll
@@ -3025,15 +3088,20 @@ __global__ __launch_bounds__(512,4) void glm53_gate_decode_nobarrier_v2_kernel(
     __shared__ Storage shared;
     const int lane=threadIdx.x,wave=threadIdx.y;
     const int lane_row=lane%16,lane_group=lane/16;
+    const int shards=glm53_shards(sh);
     // Shared expert items first, strided over the workgroups.
     {
         const int2 span=glm53_shared_span(sh);
-        for(int item=span.x;item>=0 && item<glm53_shared_gate_items<NT>(sh);item+=span.y)
-            glm53_shared_gate_item<Shape,NT,2>(sh,activations,scales,item,&shared.partial[0][0][0][0]);
+        const int shard_items=glm53_shared_gate_items<NT>(sh);
+        for(int item=span.x;item>=0 && item<shard_items*shards;item+=span.y)
+            glm53_shared_gate_item<Shape,NT,2>(glm53_shared_shard<Shape>(sh,item/shard_items,NT*32),activations,scales,
+                                               item%shard_items,&shared.partial[0][0][0][0]);
         if(static_cast<int>(blockIdx.x)>=glm53_routed_grid(sh))return;
     }
     const int num_tasks=task_count[0];
-    const int total=num_tasks*NT;
+    // Items run task by task, each task's shards in turn: an expert's items
+    // stay contiguous and share its book.
+    const int total=num_tasks*NT*shards;
     int current_expert=-1;
     const int xcd=blockIdx.x%8,rank=blockIdx.x/8,ranks=(glm53_routed_grid(sh)-xcd+7)/8;
     const int per=(total+7)/8,tall=total%8==0?8:total%8;
@@ -3042,14 +3110,15 @@ __global__ __launch_bounds__(512,4) void glm53_gate_decode_nobarrier_v2_kernel(
     for(int local=rank;local<length;local+=ranks)
     {
         const int index=first+local;
-        const int task=index/NT,n_tile=index%NT;
+        const int task=index/(NT*shards),shard=index/NT%shards,n_tile=index%NT;
         const int row_begin=tasks[task*3];
         const int row_end=min(row_begin+16,row_begin+tasks[task*3+1]);
         const int expert=tasks[task*3+2];
         const int active_m=(row_end-row_begin+15)/16;
         if(row_begin>=row_end || row_begin<0 || row_end>routes || expert<0 || expert>=Shape::Experts) continue;
-        const uint8_t* data=all_data+static_cast<int64_t>(expert)*data_bytes;
-        const uint8_t* aux=all_auxiliary+static_cast<int64_t>(expert)*auxiliary_bytes;
+        const int64_t stacked=static_cast<int64_t>(shard)*Shape::Experts+expert;
+        const uint8_t* data=all_data+stacked*data_bytes;
+        const uint8_t* aux=all_auxiliary+stacked*auxiliary_bytes;
         // The previous item ended in a barrier, so the book may be overwritten.
         const bool new_expert=expert!=current_expert;
         // A new expert's copy 0 loads first; its copies are formed once the
@@ -3160,8 +3229,8 @@ __global__ __launch_bounds__(512,4) void glm53_gate_decode_nobarrier_v2_kernel(
                         const float inverse=1.0f/bs.dq_scale;
 #pragma unroll
                         for(int atom=0;atom<4;++atom)
-                            output[static_cast<int64_t>(output_row)*(NT*32)+n_tile*32+atom*8+lane_row/2]=opus::fp32_to_fp8(activated[atom]*inverse);
-                        if(lane_row==0) output_scales[static_cast<int64_t>(output_row)*NT+n_tile]=bs.byte;
+                            output[(static_cast<int64_t>(shard)*routes+output_row)*(NT*32)+n_tile*32+atom*8+lane_row/2]=opus::fp32_to_fp8(activated[atom]*inverse);
+                        if(lane_row==0) output_scales[(static_cast<int64_t>(shard)*routes+output_row)*NT+n_tile]=bs.byte;
                     }
                 }
             }
@@ -3203,7 +3272,7 @@ int64_t glm53_auxiliary_bytes(int64_t n, int64_t k, int atoms, int entries)
 template<class F>
 void glm5_with_experts(const aiter_tensor_t& data, F&& f)
 {
-    const int64_t experts = data.dim() == 2 ? data.size(0) : -1;
+    const int64_t experts = data.dim() == 2 ? data.size(0) : data.dim() == 3 ? data.size(1) : -1;
     if(experts == Glm53Shape::Experts)
         f(Glm53Shape{});
     else if(experts == Glm5NextShape::Experts)
@@ -3218,16 +3287,38 @@ int64_t glm53_gate_bytes(int64_t n, int entries)
     return n / 64 * Shape::KTiles * (entries == 1024 ? iq2r_quad_bytes<1024>() : iq2r_quad_bytes<512>());
 }
 
+// Kernel shards of a packed stack: [shards][experts][bytes], or
+// [experts][bytes] for one (Glm53SharedArgs::shards).
+int glm53_stack_shards(const aiter_tensor_t& data)
+{
+    return data.dim() == 3 ? static_cast<int>(data.size(0)) : 1;
+}
+
+// Last-dimension size of a stack, 0 for another rank.
+int64_t glm53_stack_bytes(const aiter_tensor_t& t)
+{
+    return t.dim() == 2 || t.dim() == 3 ? t.size(t.dim() - 1) : 0;
+}
+
 template<class Shape>
 void glm53_check_stack(const aiter_tensor_t& data, const aiter_tensor_t& auxiliary, int64_t data_bytes,
                        int64_t auxiliary_bytes)
 {
-    AITER_CHECK(data.dtype() == AITER_DTYPE_u8 && data.dim() == 2 && data.size(0) == Shape::Experts &&
-                    data.size(1) == data_bytes,
-                "GLM-5 IQ2R weights must be a packed uint8 stack of the model's experts");
-    AITER_CHECK(auxiliary.dtype() == AITER_DTYPE_u8 && auxiliary.dim() == 2 && auxiliary.size(0) == Shape::Experts &&
-                    auxiliary.size(1) == auxiliary_bytes,
+    const int lead = data.dim() - 2;
+    AITER_CHECK(data.dtype() == AITER_DTYPE_u8 && (data.dim() == 2 || data.dim() == 3) &&
+                    data.size(lead) == Shape::Experts && data.size(lead + 1) == data_bytes,
+                "GLM-5 IQ2R weights must be a packed uint8 stack of the model's experts ([shards,] experts, bytes)");
+    AITER_CHECK(auxiliary.dtype() == AITER_DTYPE_u8 && auxiliary.dim() == data.dim() &&
+                    (lead == 0 || auxiliary.size(0) == data.size(0)) && auxiliary.size(lead) == Shape::Experts &&
+                    auxiliary.size(lead + 1) == auxiliary_bytes,
                 "GLM-5 IQ2R auxiliary must be the packed IQ2R-v2 bytes of the model's experts");
+}
+
+// A [shards][rows][columns] tensor, or [rows][columns] for one shard.
+bool glm53_shard_matrix(const aiter_tensor_t& t, int shards, int64_t rows, int64_t columns)
+{
+    return shards == 1 ? t.dim() == 2 && t.size(0) == rows && t.size(1) == columns
+                       : t.dim() == 3 && t.size(0) == shards && t.size(1) == rows && t.size(2) == columns;
 }
 
 // Width and codebook size of a packed gate/up stack, from its sizes: the
@@ -3239,8 +3330,8 @@ Glm53GateShape glm53_gate_shape(const aiter_tensor_t& data, const aiter_tensor_t
 {
     for(const int entries : {512, 1024})
         for(const int64_t n : {1024, 512})
-            if(data.dim() == 2 && data.size(1) == glm53_gate_bytes<Shape>(n, entries) && auxiliary.dim() == 2 &&
-               auxiliary.size(1) == glm53_auxiliary_bytes(n, Shape::Hidden, 4, entries))
+            if(glm53_stack_bytes(data) == glm53_gate_bytes<Shape>(n, entries) &&
+               glm53_stack_bytes(auxiliary) == glm53_auxiliary_bytes(n, Shape::Hidden, 4, entries))
             {
                 glm53_check_stack<Shape>(data, auxiliary, glm53_gate_bytes<Shape>(n, entries),
                                          glm53_auxiliary_bytes(n, Shape::Hidden, 4, entries));
@@ -3267,7 +3358,8 @@ void glm53_check_gate_io(const aiter_tensor_t& activations,
                          const aiter_tensor_t& output_scales,
                          int rows,
                          int routes,
-                         int intermediate)
+                         int intermediate,
+                         int shards)
 {
     AITER_CHECK(activations.dtype() == AITER_DTYPE_fp8 && activations.dim() == 2 &&
                     activations.size(0) == rows && activations.size(1) == Shape::Hidden,
@@ -3275,11 +3367,11 @@ void glm53_check_gate_io(const aiter_tensor_t& activations,
     AITER_CHECK(scales.dtype() == AITER_DTYPE_u8 && scales.dim() == 2 && scales.size(0) == rows &&
                     scales.size(1) == Shape::Groups,
                 "GLM-5 IQ2R gate input scales must be uint8 [rows, hidden / 32]");
-    AITER_CHECK(output.dtype() == AITER_DTYPE_fp8 && output.dim() == 2 && output.size(0) == routes &&
-                    output.size(1) == intermediate && output_scales.dtype() == AITER_DTYPE_u8 &&
-                    output_scales.dim() == 2 && output_scales.size(0) == routes &&
-                    output_scales.size(1) == intermediate / kScaleBlock,
-                "GLM-5.3 IQ2R gate output must be FP8 [routes, I] with uint8 scales [routes, I/32]");
+    AITER_CHECK(output.dtype() == AITER_DTYPE_fp8 && glm53_shard_matrix(output, shards, routes, intermediate) &&
+                    output_scales.dtype() == AITER_DTYPE_u8 &&
+                    glm53_shard_matrix(output_scales, shards, routes, intermediate / kScaleBlock),
+                "GLM-5.3 IQ2R gate output must be FP8 [shards, routes, I] with uint8 scales [shards, routes, I/32] "
+                "([routes, ...] for one shard)");
 }
 
 void glm53_check_tasks(const aiter_tensor_t& tasks, const aiter_tensor_t& task_count, int64_t capacity)
@@ -3302,24 +3394,28 @@ Glm53SharedArgs glm53_shared_args(const aiter_tensor_t& gate,
                                   const aiter_tensor_t& scatter,
                                   const aiter_tensor_t& act,
                                   int intermediate,
-                                  int tokens)
+                                  int tokens,
+                                  int shards)
 {
     Glm53SharedArgs sh{};
     sh.tokens = tokens;
+    sh.shards = shards;
     const bool has_gate = gate.numel() > 0, has_down = down.numel() > 0;
     if(!has_gate && !has_down)
         return sh;
+    // Every operand below holds ``shards`` stacked shards.
+    const int64_t s = shards;
     AITER_CHECK(tokens <= 1024, "GLM-5.3 IQ2R fused shared expert covers up to 1024 tokens");
     AITER_CHECK(act.dtype() == AITER_DTYPE_bf16 && act.is_contiguous() &&
-                    static_cast<int64_t>(act.numel()) >= int64_t(tokens) * intermediate,
-                "GLM-5.3 IQ2R shared activation must be contiguous BF16 [tokens, I]");
+                    static_cast<int64_t>(act.numel()) >= s * tokens * intermediate,
+                "GLM-5.3 IQ2R shared activation must be contiguous BF16 [shards, tokens, I]");
     sh.act = static_cast<__hip_bfloat16*>(act.data_ptr());
     if(has_gate)
     {
         AITER_CHECK(gate.dtype() == AITER_DTYPE_u8 &&
-                        static_cast<int64_t>(gate.numel()) == int64_t(2) * intermediate * Shape::Hidden &&
+                        static_cast<int64_t>(gate.numel()) == s * 2 * intermediate * Shape::Hidden &&
                         gate_scales.dtype() == AITER_DTYPE_u8 &&
-                        static_cast<int64_t>(gate_scales.numel()) == int64_t(2) * intermediate * Shape::Hidden / 32,
+                        static_cast<int64_t>(gate_scales.numel()) == s * 2 * intermediate * Shape::Hidden / 32,
                     "GLM-5 IQ2R shared gate/up must be MXFP8 bytes [2I * hidden] and scales [2I * hidden / 32]");
         sh.gate        = static_cast<const uint8_t*>(gate.data_ptr());
         sh.gate_scales = static_cast<const uint8_t*>(gate_scales.data_ptr());
@@ -3330,9 +3426,9 @@ Glm53SharedArgs glm53_shared_args(const aiter_tensor_t& gate,
                         static_cast<int64_t>(scatter.numel()) == int64_t(tokens) * kGlm53RouteSlots,
                     "GLM-5.3 IQ2R shared expert needs the int32 route scatter [tokens * 9]");
         AITER_CHECK(down.dtype() == AITER_DTYPE_u8 &&
-                        static_cast<int64_t>(down.numel()) == int64_t(intermediate) * Shape::DownRows &&
+                        static_cast<int64_t>(down.numel()) == s * intermediate * Shape::DownRows &&
                         down_scales.dtype() == AITER_DTYPE_u8 &&
-                        static_cast<int64_t>(down_scales.numel()) == int64_t(intermediate) * Shape::DownRows / 32,
+                        static_cast<int64_t>(down_scales.numel()) == s * intermediate * Shape::DownRows / 32,
                     "GLM-5 IQ2R shared down must be MXFP8 bytes [down rows * I] and scales [down rows * I / 32]");
         sh.scatter     = static_cast<const int32_t*>(scatter.data_ptr());
         sh.down        = static_cast<const uint8_t*>(down.data_ptr());
@@ -3356,18 +3452,20 @@ Glm53DownShape glm53_down_shape(const aiter_tensor_t& activations,
                                 const aiter_tensor_t& data,
                                 const aiter_tensor_t& auxiliary)
 {
-    const int intermediate = static_cast<int>(activations.size(1));
+    const int shards = glm53_stack_shards(data);
+    AITER_CHECK(activations.dim() == (shards == 1 ? 2 : 3), "GLM-5.3 IQ2R down input must be [shards,] routes, K");
+    const int intermediate = static_cast<int>(activations.size(activations.dim() - 1));
+    const int64_t routes = activations.size(activations.dim() - 2);
     AITER_CHECK(intermediate == 256 || intermediate == 512, "GLM-5.3 IQ2R down K must be 256 or 512");
     const int entries =
-        auxiliary.dim() == 2 && auxiliary.size(1) == glm53_auxiliary_bytes(Shape::DownRows, intermediate, 3, 1024) ? 1024 : 512;
+        glm53_stack_bytes(auxiliary) == glm53_auxiliary_bytes(Shape::DownRows, intermediate, 3, 1024) ? 1024 : 512;
     glm53_check_stack<Shape>(data, auxiliary, expected_data_bytes(Shape::DownRows, intermediate, entries),
                              glm53_auxiliary_bytes(Shape::DownRows, intermediate, 3, entries));
-    AITER_CHECK(activations.dtype() == AITER_DTYPE_fp8 && activations.dim() == 2 &&
-                    activations.size(0) % kGlm53RouteSlots == 0,
-                "GLM-5.3 IQ2R down input must be FP8 [tokens*9, K]");
-    AITER_CHECK(scales.dtype() == AITER_DTYPE_u8 && scales.dim() == 2 &&
-                    scales.size(0) == activations.size(0) && scales.size(1) == intermediate / kScaleBlock,
-                "GLM-5.3 IQ2R down scales must be uint8 [routes, K/32]");
+    AITER_CHECK(activations.dtype() == AITER_DTYPE_fp8 && glm53_shard_matrix(activations, shards, routes, intermediate) &&
+                    routes % kGlm53RouteSlots == 0,
+                "GLM-5.3 IQ2R down input must be FP8 [shards, tokens*9, K] ([tokens*9, K] for one shard)");
+    AITER_CHECK(scales.dtype() == AITER_DTYPE_u8 && glm53_shard_matrix(scales, shards, routes, intermediate / kScaleBlock),
+                "GLM-5.3 IQ2R down scales must be uint8 [shards, routes, K/32]");
     return {intermediate, entries};
 }
 
@@ -3388,13 +3486,14 @@ void iq2r_glm53_gate_m1_out(const aiter_tensor_t& activations,
     glm5_with_experts(data, [&](auto shape) {
     using Shape = decltype(shape);
     const auto [tp4, entries] = glm53_gate_shape<Shape>(data, auxiliary);
+    const int shards = glm53_stack_shards(data);
     glm53_check_device({&activations, &scales, &auxiliary, &tasks, &task_count, &output, &output_scales}, data);
     const int routes = kGlm53RouteSlots;
-    glm53_check_gate_io<Shape>(activations, scales, output, output_scales, routes, routes, tp4 ? 512 : 256);
+    glm53_check_gate_io<Shape>(activations, scales, output, output_scales, routes, routes, tp4 ? 512 : 256, shards);
     glm53_check_tasks(tasks, task_count, routes);
     const aiter_tensor_t none{};
-    const Glm53SharedArgs sh =
-        glm53_shared_args<Shape>(shared_gate, shared_gate_scales, none, none, none, shared_act, tp4 ? 512 : 256, 1);
+    const Glm53SharedArgs sh = glm53_shared_args<Shape>(
+        shared_gate, shared_gate_scales, none, none, none, shared_act, tp4 ? 512 : 256, 1, shards);
     HipDeviceGuard device_guard(data.device_id);
     const auto kernel = entries == 1024 ? (tp4 ? glm53_gate_m1_kernel<Shape, 16, C, 1024> : glm53_gate_m1_kernel<Shape, 8, C, 1024>)
                                         : (tp4 ? glm53_gate_m1_kernel<Shape, 16, C, 512> : glm53_gate_m1_kernel<Shape, 8, C, 512>);
@@ -3412,8 +3511,8 @@ void iq2r_glm53_gate_m1_out(const aiter_tensor_t& activations,
                        static_cast<opus::fp8_t*>(output.data_ptr()),
                        static_cast<uint8_t*>(output_scales.data_ptr()),
                        routes,
-                       static_cast<int>(data.size(1)),
-                       static_cast<int>(auxiliary.size(1)),
+                       static_cast<int>(glm53_stack_bytes(data)),
+                       static_cast<int>(glm53_stack_bytes(auxiliary)),
                        sh);
     HIP_CALL_LAUNCH(hipGetLastError());
     });
@@ -3437,23 +3536,25 @@ void iq2r_glm53_gate_out(const aiter_tensor_t& activations,
     glm5_with_experts(data, [&](auto shape) {
     using Shape = decltype(shape);
     const auto [tp4, entries] = glm53_gate_shape<Shape>(data, auxiliary);
+    const int shards = glm53_stack_shards(data);
     glm53_check_device(
         {&activations, &scales, &auxiliary, &tasks, &task_count, &gather, &output, &output_scales}, data);
     const int tokens = static_cast<int>(activations.size(0));
     const int routes = tokens * kGlm53RouteSlots;
-    glm53_check_gate_io<Shape>(activations, scales, output, output_scales, tokens, routes, tp4 ? 512 : 256);
+    glm53_check_gate_io<Shape>(activations, scales, output, output_scales, tokens, routes, tp4 ? 512 : 256, shards);
     AITER_CHECK(gather.dtype() == AITER_DTYPE_i32 && gather.dim() == 1 && gather.size(0) == routes,
                 "GLM-5.3 IQ2R gate gather must be int32 [routes]");
     AITER_CHECK(grid_multiplier >= 1 && grid_multiplier <= 8, "GLM-5.3 IQ2R gate grid multiplier");
     const bool prefill = kernel == kGlm53GatePrefill;
     AITER_CHECK(prefill || kernel == kGlm53GateDecodeNoBarrier, "GLM-5.3 IQ2R gate kernel id");
+    AITER_CHECK(!prefill || shards == 1, "GLM-5.3 IQ2R prefill gate runs one kernel shard per launch");
     AITER_CHECK(tokens >= 2 && tokens <= (prefill ? 4096 : 1024),
                 "GLM-5.3 IQ2R gate token range: decode 2..1024, prefill 2..4096");
     const int rows = prefill ? 64 : 16;
     glm53_check_tasks(tasks, task_count, (routes + rows - 1) / rows + std::min(routes, Shape::Experts));
     const aiter_tensor_t none{};
-    const Glm53SharedArgs sh =
-        glm53_shared_args<Shape>(shared_gate, shared_gate_scales, none, none, none, shared_act, tp4 ? 512 : 256, tokens);
+    const Glm53SharedArgs sh = glm53_shared_args<Shape>(
+        shared_gate, shared_gate_scales, none, none, none, shared_act, tp4 ? 512 : 256, tokens, shards);
     AITER_CHECK(!prefill || sh.gate == nullptr, "GLM-5.3 IQ2R shared expert runs with the decode gate only");
     HipDeviceGuard device_guard(data.device_id);
     const auto launch =
@@ -3472,7 +3573,7 @@ void iq2r_glm53_gate_out(const aiter_tensor_t& activations,
     if(sh.gate != nullptr)
     {
         const int rows = glm53_host_shared_rows(tokens);
-        const int items = (tokens + rows - 1) / rows * (tp4 ? 16 : 8) * 4;
+        const int items = (tokens + rows - 1) / rows * (tp4 ? 16 : 8) * 4 * shards;
         // Own workgroups only if every workgroup is resident at once (two
         // per CU); otherwise they would start last.
         if(routed_blocks + items <= 2 * static_cast<int>(get_num_cu_func()))
@@ -3496,8 +3597,8 @@ void iq2r_glm53_gate_out(const aiter_tensor_t& activations,
                        static_cast<opus::fp8_t*>(output.data_ptr()),
                        static_cast<uint8_t*>(output_scales.data_ptr()),
                        routes,
-                       static_cast<int>(data.size(1)),
-                       static_cast<int>(auxiliary.size(1)),
+                       static_cast<int>(glm53_stack_bytes(data)),
+                       static_cast<int>(glm53_stack_bytes(auxiliary)),
                        launch_sh);
     HIP_CALL_LAUNCH(hipGetLastError());
     });
@@ -3521,20 +3622,21 @@ void iq2r_glm53_down_out(const aiter_tensor_t& activations,
     using Shape = decltype(shape);
     const auto [K, entries] = glm53_down_shape<Shape>(activations, scales, data, auxiliary);
     const bool tp4 = K == 512;
+    const int shards = glm53_stack_shards(data);
     glm53_check_device({&activations, &scales, &auxiliary, &tasks, &task_count, &output}, data);
-    const int routes = static_cast<int>(activations.size(0));
+    const int routes = static_cast<int>(activations.size(activations.dim() - 2));
     AITER_CHECK(routes >= 2 * kGlm53RouteSlots && routes <= 1024 * kGlm53RouteSlots,
                 "GLM-5.3 IQ2R decode down covers M2..1024");
     glm53_check_tasks(tasks, task_count, (routes + 31) / 32 + std::min(routes, Shape::Experts));
-    AITER_CHECK(output.dtype() == AITER_DTYPE_bf16 && output.dim() == 2 && output.size(0) == routes &&
-                    output.size(1) == Shape::DownRows,
-                "GLM-5 IQ2R down output must be BF16 [routes, down rows]");
+    AITER_CHECK(output.dtype() == AITER_DTYPE_bf16 && glm53_shard_matrix(output, shards, routes, Shape::DownRows),
+                "GLM-5 IQ2R down output must be BF16 [shards, routes, down rows] ([routes, down rows] for one shard)");
     AITER_CHECK(kernel == kGlm53DownSingle || (kernel == kGlm53DownOrdered && !tp4) || (kernel == kGlm53DownSingle2 && tp4),
                 "GLM-5.3 IQ2R down kernel id");
+    AITER_CHECK(shards == 1 || tp4, "GLM-5.3 IQ2R kernel shards are 512 wide (the TP4 down kernels)");
     AITER_CHECK(grid_multiplier >= 1 && grid_multiplier <= 16, "GLM-5.3 IQ2R down grid multiplier");
     const aiter_tensor_t none{};
-    const Glm53SharedArgs sh =
-        glm53_shared_args<Shape>(none, none, shared_down, shared_down_scales, scatter, shared_act, K, routes / kGlm53RouteSlots);
+    const Glm53SharedArgs sh = glm53_shared_args<Shape>(
+        none, none, shared_down, shared_down_scales, scatter, shared_act, K, routes / kGlm53RouteSlots, shards);
     HipDeviceGuard device_guard(data.device_id);
     const int routed_blocks = static_cast<int>(grid_multiplier) * static_cast<int>(get_num_cu_func());
     Glm53SharedArgs launch_sh = sh;
@@ -3542,7 +3644,7 @@ void iq2r_glm53_down_out(const aiter_tensor_t& activations,
     if(sh.down != nullptr)
     {
         const int tokens = routes / kGlm53RouteSlots, rows = glm53_host_shared_rows(tokens);
-        const int items  = (tokens + rows - 1) / rows * (Shape::Hidden / 128);
+        const int items  = (tokens + rows - 1) / rows * (Shape::Hidden / 128) * shards;
         if(routed_blocks + items <= 2 * static_cast<int>(get_num_cu_func()))
         {
             shared_blocks           = items;
@@ -3557,8 +3659,8 @@ void iq2r_glm53_down_out(const aiter_tensor_t& activations,
         static_cast<const uint8_t*>(auxiliary.data_ptr()),                                  \
         static_cast<const int32_t*>(tasks.data_ptr()),                                      \
         static_cast<const int32_t*>(task_count.data_ptr()),                                 \
-        static_cast<__hip_bfloat16*>(output.data_ptr()), routes, static_cast<int>(data.size(0)),             \
-        static_cast<int>(data.size(1)), static_cast<int>(auxiliary.size(1)), launch_sh
+        static_cast<__hip_bfloat16*>(output.data_ptr()), routes, static_cast<int>(Shape::Experts),           \
+        static_cast<int>(glm53_stack_bytes(data)), static_cast<int>(glm53_stack_bytes(auxiliary)), launch_sh
     // Single: one 16-row atom per pass for decode-sized tasks, three workgroups per CU.
 #define GLM53_DOWN_LAUNCH(E)                                                                            \
     if(tp4 && kernel == kGlm53DownSingle2)                                                              \
@@ -3602,8 +3704,9 @@ void iq2r_glm53_down_route9_out(const aiter_tensor_t& activations,
     glm5_with_experts(data, [&](auto shape) {
     using Shape = decltype(shape);
     const auto [K, entries] = glm53_down_shape<Shape>(activations, scales, data, auxiliary);
+    const int shards = glm53_stack_shards(data);
     glm53_check_device({&activations, &scales, &auxiliary, &expert_ids, &scatter, &route_weights, &output}, data);
-    const int routes = static_cast<int>(activations.size(0));
+    const int routes = static_cast<int>(activations.size(activations.dim() - 2));
     const int tokens = routes / kGlm53RouteSlots;
     AITER_CHECK(tokens == 1 || tokens == 2 || tokens == 4, "GLM-5.3 IQ2R route9 down covers M1, M2 and M4");
     AITER_CHECK(expert_ids.dtype() == AITER_DTYPE_i32 && expert_ids.numel() == tokens * kGlm53TopK &&
@@ -3611,12 +3714,11 @@ void iq2r_glm53_down_route9_out(const aiter_tensor_t& activations,
                 "GLM-5.3 IQ2R route9 expert ids must be int32 [tokens, 8], scatter int32 [tokens * 9]");
     AITER_CHECK(route_weights.dtype() == AITER_DTYPE_fp32 && route_weights.numel() == tokens * kGlm53TopK,
                 "GLM-5.3 IQ2R route9 weights must be float32 [tokens, 8]");
-    AITER_CHECK(output.dtype() == AITER_DTYPE_bf16 && output.dim() == 2 && output.size(0) == tokens &&
-                    output.size(1) == Shape::Hidden,
-                "GLM-5 IQ2R route9 output must be BF16 [tokens, hidden]");
+    AITER_CHECK(output.dtype() == AITER_DTYPE_bf16 && glm53_shard_matrix(output, shards, tokens, Shape::Hidden),
+                "GLM-5 IQ2R route9 output must be BF16 [shards, tokens, hidden] ([tokens, hidden] for one shard)");
     const aiter_tensor_t none{};
     const Glm53SharedArgs sh =
-        glm53_shared_args<Shape>(none, none, shared_down, shared_down_scales, scatter, shared_act, K, tokens);
+        glm53_shared_args<Shape>(none, none, shared_down, shared_down_scales, scatter, shared_act, K, tokens, shards);
     HipDeviceGuard device_guard(data.device_id);
     // Two triplets per CTA at M4: half the CTAs, and half the per-route codebook formation.
     const int triplets = tokens >= 4 ? 2 : 1;
@@ -3627,7 +3729,7 @@ void iq2r_glm53_down_route9_out(const aiter_tensor_t& activations,
             : (K == 512 ? (triplets == 2 ? glm53_down_route9_v2_kernel<Shape, 4, C, 2> : glm53_down_route9_v2_kernel<Shape, 4, C, 1>)
                         : (triplets == 2 ? glm53_down_route9_v2_kernel<Shape, 2, C, 2> : glm53_down_route9_v2_kernel<Shape, 2, C, 1>));
     hipLaunchKernelGGL(kernel,
-                       dim3(Shape::DownRows / 48 / triplets, tokens),
+                       dim3(Shape::DownRows / 48 / triplets, tokens, shards),
                        dim3(64, kGlm53TopK),
                        0,
                        getCurrentHIPStream(),
@@ -3639,8 +3741,8 @@ void iq2r_glm53_down_route9_out(const aiter_tensor_t& activations,
                        static_cast<const int32_t*>(scatter.data_ptr()),
                        static_cast<const float*>(route_weights.data_ptr()),
                        static_cast<__hip_bfloat16*>(output.data_ptr()),
-                       static_cast<int>(data.size(1)),
-                       static_cast<int>(auxiliary.size(1)),
+                       static_cast<int>(glm53_stack_bytes(data)),
+                       static_cast<int>(glm53_stack_bytes(auxiliary)),
                        sh);
     HIP_CALL_LAUNCH(hipGetLastError());
     });
@@ -3661,6 +3763,7 @@ void iq2r_glm53_down_reduce_out(const aiter_tensor_t& activations,
     glm5_with_experts(data, [&](auto shape) {
     using Shape = decltype(shape);
     const auto [K, entries] = glm53_down_shape<Shape>(activations, scales, data, auxiliary);
+    AITER_CHECK(glm53_stack_shards(data) == 1, "GLM-5.3 IQ2R prefill down runs one kernel shard per launch");
     glm53_check_device(
         {&activations, &scales, &auxiliary, &tasks, &task_count, &route_output, &scatter, &route_weights, &output},
         data);

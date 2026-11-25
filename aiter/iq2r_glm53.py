@@ -1102,8 +1102,15 @@ class IQ2RGlm53Workspace:
     gate_task_count: Tensor
     sort_scratch: Tensor
     shared_act: Tensor
-    shard_output: Tensor  # [shards, tokens, hidden] of a rank of several shards
+    shard_output: Tensor  # [shards * tokens, hidden] of a rank of several shards
     empty: Tensor
+
+    def stacked(self, buffer: Tensor, rows: int) -> Tensor:
+        """``buffer``'s first rows as [shards, rows, ...] (as [rows, ...] for
+        one shard), contiguous: the kernels' stacked shard layout."""
+        if self.shards == 1:
+            return buffer[:rows]
+        return buffer[: self.shards * rows].view(self.shards, rows, *buffer.shape[1:])
 
     @classmethod
     def allocate(
@@ -1121,6 +1128,7 @@ class IQ2RGlm53Workspace:
         routes = max_tokens * ROUTE_SLOTS
         rows = max(max_tokens, ROUTE_SLOTS)  # M1 quantizes each of its route slots
         decode_routes = min(max_tokens, MAX_DECODE_TOKENS) * ROUTE_SLOTS
+        shard_routes = max(routes, shards * decode_routes)
         i32 = {"dtype": torch.int32, "device": device}
         u8 = {"dtype": torch.uint8, "device": device}
         fp8 = {"dtype": torch.float8_e4m3fn, "device": device}
@@ -1133,12 +1141,13 @@ class IQ2RGlm53Workspace:
             shard_size=shard_size,
             route_input_fp8=torch.empty((rows, shape.hidden), **fp8),
             route_input_scales=torch.empty((rows, shape.hidden // 32), **u8),
-            # The shards run one after another through one set of buffers.
-            intermediate_fp8=torch.empty((routes, shard_size), **fp8),
-            intermediate_scales=torch.empty((routes, shard_size // 32), **u8),
+            # Decode launches run every shard at once (stacked [shards,
+            # routes, ...]); prefill runs the shards one after another.
+            intermediate_fp8=torch.empty((shard_routes, shard_size), **fp8),
+            intermediate_scales=torch.empty((shard_routes, shard_size // 32), **u8),
             # The down kernels write every down row, padding included.
             route_output=torch.empty(
-                (routes, shape.down_rows), dtype=torch.bfloat16, device=device
+                (shard_routes, shape.down_rows), dtype=torch.bfloat16, device=device
             ),
             gather_indices=torch.empty((routes,), **i32),
             scatter_indices=torch.empty((routes,), **i32),
@@ -1160,12 +1169,12 @@ class IQ2RGlm53Workspace:
             sort_scratch=torch.empty(((routes + 255) // 256 * 512 + 1024,), **i32),
             # SiLU(gate) * up of the fused shared expert, BF16 [tokens, I].
             shared_act=torch.empty(
-                (min(max_tokens, MAX_DECODE_TOKENS), shard_size),
+                (shards * min(max_tokens, MAX_DECODE_TOKENS), shard_size),
                 dtype=torch.bfloat16,
                 device=device,
             ),
             shard_output=torch.empty(
-                (shards, max_tokens, shape.hidden) if shards > 1 else (0,),
+                (shards * max_tokens if shards > 1 else 0, shape.hidden),
                 dtype=torch.bfloat16,
                 device=device,
             ),
@@ -1281,13 +1290,11 @@ def iq2r_glm53_moe_out(
     scatter = workspace.scatter_indices[:routes]
     tasks = workspace.tasks
     count = workspace.task_count
-    intermediate = workspace.intermediate_fp8[:routes]
-    intermediate_scales = workspace.intermediate_scales[:routes]
     quant_rows = ROUTE_SLOTS if tokens == 1 else tokens
     quant = workspace.route_input_fp8[:quant_rows]
     quant_scales = workspace.route_input_scales[:quant_rows]
     empty = workspace.empty
-    act = workspace.shared_act[: min(tokens, MAX_DECODE_TOKENS)]
+    shared_tokens = min(tokens, MAX_DECODE_TOKENS)
     prefill = tokens > 1 and config.gate_kernel == "prefill"
 
     # Route sort and activation quantization, once for every shard.
@@ -1314,59 +1321,75 @@ def iq2r_glm53_moe_out(
             workspace.sort_scratch,
         )  # fmt: skip
 
-    for index in range(shards):
-        if shards == 1:
-            gate_up, gate_aux, down, down_aux = stacks
-            part, out = shared, output
-        else:
-            gate_up, gate_aux, down, down_aux = (t[index] for t in stacks)
-            part = None if shared is None else shared.shard(index)
-            out = workspace.shard_output[index, :tokens]
-        shared_gate_args = (
-            (empty, empty, act) if part is None else (part.gate, part.gate_scales, act)
-        )
-        shared_down_args = (
-            (empty, empty, act) if part is None else (part.down, part.down_scales, act)
-        )
-        if tokens == 1:
-            iq2r_glm53_gate_m1_out(
-                quant, quant_scales, gate_up, gate_aux, tasks, count,
-                intermediate, intermediate_scales, *shared_gate_args,
-            )  # fmt: skip
-        elif not prefill:
+    if prefill:
+        # The prefill kernels run one shard per launch, through one set of
+        # buffers.
+        intermediate = workspace.intermediate_fp8[:routes]
+        intermediate_scales = workspace.intermediate_scales[:routes]
+        act = workspace.shared_act[:shared_tokens]
+        shard_output = workspace.stacked(workspace.shard_output, tokens)
+        for index in range(shards):
+            parts = stacks if shards == 1 else tuple(t[index] for t in stacks)
+            out = output if shards == 1 else shard_output[index]
             iq2r_glm53_gate_out(
-                quant, quant_scales, gate_up, gate_aux, gate_tasks,
-                workspace.gate_task_count, gather, intermediate, intermediate_scales,
-                GATE_KERNELS[config.gate_kernel], config.gate_grid, *shared_gate_args,
-            )  # fmt: skip
-        else:
-            iq2r_glm53_gate_out(
-                quant, quant_scales, gate_up, gate_aux, tasks, count,
+                quant, quant_scales, parts[0], parts[1], tasks, count,
                 gather, intermediate, intermediate_scales, GATE_KERNELS["prefill"],
                 config.gate_grid, empty, empty, act,
             )  # fmt: skip
             iq2r_glm53_down_reduce_out(
-                intermediate, intermediate_scales, down, down_aux, tasks,
+                intermediate, intermediate_scales, parts[2], parts[3], tasks,
                 count, workspace.route_output[:routes], scatter, topk_weights, out,
                 config.down_chunks,
             )  # fmt: skip
-            continue
-        if config.down_kernel == "route9":
-            # Token-owned down projection with the weighted top-8 sum fused in.
-            iq2r_glm53_down_route9_out(
-                intermediate, intermediate_scales, down, down_aux, ids,
-                scatter, topk_weights, out, *shared_down_args,
-            )  # fmt: skip
-            continue
-        route_output = workspace.route_output[:routes]
-        iq2r_glm53_down_out(
-            intermediate, intermediate_scales, down, down_aux, tasks, count,
-            route_output, DOWN_KERNELS[config.down_kernel], config.down_grid, scatter,
-            *shared_down_args,
+        if shards > 1:
+            output.copy_(shard_output.sum(dim=0, dtype=torch.float32))
+        return
+
+    # M1 and decode: each launch runs every shard (stacked [shards, ...]).
+    intermediate = workspace.stacked(workspace.intermediate_fp8, routes)
+    intermediate_scales = workspace.stacked(workspace.intermediate_scales, routes)
+    act = workspace.stacked(workspace.shared_act, shared_tokens)
+    shared_gate_args = (
+        (empty, empty, act)
+        if shared is None
+        else (shared.gate, shared.gate_scales, act)
+    )
+    shared_down_args = (
+        (empty, empty, act)
+        if shared is None
+        else (shared.down, shared.down_scales, act)
+    )
+    if tokens == 1:
+        iq2r_glm53_gate_m1_out(
+            quant, quant_scales, gate_up_data, gate_up_auxiliary, tasks, count,
+            intermediate, intermediate_scales, *shared_gate_args,
         )  # fmt: skip
-        iq2r_glm53_route_reduce_out(route_output, topk_weights, scatter, out)
-    if shards > 1:
-        output.copy_(workspace.shard_output[:, :tokens].sum(dim=0, dtype=torch.float32))
+    else:
+        iq2r_glm53_gate_out(
+            quant, quant_scales, gate_up_data, gate_up_auxiliary, gate_tasks,
+            workspace.gate_task_count, gather, intermediate, intermediate_scales,
+            GATE_KERNELS[config.gate_kernel], config.gate_grid, *shared_gate_args,
+        )  # fmt: skip
+    if config.down_kernel == "route9":
+        # Token-owned down projection with the weighted top-8 sum fused in.
+        out = (
+            output if shards == 1 else workspace.stacked(workspace.shard_output, tokens)
+        )
+        iq2r_glm53_down_route9_out(
+            intermediate, intermediate_scales, down_data, down_auxiliary, ids,
+            scatter, topk_weights, out, *shared_down_args,
+        )  # fmt: skip
+        if shards > 1:
+            output.copy_(out.sum(dim=0, dtype=torch.float32))
+        return
+    route_output = workspace.stacked(workspace.route_output, routes)
+    iq2r_glm53_down_out(
+        intermediate, intermediate_scales, down_data, down_auxiliary, tasks, count,
+        route_output, DOWN_KERNELS[config.down_kernel], config.down_grid, scatter,
+        *shared_down_args,
+    )  # fmt: skip
+    # The reduce also sums the shards.
+    iq2r_glm53_route_reduce_out(route_output, topk_weights, scatter, output)
 
 
 __all__ = [
